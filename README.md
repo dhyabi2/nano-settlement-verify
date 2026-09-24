@@ -10,7 +10,11 @@ Nano node and hands back a receipt.
 
 - Python 3.11, **standard library only** — no third-party dependency.
 - Raw amounts are integers throughout. 1 XNO is `10**30` raw; a float loses the low digits,
-  so raw is parsed with `int()` and never with `float()`.
+  so raw is parsed with `int()` and never with `float()`. A float `expect_raw` is refused
+  with `TypeError` rather than compared — written as `1e30`, 1 XNO would otherwise "match"
+  an amount 19884624838656 raw short of it.
+- The node call is bounded by `RPC_TIMEOUT_S` (30s). Verification sits on a seller's request
+  path, so a node that accepts the connection and then goes quiet fails instead of hanging it.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
 ## Install

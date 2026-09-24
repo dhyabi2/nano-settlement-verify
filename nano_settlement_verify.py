@@ -16,6 +16,10 @@ from dataclasses import dataclass
 
 __all__ = ["Receipt", "NotFound", "Mismatch", "verify", "post_json"]
 
+# Seconds to wait on the node before giving up. Verification sits on a seller's
+# request path; an unbounded wait there is an outage, not patience.
+RPC_TIMEOUT_S = 30
+
 
 class NotFound(Exception):
     """The node reports no block with this hash."""
@@ -62,7 +66,9 @@ def post_json(rpc_url: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request) as response:
+    # A seller calls this on its request path, so a node that accepts the
+    # connection and then goes quiet must not hang the sale indefinitely.
+    with urllib.request.urlopen(request, timeout=RPC_TIMEOUT_S) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -74,7 +80,15 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
 
     Raises NotFound when the node has no such block, and Mismatch when the
     amount or the destination account differs from what was expected.
+
+    Raises TypeError when expect_raw is not an int, because raw is an integer
+    and a float expectation cannot be compared to one safely.
     """
+    if isinstance(expect_raw, bool) or not isinstance(expect_raw, int):
+        # A float expect_raw silently loses digits above 2**53, so 1 XNO written
+        # as 1e30 would "match" an amount 19884624838656 raw short of it. Refuse
+        # the comparison rather than settle on it.
+        raise TypeError(f"expect_raw must be an int of raw, got {type(expect_raw).__name__}")
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
     if "error" in reply:
         raise NotFound(block_hash)

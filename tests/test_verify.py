@@ -261,3 +261,47 @@ def test_the_no_sockets_guard_really_bites():
     """Proves the fixture above would catch a test that went to the network."""
     with pytest.raises(AssertionError, match="tried to open a socket"):
         nano_settlement_verify.post_json(URL, {"action": "block_info"})
+
+
+def test_a_float_expectation_is_refused_outright(node):
+    """1e30 is not 10**30. The comparison that would settle it never happens."""
+    node(block_info(amount=str(10**30)))
+    with pytest.raises(TypeError):
+        verify(HASH, 1e30, ACCOUNT, URL)
+
+
+def test_a_bool_expectation_is_refused(node):
+    """bool is a subclass of int; an expectation of True is a caller bug."""
+    node(block_info(amount="1"))
+    with pytest.raises(TypeError):
+        verify(HASH, True, ACCOUNT, URL)
+
+
+def test_an_int_expectation_is_still_accepted(node):
+    """The guard refuses floats without getting in the way of real amounts."""
+    node(block_info(amount=str(10**30)))
+    assert verify(HASH, 10**30, ACCOUNT, URL).amount_raw == 10**30
+
+
+def test_the_node_call_is_bounded_by_a_timeout(monkeypatch):
+    """A node that accepts and then goes quiet must not hang the seller."""
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"confirmed": "false"}'
+
+    def fake_urlopen(request, timeout=None):
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", fake_urlopen)
+    nano_settlement_verify.post_json(URL, {"action": "block_info"})
+    assert seen["timeout"] == nano_settlement_verify.RPC_TIMEOUT_S
+    assert seen["timeout"] is not None and seen["timeout"] > 0
