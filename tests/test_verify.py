@@ -12,7 +12,8 @@ import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt, verify
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
-ACCOUNT = "nano_3abc"
+ACCOUNT = "nano_3abc"          # the seller: the account expected to be paid
+PAYER_ACCOUNT = "nano_3payer"  # the account whose chain a send block sits on
 URL = "http://127.0.0.1:7076"
 
 
@@ -43,8 +44,19 @@ def node(monkeypatch):
 
 
 def block_info(amount="1000000000000000000000000", confirmed="true", account=ACCOUNT, height="42"):
-    """A node's block_info reply, in the shape the real node sends it."""
-    return {"block_account": account, "amount": amount, "confirmed": confirmed, "height": height}
+    """A node's block_info reply for a send, in the shape the real node sends it.
+
+    `account` is the account PAID, which the node reports as the block's link.
+    `block_account` is the chain the block sits on - for a send, the payer's.
+    """
+    return {
+        "block_account": PAYER_ACCOUNT,
+        "amount": amount,
+        "confirmed": confirmed,
+        "height": height,
+        "subtype": "send",
+        "contents": {"type": "state", "account": PAYER_ACCOUNT, "link_as_account": account},
+    }
 
 
 # --- the four acceptance tests -------------------------------------------------
@@ -305,3 +317,139 @@ def test_the_node_call_is_bounded_by_a_timeout(monkeypatch):
     nano_settlement_verify.post_json(URL, {"action": "block_info"})
     assert seen["timeout"] == nano_settlement_verify.RPC_TIMEOUT_S
     assert seen["timeout"] is not None and seen["timeout"] > 0
+
+
+# --- the account that was PAID, not the account that paid -----------------------
+#
+# A real node's block_info reports `block_account` as the account whose chain the
+# block sits on. For a send that is the PAYER. The account paid is the block's
+# link: `contents.link_as_account` on a state block, `contents.destination` on a
+# legacy one. Both fixtures below carry a real confirmed mainnet send, hash
+# ECCB8CB65CD3106EDA8CE9AA893FEAD497A91BCA903890CBD7A5C59F06AB9113.
+
+PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+SELLER = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
+SEND_RAW = 205676479000000000000000000000000000000
+
+
+def state_send(amount=str(SEND_RAW), payer=PAYER, paid_to=SELLER, confirmed="true"):
+    """A real node's reply for a state send block, with json_block=true."""
+    return {
+        "block_account": payer,
+        "amount": amount,
+        "confirmed": confirmed,
+        "height": "58",
+        "subtype": "send",
+        "contents": {"type": "state", "account": payer, "link_as_account": paid_to},
+    }
+
+
+def legacy_send(amount=str(SEND_RAW), payer=PAYER, paid_to=SELLER):
+    """A pre-state send block: contents.type names the operation, no subtype."""
+    return {
+        "block_account": payer,
+        "amount": amount,
+        "confirmed": "true",
+        "height": "58",
+        "contents": {"type": "send", "destination": paid_to},
+    }
+
+
+def receive_on(account, amount=str(SEND_RAW)):
+    """A confirmed receive on `account`'s own chain. It pays nobody."""
+    return {
+        "block_account": account,
+        "amount": amount,
+        "confirmed": "true",
+        "height": "12",
+        "subtype": "receive",
+        "contents": {"type": "state", "account": account, "link_as_account": account},
+    }
+
+
+def test_a_real_send_to_the_seller_settles(node):
+    """The whole point: an honest payment must verify."""
+    node(state_send())
+
+    receipt = verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert receipt.settled is True
+    assert receipt.amount_raw == SEND_RAW
+    assert receipt.account == SELLER
+
+
+def test_a_legacy_send_to_the_seller_settles(node):
+    node(legacy_send())
+
+    assert verify(HASH, SEND_RAW, SELLER, URL).account == SELLER
+
+
+def test_a_send_to_someone_else_raises_mismatch(node):
+    """Right amount, wrong payee: the payer's account must not stand in for it."""
+    node(state_send(paid_to="nano_3someoneelse"))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.got == "nano_3someoneelse"
+    assert caught.value.expected == SELLER
+
+
+def test_a_receive_on_the_sellers_own_chain_never_settles(node):
+    """A buyer handing over an inbound block of the seller's own chain has paid
+    nothing. `block_account` equals the seller there, so checking that field is
+    a bypass: any confirmed receive of the right size would serve the call."""
+    node(receive_on(SELLER))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.expected == "send"
+
+
+def test_an_open_block_never_settles(node):
+    reply = receive_on(SELLER)
+    reply["subtype"] = "open"
+
+    with pytest.raises(Mismatch):
+        node(reply)
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+
+def test_a_block_whose_operation_is_unknown_fails_closed(node):
+    """contents.type "state" names no operation, and no subtype came with it."""
+    reply = state_send()
+    del reply["subtype"]
+
+    node(reply)
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.expected == "send"
+
+
+def test_a_reply_with_no_link_at_all_fails_closed(node):
+    """contents arrives as an opaque string when a node ignores json_block."""
+    node({
+        "block_account": PAYER,
+        "amount": str(SEND_RAW),
+        "confirmed": "true",
+        "height": "58",
+        "subtype": "send",
+        "contents": "{\"type\":\"state\"}",
+    })
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.got == ""
+
+
+def test_the_amount_is_still_reported_before_the_payee(node):
+    node(state_send(amount=str(SEND_RAW - 1), paid_to="nano_3someoneelse"))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.got == SEND_RAW - 1

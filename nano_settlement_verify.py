@@ -20,6 +20,12 @@ __all__ = ["Receipt", "NotFound", "Mismatch", "verify", "post_json"]
 # request path; an unbounded wait there is an outage, not patience.
 RPC_TIMEOUT_S = 30
 
+# The operations a Nano block can name. A state block's contents.type is "state",
+# which says nothing about what the block did, so it is deliberately absent here:
+# a reply that carries no subtype and a contents.type of "state" names no
+# operation, and must fail closed rather than be read as a send.
+_OPERATIONS = frozenset({"send", "receive", "open", "change", "epoch"})
+
 
 class NotFound(Exception):
     """The node reports no block with this hash."""
@@ -72,6 +78,45 @@ def post_json(rpc_url: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _contents(reply: dict) -> dict:
+    """The block's contents, or an empty mapping when the node sent none.
+
+    A node that ignores json_block returns contents as an opaque string. There is
+    no link to read out of that, so it must read as absent, not raise.
+    """
+    contents = reply.get("contents")
+    return contents if isinstance(contents, dict) else {}
+
+
+def _operation(reply: dict) -> str:
+    """What the block did: "send", "receive", "open", "change" or "epoch".
+
+    A state block names it in the top-level subtype; a pre-state block names it in
+    contents.type. Anything else is unknown, and comes back as "".
+    """
+    subtype = str(reply.get("subtype") or "")
+    if subtype:
+        return subtype
+    legacy = str(_contents(reply).get("type") or "")
+    return legacy if legacy in _OPERATIONS else ""
+
+
+def _paid_account(reply: dict) -> str:
+    """The account the block paid: its link, not the chain it sits on.
+
+    A state block carries it as contents.link_as_account, a pre-state send block
+    as contents.destination. An absent link comes back as "".
+    """
+    contents = _contents(reply)
+    return str(
+        contents.get("link_as_account")
+        or contents.get("destination")
+        or reply.get("link_as_account")
+        or reply.get("destination")
+        or ""
+    )
+
+
 def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Receipt:
     """Prove a Nano send block settled for expect_raw to account.
 
@@ -79,7 +124,8 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     has the block but has not confirmed it yet.
 
     Raises NotFound when the node has no such block, and Mismatch when the
-    amount or the destination account differs from what was expected.
+    amount differs, when the block is not a send, or when it paid an account
+    other than the one expected.
 
     Raises TypeError when expect_raw is not an int, because raw is an integer
     and a float expectation cannot be compared to one safely.
@@ -97,11 +143,20 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     amount = int(reply["amount"])  # raw is an integer string; never parse it as a float
     if amount != expect_raw:
         raise Mismatch(amount, expect_raw)
-    if reply["block_account"] != account:
-        raise Mismatch(reply["block_account"], account)
+    # Only a send pays anyone. A receive or an open block sits on the account that
+    # was credited, so without this check the hash of any confirmed inbound block
+    # of the seller's own chain would verify with nothing paid for this call.
+    operation = _operation(reply)
+    if operation != "send":
+        raise Mismatch(operation, "send")
+    # block_account is the account whose chain the block sits on - for a send, the
+    # payer. The account paid is the block's link.
+    paid = _paid_account(reply)
+    if paid != account:
+        raise Mismatch(paid, account)
     return Receipt(
         settled=True,
         amount_raw=amount,
         height=int(reply["height"]),
-        account=reply["block_account"],
+        account=paid,
     )
