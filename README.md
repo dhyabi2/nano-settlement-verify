@@ -15,6 +15,11 @@ Nano node and hands back a receipt.
   an amount 19884624838656 raw short of it.
 - The node call is bounded by `RPC_TIMEOUT_S` (30s). Verification sits on a seller's request
   path, so a node that accepts the connection and then goes quiet fails instead of hanging it.
+- The account checked is the account **paid** — the block's link, which a node reports as
+  `contents.link_as_account` on a state block and `contents.destination` on a pre-state one.
+  It is not `block_account`: that field is the chain the block sits on, which for a send is
+  the *payer*. And only a `send` settles anything, so a receive, open, change or epoch block
+  is refused however well its amount matches.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
 ## Install
@@ -62,7 +67,7 @@ else:
 | `settled` | `True` only when the node reports the block confirmed |
 | `amount_raw` | the block's amount, as an integer number of raw |
 | `height` | the block's height in its account chain |
-| `account` | the account the node reports for the block |
+| `account` | the account the node reports the block paid |
 
 `Receipt.to_json()` gives you that as a JSON string, with `amount_raw` as an unquoted
 integer — so it survives a round trip that a float would have truncated.
@@ -74,7 +79,7 @@ Four outcomes, and nothing else:
 | confirmed, right amount, right account | `Receipt(settled=True, ...)` |
 | `"confirmed": "false"` | `Receipt(settled=False, amount_raw=0, height=0, account="")` |
 | `{"error": ...}` | raises `NotFound(block_hash)` |
-| a different amount, or a different account | raises `Mismatch(got, expected)` |
+| a different amount, a block that is not a send, or a different payee | raises `Mismatch(got, expected)` |
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -86,7 +91,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-21 tests: the four acceptance cases, the error paths around them, the integer-raw
+33 tests: the four acceptance cases, the error paths around them, the integer-raw
 guarantee, the receipt's JSON shape, and the exact request put to the node. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
@@ -103,6 +108,11 @@ python e2e_check.py
 It verifies. It does not sign, send, hold a key, retry, cache, or offer a command line.
 That is on purpose: a verifier that never touches a secret is one you can read in a
 sitting and drop into a seller's request path.
+
+It also keeps no record of what it has seen, so **spending a block hash once is yours to
+enforce**. A settled receipt says this block paid you that amount; it does not say the block
+has not already been spent on an earlier call. Store the hash with the call it paid for and
+refuse it the second time, or one payment buys every call the buyer cares to make.
 
 ## Licence
 

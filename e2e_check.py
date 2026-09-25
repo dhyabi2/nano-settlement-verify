@@ -13,10 +13,37 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from nano_settlement_verify import Mismatch, NotFound, verify
 
+SELLER = "nano_3abc"
+PAYER = "nano_3payer"
+
+
+def send(amount, confirmed="true"):
+    """A send in the shape a real node reports it: the chain is the payer's, and
+    the account paid is the block's link."""
+    return {
+        "block_account": PAYER,
+        "amount": amount,
+        "confirmed": confirmed,
+        "height": "42",
+        "subtype": "send",
+        "contents": {"type": "state", "account": PAYER, "link_as_account": SELLER},
+    }
+
+
 BLOCKS = {
-    "AAA": {"block_account": "nano_3abc", "amount": str(10**24), "confirmed": "true", "height": "42"},
-    "PENDING": {"block_account": "nano_3abc", "amount": str(10**24), "confirmed": "false", "height": "42"},
-    "SHORT": {"block_account": "nano_3abc", "amount": str(10**23), "confirmed": "true", "height": "42"},
+    "AAA": send(str(10**24)),
+    "PENDING": send(str(10**24), confirmed="false"),
+    "SHORT": send(str(10**23)),
+    # A confirmed receive on the seller's own chain. It pays nobody, and its
+    # block_account IS the seller - so it must not verify as a payment.
+    "INBOUND": {
+        "block_account": SELLER,
+        "amount": str(10**24),
+        "confirmed": "true",
+        "height": "12",
+        "subtype": "receive",
+        "contents": {"type": "state", "account": SELLER, "link_as_account": SELLER},
+    },
 }
 
 
@@ -78,8 +105,18 @@ try:
 except Mismatch as error:
     print("\n5. confirmed block paying someone else")
     print(f"   -> Mismatch(got={error.got!r}, expected={error.expected!r})")
+    assert error.got == "nano_3abc" and error.expected == "nano_3wrongseller"
 else:
     raise SystemExit("FAIL: expected Mismatch")
 
+try:
+    verify("INBOUND", 10**24, "nano_3abc", url)
+except Mismatch as error:
+    print("\n6. a confirmed receive on the seller's own chain pays nobody")
+    print(f"   -> Mismatch(got={error.got!r}, expected={error.expected!r})")
+    assert error.expected == "send"
+else:
+    raise SystemExit("FAIL: a receive block must not verify as a payment")
+
 server.shutdown()
-print("\nall four acceptance tests plus the wrong-account path hold end to end.")
+print("\nall four acceptance tests, the wrong-payee path and the receive path hold end to end.")
