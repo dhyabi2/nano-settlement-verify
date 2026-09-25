@@ -109,6 +109,11 @@ It verifies. It does not sign, send, hold a key, retry, cache, or offer a comman
 That is on purpose: a verifier that never touches a secret is one you can read in a
 sitting and drop into a seller's request path.
 
+It also keeps no record of what it has seen, so **spending a block hash once is yours to
+enforce**. A settled receipt says this block paid you that amount; it does not say the block
+has not already been spent on an earlier call. Store the hash with the call it paid for and
+refuse it the second time, or one payment buys every call the buyer cares to make.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).

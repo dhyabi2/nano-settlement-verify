@@ -82,6 +82,15 @@ Proved: 15 failed / 18 passed with the new tests against the module as it was, t
   account's repositories imports this module; the change is a fix to a published
   `1.0.0`, so it is a behaviour change for anyone who worked around the old comparison.
 
+## Also documented
+
+A settled receipt does not say the block has not already been spent on an earlier call, and
+the module keeps no record. The README's Scope said only that there is no cache, in the
+context of waiting for confirmation; it now says plainly that spending a hash once is the
+seller's to enforce. Without that, one payment buys every call a buyer cares to make — and
+it is the first thing a seller wires up wrong. No code change: a verifier that has no store
+cannot enforce it, and giving it one would be a different library.
+
 ## Noted, not changed
 
 `rpc_url` is passed straight to `urllib.request.Request`, which will open a `file://` or
