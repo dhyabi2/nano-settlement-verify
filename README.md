@@ -96,7 +96,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-33 tests: the four acceptance cases, the error paths around them, the integer-raw
+46 tests: the four acceptance cases, the error paths around them, the integer-raw
 guarantee, the receipt's JSON shape, and the exact request put to the node. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
