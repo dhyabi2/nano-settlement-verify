@@ -453,3 +453,107 @@ def test_the_amount_is_still_reported_before_the_payee(node):
         verify(HASH, SEND_RAW, SELLER, URL)
 
     assert caught.value.got == SEND_RAW - 1
+
+
+# --------------------------------------------------------------------------
+# One account, two spellings. The prefix was renamed from `xrb_` to `nano_`;
+# the 60 characters after it are the same encoding of the same public key.
+# A node always answers the modern form, and a seller passes whatever they
+# have stored. Comparing the two strings refuses a payment that did arrive,
+# after the buyer's money has irreversibly moved.
+# --------------------------------------------------------------------------
+
+SELLER_XRB = "xrb_1111111111111111111111111111111111111111111111111111hifc8npp"
+STRANGER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+STRANGER_XRB = "xrb_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+
+
+def test_the_two_spellings_carry_the_same_account_body():
+    """The premise of every test below, stated once."""
+    assert SELLER_XRB.split("_", 1)[1] == SELLER.split("_", 1)[1]
+    assert SELLER_XRB != SELLER
+
+
+def test_a_seller_who_stored_the_legacy_spelling_is_still_paid(node):
+    """The node answers `nano_`; the seller has `xrb_`. One account, so settled."""
+    node(state_send(paid_to=SELLER))
+
+    receipt = verify(HASH, SEND_RAW, SELLER_XRB, URL)
+
+    assert receipt.settled is True
+    assert receipt.amount_raw == SEND_RAW
+
+
+def test_the_receipt_records_the_canonical_spelling(node):
+    """Whatever the seller passed, the receipt carries the node's `nano_` form."""
+    node(state_send(paid_to=SELLER))
+
+    assert verify(HASH, SEND_RAW, SELLER_XRB, URL).account == SELLER
+
+
+def test_a_node_answering_the_legacy_spelling_settles_too(node):
+    """The mirror case: a pre-state block's `destination` in `xrb_` form."""
+    node(legacy_send(paid_to=SELLER_XRB))
+
+    assert verify(HASH, SEND_RAW, SELLER, URL).settled is True
+
+
+def test_a_stranger_is_still_refused_in_the_legacy_spelling(node):
+    """The check must identify accounts, not stop identifying them."""
+    node(state_send(paid_to=STRANGER))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER_XRB, URL)
+
+    assert caught.value.got == STRANGER
+    assert caught.value.expected == SELLER_XRB
+
+
+def test_a_stranger_paid_in_the_legacy_spelling_is_still_refused(node):
+    node(state_send(paid_to=STRANGER_XRB))
+
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+
+def test_an_expectation_with_no_nano_prefix_is_refused(node):
+    """`_account_body` answers None for a string that is not an address, and a
+    None on either side refuses - so a bare account body never stands in for
+    the address that contains it."""
+    node(state_send(paid_to=SELLER))
+
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, SELLER.split("_", 1)[1], URL)
+
+
+def test_two_identical_non_addresses_do_not_match_each_other(node):
+    """Failing closed matters more than the string equality that used to hold:
+    neither side is an account, so there is no account to agree on."""
+    node(state_send(paid_to="not-an-address"))
+
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, "not-an-address", URL)
+
+
+def test_an_empty_expectation_never_matches_an_absent_link(node):
+    node({
+        "block_account": PAYER,
+        "amount": str(SEND_RAW),
+        "confirmed": "true",
+        "height": "58",
+        "subtype": "send",
+        "contents": "{\"type\":\"state\"}",
+    })
+
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, "", URL)
+
+
+@pytest.mark.parametrize("account", [None, 123, b"nano_3abc", ""])
+def test_a_non_string_expectation_still_raises_mismatch(node, account):
+    """Not an AttributeError. Comparing the strings tolerated any type on the
+    right-hand side, so identifying the account has to as well."""
+    node(state_send(paid_to=SELLER))
+
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, account, URL)

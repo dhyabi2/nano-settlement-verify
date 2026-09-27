@@ -20,6 +20,11 @@ Nano node and hands back a receipt.
   It is not `block_account`: that field is the chain the block sits on, which for a send is
   the *payer*. And only a `send` settles anything, so a receive, open, change or epoch block
   is refused however well its amount matches.
+- The account is compared as an account, not as the string that spells it. One Nano
+  account has two spellings — the modern `nano_` form and the legacy `xrb_` form, whose
+  60 characters after the prefix are identical — and a node always answers the `nano_`
+  one. Pass `account` in either; a stranger is still refused in either. The receipt
+  records the account as the node spelled it, so it always carries the `nano_` form.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
 ## Install

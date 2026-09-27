@@ -118,5 +118,23 @@ except Mismatch as error:
 else:
     raise SystemExit("FAIL: a receive block must not verify as a payment")
 
+receipt = verify("AAA", 10**24, "xrb_3abc", url)
+print("\n7. the same seller, spelled the legacy xrb_ way")
+print(f"   -> {receipt}")
+assert receipt.settled is True
+assert receipt.account == "nano_3abc"
+
+try:
+    verify("AAA", 10**24, "xrb_3wrongseller", url)
+except Mismatch as error:
+    print("\n8. a stranger is still refused in the legacy spelling")
+    print(f"   -> Mismatch(got={error.got!r}, expected={error.expected!r})")
+    assert error.got == "nano_3abc" and error.expected == "xrb_3wrongseller"
+else:
+    raise SystemExit("FAIL: a stranger must be refused in either spelling")
+
 server.shutdown()
-print("\nall four acceptance tests, the wrong-payee path and the receive path hold end to end.")
+print(
+    "\nall four acceptance tests, the wrong-payee path, the receive path and both "
+    "spellings of one account hold end to end."
+)

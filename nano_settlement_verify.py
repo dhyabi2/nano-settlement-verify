@@ -6,6 +6,9 @@ seller expected. What comes back is a receipt a seller can keep.
 
 Amounts are raw integers everywhere: 1 XNO is 10**30 raw, and a float loses the
 low digits, so raw is parsed with int() and never with float().
+
+Accounts are compared as accounts, not as the strings that spell them: one Nano
+account has two spellings, the modern `nano_` form and the legacy `xrb_` form.
 """
 
 from __future__ import annotations
@@ -101,6 +104,43 @@ def _operation(reply: dict) -> str:
     return legacy if legacy in _OPERATIONS else ""
 
 
+# The two spellings of one Nano account. The address prefix was renamed from
+# `xrb_` to `nano_`; the 60 characters after it are the same encoding of the same
+# public key, and both forms are still in use and still accepted everywhere. So
+# two addresses name the same account exactly when those 60 characters match.
+_ACCOUNT_PREFIXES = ("nano_", "xrb_")
+
+
+def _account_body(address: object) -> str | None:
+    """The part of an address that identifies the account, or None if it has none.
+
+    Everything after the `nano_`/`xrb_` prefix. Anything that is not a string
+    carrying one of those prefixes is not a Nano address, and comes back as None
+    so that it is refused rather than compared - an absent link reads as "", and
+    "" must never match. A caller who passes None for `account` still gets the
+    Mismatch it got before this function existed, not an AttributeError.
+    """
+    if not isinstance(address, str):
+        return None
+    for prefix in _ACCOUNT_PREFIXES:
+        if address.startswith(prefix):
+            return address[len(prefix):]
+    return None
+
+
+def _same_account(left: object, right: object) -> bool:
+    """Whether two addresses name one account, however each one is spelled.
+
+    A node always answers the modern `nano_` form, while a seller passes whatever
+    they have stored, which for older tooling is the `xrb_` form of the very same
+    account. Comparing the two strings refuses a payment that did arrive - and by
+    then the buyer's money has irreversibly moved, so the refusal costs the sale
+    and leaves the seller with no receipt for money they were paid.
+    """
+    body = _account_body(left)
+    return body is not None and body == _account_body(right)
+
+
 def _paid_account(reply: dict) -> str:
     """The account the block paid: its link, not the chain it sits on.
 
@@ -125,7 +165,9 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
 
     Raises NotFound when the node has no such block, and Mismatch when the
     amount differs, when the block is not a send, or when it paid an account
-    other than the one expected.
+    other than the one expected. `account` may be given in either the `nano_` or
+    the `xrb_` spelling; they are two names for one account. The receipt records
+    the account as the node spelled it, which is the canonical `nano_` form.
 
     Raises TypeError when expect_raw is not an int, because raw is an integer
     and a float expectation cannot be compared to one safely.
@@ -152,7 +194,7 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     # block_account is the account whose chain the block sits on - for a send, the
     # payer. The account paid is the block's link.
     paid = _paid_account(reply)
-    if paid != account:
+    if not _same_account(paid, account):
         raise Mismatch(paid, account)
     return Receipt(
         settled=True,
