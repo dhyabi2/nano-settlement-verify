@@ -133,10 +133,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-95 tests: for `verify`, the four acceptance cases, the error paths around them, the
+113 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
-acceptance checks and settlement against the pinned payee and amount. None of them
+acceptance checks and settlement against the pinned payee and amount; for
+`nano_independence`, the funding chain and the independent-payer grouping. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
 

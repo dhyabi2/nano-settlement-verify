@@ -177,7 +177,11 @@ def independence(
     for payer in counted:
         for account in [payer, *chains[payer]]:
             k = _key(account)
-            if k is None or k in hubs:
+            if k in hubs:
+                # Everything behind a hub is the hub's own history, shared by
+                # every stranger it paid; walking past it would merge them anyway.
+                break
+            if k is None:
                 continue
             if k in owner:
                 parent[root(payer)] = root(owner[k])

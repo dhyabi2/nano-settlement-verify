@@ -197,3 +197,10 @@ def test_module_names_its_limit():
     """A lower bound on common control, never a proof of independence: the docstring says so."""
     doc = nano_independence.__doc__.lower()
     assert "lower bound" in doc and "not proof" in doc
+
+
+def test_an_ignored_hub_is_not_walked_past(node):
+    # Two strangers withdrew from one exchange, and the exchange itself was funded
+    # by one account. Walking past the ignored hub would merge them through its funder.
+    node({"nano_1a": EXCHANGE, "nano_1b": EXCHANGE, EXCHANGE: "nano_1genesis"})
+    assert independence(["nano_1a", "nano_1b"], URL, hops=2, ignore=[EXCHANGE]).independent == 2
