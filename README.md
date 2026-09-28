@@ -133,10 +133,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-95 tests: for `verify`, the four acceptance cases, the error paths around them, the
+113 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
-acceptance checks and settlement against the pinned payee and amount. None of them
+acceptance checks and settlement against the pinned payee and amount; for
+`nano_independence`, the funding chain and the independent-payer grouping. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
 
@@ -161,3 +162,23 @@ refuse it the second time, or one payment buys every call the buyer cares to mak
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+## How many independent payers?
+
+Counting paying keys is not counting buyers: one operator can pay from ten accounts.
+`nano_independence` groups payer accounts by where their money came from - the send that
+opened each account - and counts each group once. Read-only; same bounded node call.
+
+```python
+from nano_independence import independence
+
+report = independence(payers, "https://rpc.nano.to", seller="nano_<your account>",
+                      ignore=["nano_<an exchange hot wallet>"])
+report.independent      # groups sharing no funder, and not funded by you
+report.funded_by_seller # your own money coming back in a circle
+```
+
+It is a lower bound on common control, not proof of independence: keys funded from
+different exchange withdrawals read as separate payers. `hops` (default 1) follows the
+funding chain further back; pass hub accounts in `ignore` so strangers who withdrew from
+one exchange are not merged.
