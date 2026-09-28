@@ -23,6 +23,11 @@ __all__ = ["Receipt", "NotFound", "Mismatch", "verify", "post_json"]
 # request path; an unbounded wait there is an outage, not patience.
 RPC_TIMEOUT_S = 30
 
+# Sent on every node call. Cloudflare-fronted RPCs, rpc.nano.to among them, refuse
+# urllib's default `Python-urllib/3.x` with 403 "error code: 1010" - a refusal
+# indistinguishable from a bad node - so the call names itself instead.
+USER_AGENT = "nano-settlement-verify/1.0 (+https://github.com/dhyabi2/nano-settlement-verify)"
+
 # The operations a Nano block can name. A state block's contents.type is "state",
 # which says nothing about what the block did, so it is deliberately absent here:
 # a reply that carries no subtype and a contents.type of "state" names no
@@ -72,7 +77,7 @@ def post_json(rpc_url: str, payload: dict) -> dict:
     request = urllib.request.Request(
         rpc_url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
     # A seller calls this on its request path, so a node that accepts the

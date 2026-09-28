@@ -13,6 +13,9 @@ Nano node and hands back a receipt.
   so raw is parsed with `int()` and never with `float()`. A float `expect_raw` is refused
   with `TypeError` rather than compared — written as `1e30`, 1 XNO would otherwise "match"
   an amount 19884624838656 raw short of it.
+- Every node call sends its own User-Agent (`USER_AGENT`). Cloudflare-fronted RPCs,
+  `rpc.nano.to` among them, answer urllib's default one with 403 "error code: 1010",
+  which reads exactly like a bad node.
 - The node call is bounded by `RPC_TIMEOUT_S` (30s). Verification sits on a seller's request
   path, so a node that accepts the connection and then goes quiet fails instead of hanging it.
 - The account checked is the account **paid** — the block's link, which a node reports as
@@ -96,8 +99,9 @@ pip install pytest
 python -m pytest -v
 ```
 
-46 tests: the four acceptance cases, the error paths around them, the integer-raw
-guarantee, the receipt's JSON shape, and the exact request put to the node. None of them
+47 tests: the four acceptance cases, the error paths around them, the integer-raw
+guarantee, the receipt's JSON shape, the exact request put to the node, and the
+User-Agent it carries. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
 
