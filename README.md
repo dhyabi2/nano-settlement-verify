@@ -161,3 +161,23 @@ refuse it the second time, or one payment buys every call the buyer cares to mak
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+## How many independent payers?
+
+Counting paying keys is not counting buyers: one operator can pay from ten accounts.
+`nano_independence` groups payer accounts by where their money came from - the send that
+opened each account - and counts each group once. Read-only; same bounded node call.
+
+```python
+from nano_independence import independence
+
+report = independence(payers, "https://rpc.nano.to", seller="nano_<your account>",
+                      ignore=["nano_<an exchange hot wallet>"])
+report.independent      # groups sharing no funder, and not funded by you
+report.funded_by_seller # your own money coming back in a circle
+```
+
+It is a lower bound on common control, not proof of independence: keys funded from
+different exchange withdrawals read as separate payers. `hops` (default 1) follows the
+funding chain further back; pass hub accounts in `ignore` so strangers who withdrew from
+one exchange are not merged.
