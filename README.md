@@ -92,6 +92,40 @@ Four outcomes, and nothing else:
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
 
+## Pay against terms, not against a claim
+
+`nano_terms.py` (same package, also one stdlib file) is for two agents that trade once
+and need to agree, before any XNO moves, on what is paid, to whom, and what counts as
+delivered.
+
+- **The terms are addressed by the sha256 of their own bytes.** Both sides hold the bytes
+  and re-derive the hash, so checking a cited hash needs no registry and nobody else
+  online.
+- **The schema is pinned:** `version` (`"1"`), `payee`, `amount_raw` (a decimal string of
+  raw), `task` (what is bought, in words) and `acceptance`. An unknown field, a missing
+  one or a duplicated key is refused, not ignored.
+- **Acceptance is a check a program runs**, written in before payment: `{"sha256": hex}`
+  of the deliverable, or `{"json_keys": [...]}` that a JSON object must carry non-empty.
+- **Settlement is checked against the payee and amount the terms pinned**, through
+  `verify` above, never against what the seller says afterwards.
+
+```python
+from nano_terms import load_terms, accept, settle, terms_sha256
+
+terms = load_terms(terms_bytes, cited_sha256)   # TermsRefused on any mismatch
+done = accept(terms, deliverable_bytes)         # offline; NotAccepted if it fails
+# the buyer's own wallet pays terms.amount_raw to terms.payee here
+deal = settle(terms, done, block_hash, RPC)
+print(deal.to_json())
+# {"terms_sha256": "...", "deliverable_sha256": "...", "block_hash": "...",
+#  "settled": true, "amount_raw": 1000000000000000000000000, "payee": "nano_3..."}
+```
+
+The `Deal` record cites the terms, the deliverable and the block by hash, so anyone
+holding the bytes can check it offline, and anyone can check the block on a public node.
+Like `verify`, it never signs or sends, and spending one block hash once is yours to
+enforce.
+
 ## Tests
 
 ```
@@ -99,9 +133,10 @@ pip install pytest
 python -m pytest -v
 ```
 
-47 tests: the four acceptance cases, the error paths around them, the integer-raw
-guarantee, the receipt's JSON shape, the exact request put to the node, and the
-User-Agent it carries. None of them
+95 tests: for `verify`, the four acceptance cases, the error paths around them, the
+integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
+the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
+acceptance checks and settlement against the pinned payee and amount. None of them
 touch the network — the node reply is stubbed, and a fixture fails any test that tries to
 open a socket.
 

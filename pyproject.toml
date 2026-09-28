@@ -16,7 +16,7 @@ keywords = ["nano", "xno", "x402", "payments", "settlement", "receipt"]
 Source = "https://github.com/dhyabi2/nano-settlement-verify"
 
 [tool.setuptools]
-py-modules = ["nano_settlement_verify"]
+py-modules = ["nano_settlement_verify", "nano_terms"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
