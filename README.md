@@ -57,6 +57,13 @@ except NotFound as error:
     print(f"no such block: {error.block_hash}")       # nothing settled — do not serve
 except Mismatch as error:
     print(f"expected {error.expected}, got {error.got}")  # underpaid, or paid elsewhere
+except (OSError, ValueError) as error:
+    # The node did not answer: refused, timed out, HTTP 500, or a body that is
+    # not JSON. This is NOT "the payment is bad" — it is "we could not check".
+    # Retry or hold the call; do not refuse a payment that may well have
+    # settled. Catch it: this sits on your request path, and without this arm
+    # the first hiccup of a public node raises straight through it.
+    print(f"node unreachable, nothing was checked: {error}")
 else:
     if receipt.settled:
         print(receipt.to_json())
@@ -80,7 +87,7 @@ else:
 `Receipt.to_json()` gives you that as a JSON string, with `amount_raw` as an unquoted
 integer — so it survives a round trip that a float would have truncated.
 
-Four outcomes, and nothing else:
+Four outcomes when the node answers:
 
 | the node says | you get |
 | --- | --- |
@@ -88,6 +95,21 @@ Four outcomes, and nothing else:
 | `"confirmed": "false"` | `Receipt(settled=False, amount_raw=0, height=0, account="")` |
 | `{"error": ...}` | raises `NotFound(block_hash)` |
 | a different amount, a block that is not a send, or a different payee | raises `Mismatch(got, expected)` |
+
+And one for when it does not answer at all. There is no retry and no wrapper
+exception, so the transport failure reaches you as itself:
+
+| what went wrong | what `verify` raises |
+| --- | --- |
+| connection refused, DNS failure, or `RPC_TIMEOUT_S` elapsed | `urllib.error.URLError` (an `OSError`) |
+| an HTTP error status — 403, 429, 500 | `urllib.error.HTTPError` (also an `OSError`) |
+| a body that is not JSON — an HTML error or maintenance page | `json.JSONDecodeError` (a `ValueError`) |
+
+**These are not `NotFound`.** "The node has no such block" and "the node did not
+answer" are different facts, and only the first one means the payment is not
+there. A seller that treats an unreachable node as a missing block refuses a
+call the buyer already paid for, and XNO does not come back. Catch `OSError`
+and `ValueError` around `verify` and retry or hold — the example above does.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
