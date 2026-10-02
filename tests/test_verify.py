@@ -557,3 +557,87 @@ def test_a_non_string_expectation_still_raises_mismatch(node, account):
 
     with pytest.raises(Mismatch):
         verify(HASH, SEND_RAW, account, URL)
+
+
+# --- the node that does not answer at all --------------------------------------
+#
+# `post_json` has no error handling on purpose: there is no retry and no wrapper
+# exception, so a transport failure reaches the caller as itself. That is a real
+# outcome of `verify` and the README used to enumerate four and call them "and
+# nothing else", so a seller following it wrapped the call in `except NotFound`
+# and had the first hiccup of a public node raise straight through its request
+# path. These pin what actually comes out, and that it is never NotFound: "no
+# such block" and "the node did not answer" are different facts, and only the
+# first one means the payment is not there.
+
+
+def _urlopen_raising(monkeypatch, exc):
+    def boom(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", boom)
+
+
+def test_a_node_that_refuses_the_connection_is_not_a_missing_block(monkeypatch):
+    import urllib.error
+
+    _urlopen_raising(monkeypatch, urllib.error.URLError(OSError(111, "Connection refused")))
+
+    with pytest.raises(OSError) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+    assert not isinstance(caught.value, (NotFound, Mismatch))
+
+
+def test_an_http_error_status_from_the_node_is_not_a_missing_block(monkeypatch):
+    import urllib.error
+
+    _urlopen_raising(
+        monkeypatch,
+        urllib.error.HTTPError(URL, 500, "Internal Server Error", {}, None),
+    )
+
+    with pytest.raises(OSError) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+    assert not isinstance(caught.value, (NotFound, Mismatch))
+
+
+def test_a_body_that_is_not_json_is_not_a_missing_block(monkeypatch):
+    """A node behind a proxy answers an HTML error page far more often than JSON."""
+
+    class Body:
+        def read(self):
+            return b"<html>down for maintenance</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        nano_settlement_verify.urllib.request, "urlopen", lambda *a, **k: Body())
+
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+    assert isinstance(caught.value, json.JSONDecodeError)
+    assert not isinstance(caught.value, (NotFound, Mismatch))
+
+
+def test_the_readme_names_the_node_unreachable_outcome():
+    """The README must not promise outcomes `verify` does not keep.
+
+    It listed four and said "and nothing else". A seller reads that table to
+    decide what to catch, and the fifth outcome - the node not answering - is
+    the one that crashes a request path.
+    """
+    import pathlib
+
+    readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    text = readme.read_text(encoding="utf-8")
+
+    assert "Four outcomes, and nothing else" not in text, (
+        "the README still claims verify has exactly four outcomes")
+    for promise in ("URLError", "HTTPError", "JSONDecodeError"):
+        assert promise in text, "the README does not name %s as an outcome" % promise
+    # And the quickstart a reader copies must catch it.
+    assert "except (OSError, ValueError)" in text
