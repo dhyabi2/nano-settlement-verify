@@ -114,6 +114,78 @@ and `ValueError` around `verify` and retry or hold — the example above does.
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
 
+## One node's word, or two?
+
+`verify` above asks one node. That is the right default for a seller's request path, but
+it means the receipt is exactly as good as that one endpoint — and public Nano RPC is
+thin: `rpc.nano.to` wants a key and rate-limits a burst, Nanswap throttles, and a proxy
+in front of any of them can answer HTTP 200 with something that is not a node reply at
+all. An agent with no node of its own has no second opinion to fall back on.
+
+`nano_quorum.py` (same package, also one stdlib file) is that second opinion.
+
+```python
+from nano_quorum import verify_corroborated, Disagreement, NotCorroborated
+
+NODES = ["https://rpc.nano.to", "https://my-other-node.example/proxy"]
+
+try:
+    out = verify_corroborated(block_hash, expect_raw=10**24, account="nano_3abc",
+                              rpc_urls=NODES)          # agree=2 by default
+except Mismatch:
+    refuse()            # a node has it confirmed, and it did not pay you
+except Disagreement:
+    refuse()            # two nodes, two different stories — one of them is wrong
+except NotCorroborated:
+    hold_and_retry()    # too few endpoints answered; NOTHING was checked
+else:
+    if out.receipt.settled:
+        serve_the_call()        # out.agreed names the endpoints that concurred
+    else:
+        wait_and_ask_again()    # answered, but not confirmed by enough of them yet
+```
+
+The rules it holds to, each of which is a way of failing closed:
+
+- **A repeated endpoint is one witness.** `["https://rpc.nano.to", "https://rpc.nano.to/"]`
+  is refused with `ValueError` before any call, rather than quietly counting one node
+  twice. Being *distinct* still does not make endpoints *independent* — several public
+  Nano RPCs are proxies in front of the same node, and nothing here can see that.
+  Agreement is only worth what your endpoint list is worth.
+- **It does not break ties.** Two nodes that each report the block confirmed, with
+  different contents, cannot both be right, and nothing here can tell you which is
+  lying. A third vote would only make a guess look like a quorum, so it raises.
+- **One `Mismatch` refuses at once.** A node that has the block *confirmed* and says it
+  paid a different amount or a different account is reporting something a later node
+  cannot overturn — a confirmed block's contents are fixed by its hash.
+- **Silence is never a "no".** An endpoint that is refused, times out, or serves an HTML
+  maintenance page has told you nothing. Fewer than `agree` endpoints answering raises
+  `NotCorroborated`, which means *hold the call*, not *refuse the buyer*. Refusing a call
+  that was paid for costs the sale, and XNO does not come back.
+- **It does not retry.** A failed endpoint is skipped, not asked again. Waiting is yours
+  to decide, as it is for `verify`.
+- **It never sends.** `process` is deliberately absent; this reads, like the rest of the
+  package.
+
+Two more functions come with it:
+
+```python
+from nano_quorum import balance_corroborated, post_json_failover
+
+balance_raw, receivable_raw = balance_corroborated("nano_3abc", NODES)   # integers of raw
+reply, which_node = post_json_failover(NODES, {"action": "account_info", ...})
+```
+
+`balance_corroborated` compares only the **confirmed** figures. An endpoint that answers
+without them — a proxy that drops `include_confirmed` — counts as not having answered,
+rather than being read for its unconfirmed `balance`, which is precisely the number that
+differs between nodes. Confirmed figures still move, so two honest nodes a block apart
+will disagree here; the remedy is to ask again, not to take the larger number.
+
+`post_json_failover` is **failover, not corroboration**: it returns the first endpoint
+that answers, for reads where one node's word is enough. Do not decide that money
+arrived with it.
+
 ## Pay against terms, not against a claim
 
 `nano_terms.py` (same package, also one stdlib file) is for two agents that trade once
@@ -155,20 +227,27 @@ pip install pytest
 python -m pytest -v
 ```
 
-117 tests: for `verify`, the four acceptance cases, the error paths around them, the
+153 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks and settlement against the pinned payee and amount; for
-`nano_independence`, the funding chain and the independent-payer grouping. None of them
-touch the network — the node reply is stubbed, and a fixture fails any test that tries to
-open a socket.
+`nano_independence`, the funding chain and the independent-payer grouping; for
+`nano_quorum`, agreement, contradiction, the duplicate endpoint and every way an
+endpoint can say nothing. None of them touch the network — the node reply is stubbed,
+and a fixture fails any test that tries to open a socket.
 
 There is also a hand check that exercises the real `urllib` path against a throwaway HTTP
 node stub on loopback:
 
 ```
 python e2e_check.py
+python e2e_quorum_check.py
 ```
+
+The second one stands up several loopback nodes that disagree with each other — one
+honest, one lagging, one contradicting, one serving a maintenance page, one dead — and
+then, when the network allows it, repeats the decisive case against a real confirmed
+block on the live ledger.
 
 ## Scope
 
