@@ -14,3 +14,4 @@ jobs:
       - run: pip install pytest
       - run: python3 -m pytest -q
       - run: python3 e2e_check.py
+      - run: python3 e2e_quorum_check.py
