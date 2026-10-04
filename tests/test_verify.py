@@ -9,7 +9,13 @@ import json
 import pytest
 
 import nano_settlement_verify
-from nano_settlement_verify import Mismatch, NotFound, Receipt, verify
+from nano_settlement_verify import (
+    Mismatch,
+    NotANodeReply,
+    NotFound,
+    Receipt,
+    verify,
+)
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
 ACCOUNT = "nano_3abc"          # the seller: the account expected to be paid
@@ -143,12 +149,68 @@ def test_an_unconfirmed_reply_never_looks_at_the_amount(node):
     assert verify(HASH, 10**24, ACCOUNT, URL) == Receipt(False, 0, 0, "")
 
 
-def test_a_reply_with_no_confirmed_field_raises_key_error(node):
+def test_a_reply_with_no_confirmed_field_is_refused_as_not_a_node_reply(node):
     """A malformed reply is not quietly treated as settled or as unsettled."""
     node({"amount": "1", "block_account": ACCOUNT, "height": "1"})
 
-    with pytest.raises(KeyError):
+    with pytest.raises(NotANodeReply):
         verify(HASH, 10**24, ACCOUNT, URL)
+
+
+# A seller calls verify on its request path, and the README tells it to catch
+# `(OSError, ValueError)` for "we could not check" - the arm whose absence it
+# warns about in as many words. A public RPC behind a proxy answers 200 with its
+# own JSON at least as often as with HTML, and none of those bodies carries
+# `confirmed`. Each of these used to raise a bare KeyError, which is neither an
+# OSError nor a ValueError, so it went straight through that arm and out of the
+# seller's request path - dropping a call the buyer may already have paid for,
+# which on this rail cannot be undone.
+NOT_NODE_REPLIES = {
+    "a proxy's status page": {"status": "ok", "service": "nano-proxy"},
+    "a rate-limit envelope": {"message": "rate limited, add an API key"},
+    "an empty object": {},
+    "confirmed but no amount": {"confirmed": "true"},
+}
+
+
+@pytest.mark.parametrize("shape", sorted(NOT_NODE_REPLIES))
+def test_a_json_body_that_is_not_a_node_reply_lands_in_the_documented_family(node, shape):
+    node(NOT_NODE_REPLIES[shape])
+
+    with pytest.raises((OSError, ValueError)) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+    # Not NotFound and not Mismatch: nothing here says the payment is bad.
+    assert not isinstance(caught.value, (NotFound, Mismatch))
+    assert isinstance(caught.value, NotANodeReply)
+
+
+def test_a_confirmed_reply_with_no_height_is_refused_not_crashed(node):
+    """The last bare read: a reply that gets all the way past the payee check.
+
+    It carries the right amount, names a send and pays the right account, and
+    then has no `height` for the receipt. That raised KeyError from the Receipt
+    construction itself, after every check had passed.
+    """
+    reply = block_info()
+    del reply["height"]
+    node(reply)
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+    assert "height" in str(caught.value)
+    assert isinstance(caught.value, ValueError)
+
+
+def test_a_node_reply_is_never_refused_as_not_a_node_reply(node):
+    """The guard must not catch the replies that ARE node replies."""
+    node({"error": "Block not found"})
+    with pytest.raises(NotFound):
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+    node({"confirmed": "false"})
+    assert verify(HASH, 10**24, ACCOUNT, URL) == Receipt(False, 0, 0, "")
 
 
 def test_a_non_integer_amount_raises_value_error(node):
