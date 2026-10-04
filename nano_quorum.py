@@ -162,11 +162,13 @@ def distinct_endpoints(rpc_urls, agree: int = AGREE_DEFAULT) -> tuple[str, ...]:
 
 # What counts as "this endpoint did not answer", as opposed to "it answered and
 # the answer was no". OSError covers a refused connection, DNS and the timeout;
-# ValueError covers a body that is not JSON. KeyError and TypeError cover a body
-# that IS JSON but is not a node reply - a proxy's status page, an error
-# envelope with no `confirmed` - which `verify` raises on by design rather than
-# read as settled or unsettled. All of them mean the same thing here: this
-# endpoint told us nothing, ask the next one.
+# ValueError covers a body that is not JSON, and also `verify`'s NotANodeReply -
+# a body that IS JSON but is not a node reply, such as a proxy's status page or
+# an error envelope with no `confirmed`, which `verify` refuses by design rather
+# than read as settled or unsettled. KeyError is kept because
+# `balance_corroborated` below still reads a balance reply directly, and
+# TypeError for a reply whose fields are the wrong type. All of them mean the
+# same thing here: this endpoint told us nothing, ask the next one.
 _UNREADABLE = (OSError, ValueError, KeyError, TypeError)
 
 

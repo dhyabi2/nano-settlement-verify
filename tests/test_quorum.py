@@ -239,15 +239,18 @@ def test_a_proxys_html_error_page_counts_as_silence_not_as_an_answer(monkeypatch
 
 
 def test_json_that_is_not_a_node_reply_counts_as_silence(monkeypatch):
-    """`verify` raises KeyError on a reply with neither `error` nor `confirmed`.
+    """`verify` raises NotANodeReply on a reply with neither `error` nor `confirmed`.
 
     That is deliberate there - it must not read as settled or as unsettled - and
     here it means the same as a closed socket: this endpoint told us nothing.
+    `NotANodeReply` is a ValueError, so `_UNREADABLE` catches it exactly as it
+    caught the bare KeyError this used to raise; what changed is only that a
+    seller calling `verify` on its own can now catch it too.
     """
     nodes(monkeypatch, {A: {"status": "ok"}, B: send_block()})
     with pytest.raises(NotCorroborated) as caught:
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
-    assert "KeyError" in caught.value.failures[A]
+    assert "NotANodeReply" in caught.value.failures[A]
 
 
 def test_a_dead_endpoint_does_not_stop_two_live_ones_agreeing(monkeypatch):

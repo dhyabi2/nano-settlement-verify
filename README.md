@@ -58,8 +58,9 @@ except NotFound as error:
 except Mismatch as error:
     print(f"expected {error.expected}, got {error.got}")  # underpaid, or paid elsewhere
 except (OSError, ValueError) as error:
-    # The node did not answer: refused, timed out, HTTP 500, or a body that is
-    # not JSON. This is NOT "the payment is bad" — it is "we could not check".
+    # The node did not answer: refused, timed out, HTTP 500, a body that is not
+    # JSON, or JSON that is not a node reply. This is NOT "the payment is bad" —
+    # it is "we could not check".
     # Retry or hold the call; do not refuse a payment that may well have
     # settled. Catch it: this sits on your request path, and without this arm
     # the first hiccup of a public node raises straight through it.
@@ -104,6 +105,13 @@ exception, so the transport failure reaches you as itself:
 | connection refused, DNS failure, or `RPC_TIMEOUT_S` elapsed | `urllib.error.URLError` (an `OSError`) |
 | an HTTP error status — 403, 429, 500 | `urllib.error.HTTPError` (also an `OSError`) |
 | a body that is not JSON — an HTML error or maintenance page | `json.JSONDecodeError` (a `ValueError`) |
+| a body that **is** JSON but is not a node reply — a proxy's status page, a rate-limit envelope | `NotANodeReply` (also a `ValueError`) |
+
+The last row is the one worth knowing about, because a public RPC behind a proxy
+answers 200 with its own JSON at least as often as it answers with HTML, and
+none of those bodies carries `confirmed`. It used to raise a bare `KeyError`,
+which is neither an `OSError` nor a `ValueError`, so it went straight through
+the arm below and out of the seller's request path.
 
 **These are not `NotFound`.** "The node has no such block" and "the node did not
 answer" are different facts, and only the first one means the payment is not
@@ -227,7 +235,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-153 tests: for `verify`, the four acceptance cases, the error paths around them, the
+159 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks and settlement against the pinned payee and amount; for
