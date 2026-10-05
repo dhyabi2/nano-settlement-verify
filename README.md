@@ -235,13 +235,14 @@ pip install pytest
 python -m pytest -v
 ```
 
-159 tests: for `verify`, the four acceptance cases, the error paths around them, the
+162 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks and settlement against the pinned payee and amount; for
 `nano_independence`, the funding chain and the independent-payer grouping; for
 `nano_quorum`, agreement, contradiction, the duplicate endpoint and every way an
-endpoint can say nothing. None of them touch the network — the node reply is stubbed,
+endpoint can say nothing; for the skill bundle, that its vendored library is the
+library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
 and a fixture fails any test that tries to open a socket.
 
 There is also a hand check that exercises the real `urllib` path against a throwaway HTTP
