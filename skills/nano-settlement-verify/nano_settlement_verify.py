@@ -17,7 +17,7 @@ import json
 import urllib.request
 from dataclasses import dataclass
 
-__all__ = ["Receipt", "NotFound", "Mismatch", "verify", "post_json"]
+__all__ = ["Receipt", "NotFound", "Mismatch", "NotANodeReply", "verify", "post_json"]
 
 # Seconds to wait on the node before giving up. Verification sits on a seller's
 # request path; an unbounded wait there is an outage, not patience.
@@ -50,6 +50,44 @@ class Mismatch(Exception):
         super().__init__(f"expected {expected!r}, got {got!r}")
         self.got = got
         self.expected = expected
+
+
+class NotANodeReply(ValueError):
+    """The endpoint answered with JSON that is not a node's block_info reply.
+
+    A public RPC behind a proxy answers 200 with its own JSON far more often
+    than it answers with HTML: a status page, a rate-limit envelope, an auth
+    complaint. None of them carry `confirmed`, so none of them says anything
+    about the payment.
+
+    This is a `ValueError` on purpose. It belongs with the transport failures,
+    not with `NotFound` or `Mismatch`: it means "we could not look", not "the
+    payment is bad". A seller catching `(OSError, ValueError)` around `verify` -
+    which is what the README tells it to do, because this sits on its request
+    path - holds the call and asks again, instead of taking an uncaught
+    exception. It used to be a bare `KeyError`, which escaped that arm.
+
+    It is never raised for a reply that IS a node reply: an `{"error": ...}`
+    body is still `NotFound`, and `"confirmed": "false"` is still an unsettled
+    receipt.
+    """
+
+
+def _required(reply: dict, field: str):
+    """`reply[field]`, or `NotANodeReply` naming what was missing.
+
+    Every field a node's block_info reply must carry is read through here, so a
+    malformed reply is refused in the documented family rather than raising a
+    bare KeyError out of a seller's request path.
+    """
+    try:
+        return reply[field]
+    except KeyError:
+        raise NotANodeReply(
+            "the endpoint's reply carries no %r, so it is not a node's "
+            "block_info reply and says nothing about this block; keys present: %s"
+            % (field, sorted(reply))
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -176,6 +214,12 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
 
     Raises TypeError when expect_raw is not an int, because raw is an integer
     and a float expectation cannot be compared to one safely.
+
+    Raises NotANodeReply - a ValueError - when the endpoint answers with JSON
+    that is not a node's block_info reply, which is what a proxy's status page
+    or a rate-limit envelope looks like. That lands with the transport failures
+    a seller is told to catch, rather than as a bare KeyError through its
+    request path.
     """
     if isinstance(expect_raw, bool) or not isinstance(expect_raw, int):
         # A float expect_raw silently loses digits above 2**53, so 1 XNO written
@@ -185,9 +229,10 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
     if "error" in reply:
         raise NotFound(block_hash)
-    if reply["confirmed"] != "true":
+    if _required(reply, "confirmed") != "true":
         return Receipt(settled=False, amount_raw=0, height=0, account="")
-    amount = int(reply["amount"])  # raw is an integer string; never parse it as a float
+    # raw is an integer string; never parse it as a float
+    amount = int(_required(reply, "amount"))
     if amount != expect_raw:
         raise Mismatch(amount, expect_raw)
     # Only a send pays anyone. A receive or an open block sits on the account that
@@ -204,6 +249,6 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     return Receipt(
         settled=True,
         amount_raw=amount,
-        height=int(reply["height"]),
+        height=int(_required(reply, "height")),
         account=paid,
     )
