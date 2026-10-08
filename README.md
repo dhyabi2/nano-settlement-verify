@@ -270,7 +270,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-247 tests: for `verify`, the four acceptance cases, the error paths around them, the
+274 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
@@ -281,7 +281,9 @@ against the pinned payee and amount; for
 endpoint can say nothing; for `nano_payers`, both x402 document shapes, every refusal in
 the payee table, and what the payer count will not include - an unconfirmed receive, the
 seller's own sends, a receive from itself, one account written two ways, a chain read only
-half way; and for the README itself, that the curl body in *Check it without running our
+half way; for `nano_claim`, claimed, still receivable to an opened and an unopened
+account, a non-send and a malformed hash refused, and every read that fails - a node error, a
+receive not found within the bound - coming back as `unknown` with a nonzero exit; and for the README itself, that the curl body in *Check it without running our
 code* is the payload `verify` really sends, so the two cannot drift; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
 and a fixture fails any test that tries to open a socket.
@@ -310,7 +312,7 @@ It verifies. It does not sign, send, hold a key, retry or cache, and `verify` it
 command line. That is on purpose: a verifier that never touches a secret is one you can read
 in a sitting and drop into a seller's request path. (`nano_payers` does have one, because an
 audit is something a stranger runs once from a shell, not something on a request path. It
-reads the same way: no key, no send.)
+reads the same way: no key, no send. So does `nano_claim`.)
 
 It also keeps no record of what it has seen, so **spending a block hash once is yours to
 enforce**. A settled receipt says this block paid you that amount; it does not say the block
@@ -417,3 +419,35 @@ It is a lower bound on common control, not proof of independence: keys funded fr
 different exchange withdrawals read as separate payers. `hops` (default 1) follows the
 funding chain further back; pass hub accounts in `ignore` so strangers who withdrew from
 one exchange are not merged.
+
+## Was the send claimed?
+
+A Nano send does not land in the destination by itself: the account it paid has to publish
+a receive block naming it, and an account that has never received anything does not exist
+on the ledger yet. `nano_claim` reads one send hash off the public chain once and says which
+of those it is:
+
+```
+python3 nano_claim.py <send-block-hash> [rpc-url]
+```
+
+```json
+{"send_hash": "243AF6BFC56A199CB2C40C0ABFF4C583B905615E68F54D6CBCCD1A5F0D0DF57C",
+ "from": "nano_1434j1n4sin4cefs5njibag4tsmo596fmg3s6bdogtod3ndmdfez5yuebrh9",
+ "to": "nano_3rra4cwps4w6oh8sfctde3tt1g3tjgh39tgxbxdkbn8kmu5yykmgtqaehp6p",
+ "amount_raw": "10000000000000000000000000", "send_confirmed": true,
+ "outcome": "receivable", "receive_hash": null, "to_account_opened": false,
+ "read_at": "2026-10-08T22:30:14Z", "source": "https://rpc.nano.to", "error": null}
+```
+
+`outcome` is one of four words. `claimed`: a confirmed receive on the destination's chain
+links this send, and `receive_hash` is that block. `receivable`: the node still holds the
+send for the destination; `to_account_opened` says whether that account exists yet. Both
+exit 0. `unknown` (exit 2): the read did not settle it - a node call failed or answered
+something that is not a node reply, the receive was not among the destination's newest 500
+blocks, or the facts disagree; `error` says which. `refused` (exit 3): a malformed hash or a
+block that is not a send. A read that could not run never comes back as `claimed` or
+`receivable`.
+
+It makes three kinds of read call - `blocks_info`, `account_info`, `account_history` - and
+nothing else. The outcome field was asked for by an agent on Moltbook.
