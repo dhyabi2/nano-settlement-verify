@@ -13,11 +13,21 @@ account has two spellings, the modern `nano_` form and the legacy `xrb_` form.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.request
 from dataclasses import dataclass
 
-__all__ = ["Receipt", "NotFound", "Mismatch", "NotANodeReply", "verify", "post_json"]
+__all__ = [
+    "Receipt",
+    "NotFound",
+    "Mismatch",
+    "NotANodeReply",
+    "verify",
+    "post_json",
+    "is_valid_account",
+    "public_key_from_address",
+]
 
 # Seconds to wait on the node before giving up. Verification sits on a seller's
 # request path; an unbounded wait there is an outage, not patience.
@@ -169,6 +179,62 @@ def _account_body(address: object) -> str | None:
         if address.startswith(prefix):
             return address[len(prefix):]
     return None
+
+
+# A Nano address is its public key in base32 plus a 5-byte blake2b checksum of
+# that key, so an address can be checked for being payable at all without
+# asking anyone: 60 characters after the prefix, the first 52 carrying 4 zero
+# padding bits and the 256-bit key, the last 8 carrying the checksum reversed.
+# Nano's own base32 alphabet drops the characters that misread by hand.
+_ACCOUNT_ALPHABET = "13456789abcdefghijkmnopqrstuwxyz"
+_ACCOUNT_ALPHABET_INDEX = {c: i for i, c in enumerate(_ACCOUNT_ALPHABET)}
+_ACCOUNT_BODY_LEN = 60
+
+
+def _base32_to_int(chars: str) -> int | None:
+    """The integer those base32 characters spell, or None if any is not one."""
+    value = 0
+    for char in chars:
+        index = _ACCOUNT_ALPHABET_INDEX.get(char)
+        if index is None:
+            return None
+        value = value * 32 + index
+    return value
+
+
+def public_key_from_address(address: object) -> bytes | None:
+    """The 32-byte public key an address names, or None if it names none.
+
+    None means the string cannot be a Nano account at all: a wrong prefix, a
+    wrong length, a character outside Nano's base32 alphabet, non-zero padding
+    bits, or a checksum that does not match the key it is attached to. It never
+    means the account is empty or unknown to any node - this reads the address
+    itself and asks nobody.
+    """
+    body = _account_body(address)
+    if body is None or len(body) != _ACCOUNT_BODY_LEN:
+        return None
+    key_value = _base32_to_int(body[:52])
+    check_value = _base32_to_int(body[52:])
+    if key_value is None or check_value is None:
+        return None
+    if key_value >> 256:  # the 4 leading bits are padding and must be zero
+        return None
+    public_key = key_value.to_bytes(32, "big")
+    expected = hashlib.blake2b(public_key, digest_size=5).digest()[::-1]
+    if check_value.to_bytes(5, "big") != expected:
+        return None
+    return public_key
+
+
+def is_valid_account(address: object) -> bool:
+    """Whether this string is an address XNO can actually be sent to.
+
+    The checksum is the whole point: a mistyped or truncated Nano address is
+    overwhelmingly likely to fail it, and a Nano send is irreversible, so an
+    address that fails this is money that leaves and never arrives.
+    """
+    return public_key_from_address(address) is not None
 
 
 def _same_account(left: object, right: object) -> bool:

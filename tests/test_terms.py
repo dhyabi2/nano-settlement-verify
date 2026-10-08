@@ -18,7 +18,15 @@ from nano_settlement_verify import Mismatch
 from nano_terms import NotAccepted, TermsRefused, accept, load_terms, settle, terms_sha256
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
-PAYEE = "nano_3seller"
+# Real, checksum-valid Nano addresses, not placeholders. `load_terms` refuses a
+# payee whose checksum does not match, because XNO sent to a mistyped address
+# does not arrive and cannot be recalled - so a fixture payee has to be payable.
+# `test_the_fixture_addresses_are_payable` below holds them to that, so a later
+# edit cannot quietly reintroduce a placeholder and make this file's refusals
+# pass for the wrong reason.
+PAYEE = "nano_3wxkjcz9bby6bo8uw4ow8dtmhsq8ffj7th9kxfq16ribhhkgxam4kbbf6ww3"
+BUYER = "nano_3q4ki69hmaat7gts8kdufcspb31nm6thg4ryiomicgj8dxr4z8qcp4yh9s1z"
+ANOTHER_ACCOUNT = "nano_3pmhddz8g4gxhcqwxw68paibs89wb1o7bqgc6twyfkz1a37puf88pa9stsp8"
 URL = "http://127.0.0.1:7076"
 DELIVERABLE = b'{"answer": 42, "source": "https://example.org/a"}'
 
@@ -37,12 +45,12 @@ def node(monkeypatch, amount="1000000000000000000000000", paid=PAYEE, confirmed=
     def post_json(rpc_url, payload):
         calls.append(payload)
         return {
-            "block_account": "nano_3buyer",
+            "block_account": BUYER,
             "amount": amount,
             "confirmed": confirmed,
             "height": "7",
             "subtype": "send",
-            "contents": {"type": "state", "account": "nano_3buyer", "link_as_account": paid},
+            "contents": {"type": "state", "account": BUYER, "link_as_account": paid},
         }
 
     monkeypatch.setattr(nano_settlement_verify, "post_json", post_json)
@@ -123,6 +131,52 @@ def test_payee_must_be_a_nano_address(payee):
     raw = terms_bytes(payee=payee)
     with pytest.raises(TermsRefused):
         load_terms(raw, terms_sha256(raw))
+
+
+def test_the_fixture_addresses_are_payable():
+    """Every address this file pins is one XNO could actually be sent to.
+
+    The payee checks below are only meaningful if the accepted payee is itself
+    payable; a placeholder would make them pass for the wrong reason.
+    """
+    for name, address in (("PAYEE", PAYEE), ("BUYER", BUYER),
+                          ("ANOTHER_ACCOUNT", ANOTHER_ACCOUNT)):
+        assert nano_settlement_verify.is_valid_account(address), name
+
+
+@pytest.mark.parametrize(
+    "payee",
+    [
+        # The prefix was the whole check, so each of these was accepted as the
+        # pinned payee of terms both sides hash - and then paid, irreversibly.
+        "nano_1a",
+        "nano_3abc",
+        "nano_1",
+        # right length, right alphabet, one character off: the case a checksum
+        # exists for, and the one a human eye does not catch.
+        PAYEE[:-1] + ("4" if PAYEE[-1] != "4" else "5"),
+        # right length, but a character Nano's base32 alphabet does not have
+        # (`0`, `2`, `l` and `v` are left out because they misread by hand).
+        "nano_0" + PAYEE[6:],
+        # the 60 characters of a valid address, truncated by one
+        PAYEE[:-1],
+        # and one character too many
+        PAYEE + "1",
+    ],
+)
+def test_a_payee_that_cannot_be_paid_is_refused(payee):
+    raw = terms_bytes(payee=payee)
+    with pytest.raises(TermsRefused) as caught:
+        load_terms(raw, terms_sha256(raw))
+    assert caught.value.code == "invalid_payee", caught.value.code
+
+
+def test_both_spellings_of_one_payee_are_accepted():
+    """A node answers `nano_`; older tooling stores `xrb_`. They are one
+    account, and the checksum check must not refuse the legacy spelling."""
+    legacy = "xrb_" + PAYEE[len("nano_"):]
+    raw = terms_bytes(payee=legacy)
+    assert load_terms(raw, terms_sha256(raw)).payee == legacy
 
 
 def test_an_unknown_version_is_refused():
@@ -207,7 +261,7 @@ def test_settle_checks_the_pinned_payee_and_amount(monkeypatch):
 
 
 def test_a_payment_to_another_account_does_not_settle_the_terms(monkeypatch):
-    node(monkeypatch, paid="nano_3someoneelse")
+    node(monkeypatch, paid=ANOTHER_ACCOUNT)
     raw = terms_bytes()
     terms = load_terms(raw, terms_sha256(raw))
     with pytest.raises(Mismatch):
