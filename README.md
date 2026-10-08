@@ -241,7 +241,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-171 tests: for `verify`, the four acceptance cases, the error paths around them, the
+174 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a

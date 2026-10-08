@@ -101,3 +101,72 @@ def test_the_skill_cli_answers_node_unreachable_the_way_skill_md_promises():
         % (done.returncode, done.stderr)
     )
     assert '"node_unreachable"' in done.stdout, done.stdout or done.stderr
+
+
+# The same defect as the test above, one line earlier in `main`. `EXPECT_RAW`
+# is parsed by `int(argv[2])` BEFORE the try, so the one error the library is
+# most careful about - an amount that is not a whole number of raw - is the one
+# the front end cannot report. A seller following SKILL.md's table gets exit 1
+# and an empty stdout, which `case $?` matches nowhere.
+_AMOUNT_DRIVER = """
+import sys
+sys.path.insert(0, ".")
+import nano_settlement_verify
+nano_settlement_verify.post_json = lambda rpc_url, payload: (_ for _ in ()).throw(
+    AssertionError("the node must not be asked about an unparseable amount")
+)
+import verify_cli
+sys.exit(verify_cli.main(["verify_cli.py", %r, sys.argv[1], %r]))
+""" % (HASH, ACCOUNT)
+
+
+def _run_with_amount(amount):
+    return subprocess.run(
+        [sys.executable, "-c", _AMOUNT_DRIVER, amount],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_a_decimal_amount_is_refused_with_a_verdict_not_a_traceback():
+    """`0.001` is the mistake SKILL.md warns about, so it must get a verdict.
+
+    The library refuses a float `expect_raw` with `TypeError` because raw has
+    30 digits and a float keeps about 15 - the low digits being exactly where
+    an underpayment hides. The CLI never reaches that refusal: `int("0.001")`
+    raises `ValueError` outside the try and the process dies with exit 1 and
+    nothing on stdout.
+    """
+    done = _run_with_amount("0.001")
+    assert done.returncode == 3, (
+        "expected exit 3 (do not serve), got %d; stderr:\n%s"
+        % (done.returncode, done.stderr)
+    )
+    assert '"invalid_amount"' in done.stdout, done.stdout or done.stderr
+
+
+def test_every_unparseable_amount_stays_inside_the_documented_table():
+    """SKILL.md documents four exit codes and no others; 1 is not one of them."""
+    for amount in ("1e27", "abc", "", "0x10", "1.0", "  ", "1,000"):
+        done = _run_with_amount(amount)
+        assert done.returncode == 3, (
+            "%r exited %d, outside SKILL.md's table; stderr:\n%s"
+            % (amount, done.returncode, done.stderr)
+        )
+        assert '"invalid_amount"' in done.stdout, (
+            "%r produced no verdict on stdout: %s" % (amount, done.stdout or done.stderr)
+        )
+
+
+def test_a_plain_integer_amount_is_untouched_by_the_guard():
+    """The guard adds a refusal and takes nothing away: the node is still asked.
+
+    `post_json` throws if it is called, so reaching it proves the amount
+    parsed and the verdict path ran exactly as before.
+    """
+    done = _run_with_amount(ONE_XNO_RAW)
+    assert done.returncode != 3, (
+        "a valid raw amount was refused as invalid: %s" % (done.stdout or done.stderr)
+    )
+    assert '"invalid_amount"' not in done.stdout, done.stdout
