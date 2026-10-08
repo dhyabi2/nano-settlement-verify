@@ -43,7 +43,7 @@ One JSON object on stdout, and an exit code:
 | --- | --- | --- |
 | 0 | `{"settled": true, ...}` - confirmed send of exactly that amount to that account | serve the call |
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
-| 3 | `{"verdict": "mismatch"}` or `{"verdict": "no_such_block"}` - wrong amount, wrong payee, or no such block | do not serve |
+| 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
 | 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment |
 
 Only a `send` block settles anything. A receive, open or change block is refused however well
