@@ -270,7 +270,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-174 tests: for `verify`, the four acceptance cases, the error paths around them, the
+245 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
@@ -278,7 +278,10 @@ character outside Nano's alphabet, and both spellings of one account) and settle
 against the pinned payee and amount; for
 `nano_independence`, the funding chain and the independent-payer grouping; for
 `nano_quorum`, agreement, contradiction, the duplicate endpoint and every way an
-endpoint can say nothing; for the skill bundle, that its vendored library is the
+endpoint can say nothing; for `nano_payers`, both x402 document shapes, every refusal in
+the payee table, and what the payer count will not include - an unconfirmed receive, the
+seller's own sends, a receive from itself, one account written two ways, a chain read only
+half way; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
 and a fixture fails any test that tries to open a socket.
 
@@ -288,6 +291,7 @@ node stub on loopback:
 ```
 python e2e_check.py
 python e2e_quorum_check.py
+python e2e_payers_check.py
 ```
 
 The second one stands up several loopback nodes that disagree with each other — one
@@ -295,11 +299,17 @@ honest, one lagging, one contradicting, one serving a maintenance page, one dead
 then, when the network allows it, repeats the decisive case against a real confirmed
 block on the live ledger.
 
+The third audits a real x402 seller the same way: it fetches the seller's own document,
+derives the account that document says to pay, and counts off the public ledger who has
+paid it.
+
 ## Scope
 
-It verifies. It does not sign, send, hold a key, retry, cache, or offer a command line.
-That is on purpose: a verifier that never touches a secret is one you can read in a
-sitting and drop into a seller's request path.
+It verifies. It does not sign, send, hold a key, retry or cache, and `verify` itself has no
+command line. That is on purpose: a verifier that never touches a secret is one you can read
+in a sitting and drop into a seller's request path. (`nano_payers` does have one, because an
+audit is something a stranger runs once from a shell, not something on a request path. It
+reads the same way: no key, no send.)
 
 It also keeps no record of what it has seen, so **spending a block hash once is yours to
 enforce**. A settled receipt says this block paid you that amount; it does not say the block
@@ -310,11 +320,88 @@ refuse it the second time, or one payment buys every call the buyer cares to mak
 
 MIT — see [LICENSE](LICENSE).
 
+## Is anybody actually paying this seller?
+
+`verify` answers *did this payment settle?*. Before a buyer has paid anything at all it
+asks something earlier: **is this seller real, and is the account it advertises the account
+that gets paid?**
+
+`nano_payers` answers that from two places the seller does not control the reading of — the
+seller's **own** x402 document, and the **public ledger**. So a stranger holding nothing but
+a URL can re-derive every number, and a seller claiming traffic it has not got is
+contradicted by the ledger rather than argued with.
+
+```
+python nano_payers.py https://extract.paypercall.dev/.well-known/x402
+```
+
+```python
+import json, urllib.request
+from nano_payers import payees_from_manifest, payers
+
+doc = json.load(urllib.request.urlopen("https://seller.example/.well-known/x402"))
+for payee in payees_from_manifest(doc):     # offline: it parses, it does not fetch
+    report = payers(payee.account, ["https://rpc.nano.to"])
+    print(payee.account, payee.prices_raw)
+    print(report.distinct_payers, report.payments, report.received_raw)
+```
+
+Both x402 shapes are read, because they are different documents: a **catalogue**
+(`resources[]`, what a seller serves at `/.well-known/x402`) and a single **challenge**
+(`accepts[]`, what one resource answers a 402 with). An entry on another rail is skipped —
+a seller taking USDC beside XNO is doing nothing wrong — but a Nano entry that cannot be
+paid is refused and named: `payee_checksum` (an address XNO would vanish into),
+`network_unspecified` (a bare `nano`, which names the family and not the network, and
+Nano's test networks share the `nano_` prefix), `not_mainnet`, `amount_not_raw` (a price
+written `1e26` or `0.0001`, or as a JSON number, which cannot carry 30 digits exactly).
+
+What the count will **not** include, each because including it overstates what a seller has
+been paid:
+
+- a **send** on the payee's chain — that is money leaving, not income;
+- an **unconfirmed** receive — it can still be rolled back, so it is reported separately
+  and never counted;
+- a receive **from the payee itself** — moving your own money is not a customer;
+- the same account in both spellings — `nano_` and `xrb_` are one payer, counted once;
+- a chain the node did not read back to its open block — that raises `HistoryIncomplete`
+  rather than reporting a smaller business, which is the one error a caller cannot see.
+
+An endpoint that serves a reply this cannot read, an amount that is not an integer, or half
+a chain is one `payers` walks away from and asks the next node about — failing over on a
+*usable answer*, not on an HTTP 200. The report names the node it was read from, and it is
+still one node's word; `payers_corroborated` requires several to name the **same set** of
+paying accounts, and raises `Disagreement` with the accounts each one named when they do
+not. Amounts and timestamps are deliberately not compared across nodes: `local_timestamp`
+is when each node saw a block and legitimately differs.
+
+**It cannot tell a customer from the seller funding itself.** The ledger records that an
+account sent XNO, never why. `outside_payers(report, our_accounts)` takes that judgement
+out of the count and puts it where it belongs — with whoever knows which accounts are
+theirs — and nothing here infers ownership from the size of a number:
+
+```python
+from nano_payers import outside_payers
+
+real = outside_payers(report, ["nano_<our own funding account>"])
+real.distinct_payers       # accounts that are not us
+```
+
+Measured against a live seller on 2026-10-08 — `extract.paypercall.dev`, whose document
+advertises one payee across 24 resources priced from `100000000000000000000000000` raw:
+**10 distinct accounts have paid it, 27 confirmed payments, 71618000000000000000000000000000
+raw**, of which 5 accounts paid only whole multiples of the advertised per-call price.
+
 ## How many independent payers?
 
 Counting paying keys is not counting buyers: one operator can pay from ten accounts.
 `nano_independence` groups payer accounts by where their money came from - the send that
 opened each account - and counts each group once. Read-only; same bounded node call.
+
+`nano_payers.payers` produces exactly the list it wants, so the two compose into the whole
+question: from a seller's URL to how many independent payers it has. On the live seller
+above, the 10 paying accounts group into **7** independent payers - three of the small
+per-call payers were funded from one account, and so are one operator however separately
+they paid.
 
 ```python
 from nano_independence import independence
