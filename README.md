@@ -122,6 +122,35 @@ and `ValueError` around `verify` and retry or hold — the example above does.
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
 
+## Check it without running our code
+
+You should not have to run the seller's code to believe the seller's receipt. Everything
+`verify` decides comes from one public node call, which you can make yourself:
+
+```
+curl -s -A 'my-check/1' -H 'Content-Type: application/json' \
+  -d '{"action": "block_info", "json_block": "true", "hash": "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948"}' \
+  https://rpc.nano.to
+```
+
+Send both headers. `rpc.nano.to` answers a body without `Content-Type: application/json`
+with `{"error":"Action not provided"}`, and curl's or urllib's default User-Agent may be
+refused with 403 - either reads like a missing block when it is not.
+
+Then read four fields, which are the only ones `verify` reads:
+
+| field | a payment to you has |
+| --- | --- |
+| `confirmed` | the string `"true"` (anything else is *not yet*, not *no*) |
+| `subtype` (state block) or `contents.type` (older block) | `send` - a receive, open, change or epoch block pays nobody |
+| `amount` | the raw amount you quoted, compared as an integer, never as a float |
+| `contents.link_as_account` (state) or `contents.destination` (older) | your account; `nano_` and `xrb_` spellings of the same 60 characters are one account |
+
+The hash above is the genesis account's open block. It is confirmed, but its
+`contents.type` is `open`, so it settles nothing - which is the answer `verify` gives too
+(`Mismatch`). Ask a second node you chose, not one the seller named, if one node's word
+is not enough; the next section does that in code.
+
 ## One node's word, or two?
 
 `verify` above asks one node. That is the right default for a seller's request path, but
