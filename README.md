@@ -270,7 +270,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-245 tests: for `verify`, the four acceptance cases, the error paths around them, the
+247 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
@@ -281,7 +281,8 @@ against the pinned payee and amount; for
 endpoint can say nothing; for `nano_payers`, both x402 document shapes, every refusal in
 the payee table, and what the payer count will not include - an unconfirmed receive, the
 seller's own sends, a receive from itself, one account written two ways, a chain read only
-half way; for the skill bundle, that its vendored library is the
+half way; and for the README itself, that the curl body in *Check it without running our
+code* is the payload `verify` really sends, so the two cannot drift; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
 and a fixture fails any test that tries to open a socket.
 
