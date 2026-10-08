@@ -9,6 +9,9 @@ what is paid, to whom, and what counts as delivered. This module pins them.
 - The schema is fixed: `version`, `payee`, `amount_raw`, `task`, `acceptance`,
   and nothing more. A field this module does not know is refused rather than
   ignored, because an ignored field is a term one side thinks it agreed to.
+  `payee` is checked against its own checksum, not only its prefix: a Nano send
+  is irreversible, so an address that cannot be paid is refused here and not by
+  money that leaves and never arrives.
 - Acceptance is a machine check written into the terms before payment: either
   the deliverable's sha256, or a list of keys a JSON object must carry. There is
   no "the buyer decides" kind; a check a program cannot run is renegotiation.
@@ -160,8 +163,19 @@ def load_terms(terms_bytes: bytes, cited_sha256: str) -> Terms:
     if doc["version"] != VERSION:
         raise TermsRefused("unknown_version", f"only version {VERSION!r} is understood")
     payee = doc["payee"]
-    if nano_settlement_verify._account_body(payee) in (None, ""):
-        raise TermsRefused("invalid_payee", "payee must be a nano_ (or xrb_) address")
+    # The prefix alone used to be the whole check, so `"nano_1a"` was accepted as
+    # the pinned payee of terms both sides hash and rely on - and the buyer then
+    # pays `terms.amount_raw` to it with its own wallet, irreversibly, to an
+    # address that names no account. A Nano address carries a blake2b checksum of
+    # its own public key precisely so that this can be caught without asking
+    # anyone, so it is checked here rather than discovered by a send that never
+    # arrives. This refuses a payee; it never accepts one it refused before.
+    if not nano_settlement_verify.is_valid_account(payee):
+        raise TermsRefused(
+            "invalid_payee",
+            "payee must be a nano_ (or xrb_) address whose checksum matches:"
+            " XNO sent to an address that fails it does not arrive and cannot be recalled",
+        )
     amount = doc["amount_raw"]
     if not isinstance(amount, str) or not _RAW.fullmatch(amount):
         raise TermsRefused("invalid_amount", "amount_raw must be a positive decimal string of raw")

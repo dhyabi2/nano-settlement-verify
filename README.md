@@ -206,6 +206,12 @@ delivered.
 - **The schema is pinned:** `version` (`"1"`), `payee`, `amount_raw` (a decimal string of
   raw), `task` (what is bought, in words) and `acceptance`. An unknown field, a missing
   one or a duplicated key is refused, not ignored.
+- **The payee must be an address XNO can actually reach.** A Nano address carries a
+  blake2b checksum of its own public key, and `load_terms` checks it — not only the
+  `nano_`/`xrb_` prefix. A Nano send is irreversible, so terms that pin a mistyped or
+  truncated payee are money that leaves and never arrives; that is refused here, with
+  `TermsRefused("invalid_payee", ...)`, rather than discovered afterwards.
+  `is_valid_account(address)` is public if you want the same check yourself.
 - **Acceptance is a check a program runs**, written in before payment: `{"sha256": hex}`
   of the deliverable, or `{"json_keys": [...]}` that a JSON object must carry non-empty.
 - **Settlement is checked against the payee and amount the terms pinned**, through
@@ -235,10 +241,12 @@ pip install pytest
 python -m pytest -v
 ```
 
-162 tests: for `verify`, the four acceptance cases, the error paths around them, the
+171 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
-acceptance checks and settlement against the pinned payee and amount; for
+acceptance checks, the payee checksum (including a one-character-off address, a
+character outside Nano's alphabet, and both spellings of one account) and settlement
+against the pinned payee and amount; for
 `nano_independence`, the funding chain and the independent-payer grouping; for
 `nano_quorum`, agreement, contradiction, the duplicate endpoint and every way an
 endpoint can say nothing; for the skill bundle, that its vendored library is the
