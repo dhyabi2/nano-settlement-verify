@@ -7,7 +7,9 @@ for a new account, an open) block naming the send. Until it does, the send sits
 on the ledger as receivable, and an account that has never received anything
 does not exist on the ledger at all.
 
-    python3 nano_claim.py <send-block-hash> [rpc-url]
+    python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]
+        [--attempt N] [--first-unknown-at T] [--retry-after S]
+        [--escalate-reads N] [--escalate-hours H]
 
 prints one JSON object:
 
@@ -15,7 +17,7 @@ prints one JSON object:
      "amount_raw": "10000000000000000000000000", "send_confirmed": true,
      "outcome": "receivable", "receive_hash": null, "to_account_opened": false,
      "read_at": "2026-10-08T12:00:00Z", "source": "https://rpc.nano.to",
-     "error": null}
+     "error": null, "absence_scope": {...}, "reconcile": null}
 
 `outcome` is exactly one of:
 
@@ -33,6 +35,22 @@ prints one JSON object:
 A check that could not run never comes back as `claimed` or `receivable`. Only
 those two exit 0.
 
+`unknown` is a state with a way out, not "wait forever". It carries `reconcile`:
+the `operation_id` to look up again (the send hash - the same identity, never a
+new send), `resubmit: false` (do not re-send on unknown), the `nodes_checked`
+and `checked_at` of this read, `retry_after_s` and `next_check_at`, and
+`escalate_after`: after `unknown_reads` unknown reads or `hours` since the first
+one, `escalate` turns true, `action` reads "escalate" and the caller stops
+re-checking and takes it to a person. The caller carries `attempt` and
+`first_unknown_at` from one read to the next. Answered reads have
+`reconcile: null`.
+
+Not found is never read as never sent. Whenever a node did not have the send,
+the receive, or the destination account, `absence_scope` says what was not
+found, on which `nodes`, `at` what instant, and in what `window`, with
+`proves_absence: false`. With several nodes (`--nodes`), a node that found the
+send outranks one that did not; not found on all of them stays `unknown`.
+
 Every call is a read: `blocks_info`, `account_info`, `account_history`. No key,
 no signing, no sending. Raw amounts are integer strings: 1 XNO is `10**30` raw.
 """
@@ -41,7 +59,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import nano_settlement_verify
 from nano_settlement_verify import is_valid_account
@@ -49,6 +67,9 @@ from nano_settlement_verify import is_valid_account
 __all__ = [
     "Refused",
     "HISTORY_BOUND",
+    "RETRY_AFTER_S",
+    "ESCALATE_AFTER_READS",
+    "ESCALATE_AFTER_HOURS",
     "OUTCOMES",
     "claim_status",
     "exit_code",
@@ -60,6 +81,14 @@ __all__ = [
 # receive older than this is reported as not found within the bound, never as
 # not claimed.
 HISTORY_BOUND = 500
+
+# What an `unknown` tells the caller to do next. A confirmed Nano send settles in
+# about a second, so an unknown that outlives a dozen reads five minutes apart
+# (an hour) is a node or network problem a person should look at; 24 hours is
+# the outer bound for a caller that re-checks less often.
+RETRY_AFTER_S = 300
+ESCALATE_AFTER_READS = 12
+ESCALATE_AFTER_HOURS = 24
 
 OUTCOMES = ("claimed", "receivable", "unknown", "refused")
 
@@ -82,8 +111,28 @@ class _Unknown(Exception):
     """A read that did not answer the question; becomes outcome "unknown"."""
 
 
+class _NotFound(_Unknown):
+    """A node did not have something. Unknown, and scoped: `what` and `window`."""
+
+    def __init__(self, message: str, what: str, window: str):
+        self.what = what
+        self.window = window
+        super().__init__(message)
+
+
+_TIME = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(_TIME)
+
+
+def _at(text: str) -> datetime:
+    return datetime.strptime(text, _TIME).replace(tzinfo=timezone.utc)
+
+
+def _stamp(moment: datetime) -> str:
+    return moment.strftime(_TIME)
 
 
 def _call(rpc_url: str, payload: dict) -> dict:
@@ -110,6 +159,9 @@ def _send(send_hash: str, rpc_url: str) -> dict:
     if "error" in reply:
         # A node that lacks the block may simply be behind; that is not proof
         # the block does not exist, so it is unknown rather than refused.
+        if "not found" in str(reply["error"]).lower():
+            raise _NotFound(f"blocks_info: {reply['error']}", "send block",
+                            "each listed node's ledger at the instant read")
         raise _Unknown(f"blocks_info: {reply['error']}")
     blocks = reply.get("blocks")
     if not isinstance(blocks, dict) or not isinstance(blocks.get(send_hash), dict):
@@ -171,25 +223,16 @@ def _receive_of(send_hash: str, account: str, rpc_url: str, bound: int):
             link = nano_settlement_verify._contents(block).get("link")
             if str(link or "").upper() == send_hash:
                 return block_hash, block.get("confirmed") == "true"
-    raise _Unknown(
+    raise _NotFound(
         f"no receive linking this send in the newest {len(history)} block(s) of "
-        f"{account} (bound {bound}); it may be older, or not on this node"
+        f"{account} (bound {bound}); it may be older, or not on this node",
+        "receive linking this send",
+        f"the newest {bound} blocks of {account} on each listed node at the instant read",
     )
 
 
-def claim_status(send_hash, rpc_url: str, *, history_bound: int = HISTORY_BOUND,
-                 now=_now) -> dict:
-    """Read once whether the send `send_hash` was claimed by the account it paid.
-
-    Returns the JSON-ready dict described in the module docstring. Raises
-    `Refused` for a malformed hash or a block that is not a send. Every other
-    failure - a node call that raises or answers garbage - comes back as
-    outcome "unknown" with `error` set, never as an exception and never as a
-    clean outcome.
-    """
-    if not isinstance(send_hash, str) or not _HASH.fullmatch(send_hash):
-        raise Refused("malformed_hash", f"{send_hash!r} is not 64 hex characters")
-    send_hash = send_hash.upper()
+def _read_one(send_hash: str, rpc_url: str, history_bound: int, now) -> tuple[dict, object]:
+    """One node's answer: (status, the _NotFound behind it or None)."""
     status = {
         "send_hash": send_hash,
         "from": None,
@@ -203,6 +246,7 @@ def claim_status(send_hash, rpc_url: str, *, history_bound: int = HISTORY_BOUND,
         "source": rpc_url,
         "error": None,
     }
+    absent = None
     try:
         block = _send(send_hash, rpc_url)
         operation = nano_settlement_verify._operation(block)
@@ -226,9 +270,12 @@ def claim_status(send_hash, rpc_url: str, *, history_bound: int = HISTORY_BOUND,
         if flag not in ("0", "1"):
             raise _Unknown(f"the node did not say whether the send is receivable ({flag!r})")
         status["to_account_opened"] = _opened(destination, rpc_url)
+        if not status["to_account_opened"]:
+            absent = _NotFound("account_info: Account not found", "destination account",
+                               "each listed node's ledger at the instant read")
         if flag == "1":
             status["outcome"] = "receivable"
-            return status
+            return status, absent
         if not status["send_confirmed"]:
             raise _Unknown("the send is neither confirmed nor receivable")
         if not status["to_account_opened"]:
@@ -238,14 +285,90 @@ def claim_status(send_hash, rpc_url: str, *, history_bound: int = HISTORY_BOUND,
         if not confirmed:
             raise _Unknown(f"receive {receive_hash} is not confirmed yet")
         status["outcome"] = "claimed"
-        return status
+        return status, None
     except Refused:
         raise
+    except _NotFound as error:
+        status["error"] = str(error)
+        absent = error
     except _Unknown as error:
         status["error"] = str(error)
     except _UNREADABLE as error:
         status["error"] = f"{type(error).__name__}: {error}"
     status["outcome"] = "unknown"
+    return status, absent
+
+
+def claim_status(send_hash, rpc_url, *, history_bound: int = HISTORY_BOUND, now=_now,
+                 attempt: int = 1, first_unknown_at: str | None = None,
+                 retry_after_s: int = RETRY_AFTER_S,
+                 escalate_after_reads: int = ESCALATE_AFTER_READS,
+                 escalate_after_hours: float = ESCALATE_AFTER_HOURS) -> dict:
+    """Read whether the send `send_hash` was claimed by the account it paid.
+
+    `rpc_url` is one node URL or a list of them, asked in order: the first
+    node that answers `claimed` settles it, a `receivable` answer stands
+    unless a later node finds the claim, and only when no node answers is the
+    outcome "unknown". Returns the JSON-ready dict described in the module
+    docstring. Raises `Refused` for a malformed hash or a block that is not a
+    send. Every other failure comes back as outcome "unknown" with `error`,
+    `absence_scope` (when something was not found) and `reconcile` set, never
+    as an exception and never as a clean outcome. `attempt` and
+    `first_unknown_at` are carried by the caller from its earlier unknown reads.
+    """
+    if not isinstance(send_hash, str) or not _HASH.fullmatch(send_hash):
+        raise Refused("malformed_hash", f"{send_hash!r} is not 64 hex characters")
+    send_hash = send_hash.upper()
+    urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
+    if not urls:
+        raise ValueError("no node to read")
+    reads = []
+    for url in urls:
+        status, absent = _read_one(send_hash, url, history_bound, now)
+        reads.append((url, status, absent))
+        if status["outcome"] == "claimed":
+            break
+    answered = [r for r in reads if r[1]["outcome"] != "unknown"]
+    url, status, absent = answered[-1] if answered else reads[0]
+    checked_at = status["read_at"] if answered else reads[-1][1]["read_at"]
+    if not answered and len(reads) > 1:
+        status["error"] = "; ".join(f"{u}: {s['error']}" for u, s, _ in reads)
+    if absent is not None:
+        same = [u for u, _, a in reads if a is not None and a.what == absent.what]
+        status["absence_scope"] = {
+            "not_found": absent.what,
+            "nodes": same if not answered else [url],
+            "at": status["read_at"],
+            "window": absent.window,
+            "proves_absence": False,
+        }
+    else:
+        status["absence_scope"] = None
+    status["reconcile"] = None
+    if answered:
+        return status
+
+    first = first_unknown_at or checked_at
+    deadline = _at(first) + timedelta(hours=escalate_after_hours)
+    escalate = attempt >= escalate_after_reads or _at(checked_at) >= deadline
+    status["reconcile"] = {
+        "operation_id": send_hash,
+        "resubmit": False,
+        "nodes_checked": [u for u, _, _ in reads],
+        "checked_at": checked_at,
+        "attempt": attempt,
+        "retry_after_s": retry_after_s,
+        "next_check_at": None if escalate
+        else _stamp(_at(checked_at) + timedelta(seconds=retry_after_s)),
+        "escalate_after": {
+            "unknown_reads": escalate_after_reads,
+            "hours": escalate_after_hours,
+            "first_unknown_at": first,
+            "deadline": _stamp(deadline),
+        },
+        "escalate": escalate,
+        "action": "escalate" if escalate else "recheck",
+    }
     return status
 
 
@@ -254,26 +377,73 @@ def exit_code(status: dict) -> int:
     return {"claimed": 0, "receivable": 0, "refused": 3}.get(status.get("outcome"), 2)
 
 
+USAGE = (
+    "usage: python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]\n"
+    "       [--attempt N] [--first-unknown-at YYYY-MM-DDTHH:MM:SSZ]\n"
+    "       [--retry-after SECONDS] [--escalate-reads N] [--escalate-hours H]"
+)
+
+
+class _Usage(Exception):
+    pass
+
+
+def _parse(argv: list[str]):
+    import argparse
+
+    class Parser(argparse.ArgumentParser):
+        # argparse exits 2 on a bad flag, which is this tool's "unknown".
+        def error(self, message):
+            raise _Usage(message)
+
+    parser = Parser(add_help=False)
+    parser.add_argument("send_hash")
+    parser.add_argument("rpc_url", nargs="?")
+    parser.add_argument("--nodes", nargs="+", default=[])
+    parser.add_argument("--attempt", type=int, default=1)
+    parser.add_argument("--first-unknown-at")
+    parser.add_argument("--retry-after", type=int, default=RETRY_AFTER_S)
+    parser.add_argument("--escalate-reads", type=int, default=ESCALATE_AFTER_READS)
+    parser.add_argument("--escalate-hours", type=float, default=ESCALATE_AFTER_HOURS)
+    args = parser.parse_args(argv)
+    if args.attempt < 1 or args.retry_after < 0 or args.escalate_reads < 1 \
+            or args.escalate_hours < 0:
+        raise _Usage("--attempt and --escalate-reads are at least 1; times are not negative")
+    if args.first_unknown_at is not None:
+        try:
+            _at(args.first_unknown_at)
+        except ValueError:
+            raise _Usage("--first-unknown-at is YYYY-MM-DDTHH:MM:SSZ") from None
+    return args
+
+
 def _main(argv: list[str]) -> int:
-    """`python3 nano_claim.py <send-block-hash> [rpc-url]`."""
+    """`python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...] ...`."""
     import sys
 
-    if not argv or len(argv) > 2:
-        print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print("usage: python3 nano_claim.py <send-block-hash> [rpc-url]", file=sys.stderr)
-        return 64
-    send_hash = argv[0]
-    rpc_url = argv[1] if len(argv) > 1 else "https://rpc.nano.to"
     try:
-        status = claim_status(send_hash, rpc_url)
+        args = _parse(argv)
+    except _Usage as error:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print(f"{USAGE}\n{error}", file=sys.stderr)
+        return 64
+    urls = ([args.rpc_url] if args.rpc_url else []) + args.nodes
+    urls = list(dict.fromkeys(urls)) or ["https://rpc.nano.to"]
+    try:
+        status = claim_status(
+            args.send_hash, urls if len(urls) > 1 else urls[0],
+            attempt=args.attempt, first_unknown_at=args.first_unknown_at,
+            retry_after_s=args.retry_after, escalate_after_reads=args.escalate_reads,
+            escalate_after_hours=args.escalate_hours,
+        )
     except Refused as error:
         status = {
-            "send_hash": send_hash,
+            "send_hash": args.send_hash,
             "outcome": "refused",
             "reason": error.reason,
             "error": error.detail,
             "read_at": _now(),
-            "source": rpc_url,
+            "source": urls[0],
         }
     print(json.dumps(status))
     return exit_code(status)
