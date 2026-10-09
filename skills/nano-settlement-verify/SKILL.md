@@ -25,7 +25,7 @@ skill; this one is the seller's check.
 ## Run it
 
 ```
-python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL]
+python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 ```
 
 - `BLOCK_HASH` - the 64-hex send block the buyer gave you.
@@ -34,6 +34,13 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL]
   Never use a decimal or a float here: it loses the low digits.
 - `ACCOUNT` - the `nano_` account you expected to be paid.
 - `RPC_URL` - optional; any Nano node RPC.
+- `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
+  offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
+
+**What "seen" means.** A Nano block carries no sender-signed time. `seen_at` is the node's
+`local_timestamp` - when THAT node first saw the block, on its own clock - and another node
+can differ by seconds; very old blocks report `0`, which is `unknown_time`, never on time.
+The expiry is checked against the node you chose: read it on two nodes if seconds matter.
 
 ## Read the verdict
 
@@ -45,6 +52,9 @@ One JSON object on stdout, and an exit code:
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
 | 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
 | 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment |
+| 5 | `{"verdict": "late", "seen_at": ..., "not_after": ...}` - right amount and account, seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
+| 6 | `{"verdict": "unknown_time", "seen_at": null, ...}` - settled, but the node reports no time for it | do not treat as on time; ask another node |
+| 64 | usage error, or `{"verdict": "invalid_not_after"}` | fix the command |
 
 Only a `send` block settles anything. A receive, open or change block is refused however well
 its amount matches. The account compared is the account PAID (the block's destination), not
