@@ -355,6 +355,8 @@ each report also carries `repeat_payers` (accounts with two or more confirmed pa
 `repeat_rate` (`repeat_payers / distinct_payers`, four places, `0` when nobody has paid);
 per payer, `payments` and `first_timestamp`/`last_timestamp` (when the payee's receive was
 seen, i.e. when the money was collected). Both are recomputed by `outside_payers`.
+A repeat is any second payment, including one seconds after the first: read `repeat_rate`
+together with each payer's first and last timestamps before calling it returning custom.
 
 Both x402 shapes are read, because they are different documents: a **catalogue**
 (`resources[]`, what a seller serves at `/.well-known/x402`) and a single **challenge**
