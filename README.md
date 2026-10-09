@@ -119,6 +119,20 @@ there. A seller that treats an unreachable node as a missing block refuses a
 call the buyer already paid for, and XNO does not come back. Catch `OSError`
 and `ValueError` around `verify` and retry or hold — the example above does.
 
+### An order's expiry: `not_after`
+
+`verify(..., not_after=unix_seconds)` also refuses a payment that arrived with the right
+amount and account but after the order expired: it raises `Late(seen_at, not_after, receipt)`
+(the receipt is kept, the money did move), and settles when `seen_at <= not_after` -
+exactly at the deadline is on time. `parse_not_after` reads unix seconds or ISO-8601 with an
+offset (`2026-10-09T18:00:00Z`). It is the same single `block_info` read.
+
+**The time is not the sender's.** A Nano block carries no sender-signed time; `seen_at` is
+the node's `local_timestamp`, the moment *that* node first saw the block on its own clock,
+and another node can differ by seconds. Very old blocks report `0`; missing or `0` raises
+`UnknownTime`, never "on time". The deadline is checked against the node you chose - read
+it on two nodes if seconds matter.
+
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
 
@@ -270,7 +284,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-300 tests: for `verify`, the four acceptance cases, the error paths around them, the
+327 tests: for `verify`, the four acceptance cases, the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines), the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a

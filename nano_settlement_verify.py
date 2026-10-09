@@ -17,13 +17,18 @@ import hashlib
 import json
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 
 __all__ = [
     "Receipt",
     "NotFound",
     "Mismatch",
+    "Late",
+    "UnknownTime",
     "NotANodeReply",
     "verify",
+    "parse_not_after",
+    "TIME_SOURCE",
     "post_json",
     "is_valid_account",
     "public_key_from_address",
@@ -60,6 +65,41 @@ class Mismatch(Exception):
         super().__init__(f"expected {expected!r}, got {got!r}")
         self.got = got
         self.expected = expected
+
+
+# Said in every receipt that carries a deadline, because it is the whole caveat.
+TIME_SOURCE = (
+    "local_timestamp: when this node first saw the block, on its own clock; "
+    "not signed by the sender, and another node can differ by seconds - "
+    "read it on two nodes if seconds matter"
+)
+
+
+class Late(Exception):
+    """The block settled for the right amount and account, but was seen after not_after.
+
+    The money did arrive - `receipt` is the settled receipt, so a refund can
+    cite it - but not by the order's deadline, so the order is not paid on time.
+    """
+
+    def __init__(self, seen_at: int, not_after: int, receipt: "Receipt") -> None:
+        super().__init__(f"seen at {seen_at}, after the deadline {not_after}")
+        self.seen_at = seen_at
+        self.not_after = not_after
+        self.receipt = receipt
+
+
+class UnknownTime(Exception):
+    """The block settled, but the node reports no time it saw it (missing or 0).
+
+    Very old blocks carry local_timestamp 0. With no time, on-time cannot be
+    shown, so this is never read as on time.
+    """
+
+    def __init__(self, not_after: int, receipt: "Receipt") -> None:
+        super().__init__(f"the node reports no local_timestamp; deadline {not_after} unchecked")
+        self.not_after = not_after
+        self.receipt = receipt
 
 
 class NotANodeReply(ValueError):
@@ -108,16 +148,50 @@ class Receipt:
     amount_raw: int
     height: int
     account: str
+    # Set only when verify() was given not_after; otherwise the receipt and its
+    # JSON are exactly what they were before deadlines existed.
+    seen_at: int | None = None
+    not_after: int | None = None
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "settled": self.settled,
-                "amount_raw": self.amount_raw,
-                "height": self.height,
-                "account": self.account,
-            }
-        )
+        out = {
+            "settled": self.settled,
+            "amount_raw": self.amount_raw,
+            "height": self.height,
+            "account": self.account,
+        }
+        if self.not_after is not None:
+            out.update(seen_at=self.seen_at, not_after=self.not_after, time_source=TIME_SOURCE)
+        return json.dumps(out)
+
+
+def parse_not_after(text: str) -> int:
+    """A deadline as unix seconds, from unix seconds or ISO-8601 with a UTC offset.
+
+    `1790150110`, `2026-09-23T07:55:10Z` and `2026-09-23T07:55:10+00:00` are the
+    same instant. A time with no offset is refused (ValueError): whose clock it
+    means is a guess, and a guessed deadline decides real orders.
+    """
+    text = str(text).strip()
+    if text.isdigit():
+        return int(text)
+    when = datetime.fromisoformat(text)  # ValueError on anything unreadable
+    if when.tzinfo is None:
+        raise ValueError(f"deadline {text!r} has no UTC offset; add Z or +00:00")
+    return int(when.timestamp())
+
+
+def _seen_at(reply: dict) -> int | None:
+    """The node's local_timestamp as unix seconds, or None when it has none.
+
+    Missing, empty, unreadable and 0 all come back as None: 0 is what a node
+    reports for a block it has no record of seeing, not the epoch.
+    """
+    try:
+        seen = int(str(reply.get("local_timestamp") or "0"))
+    except ValueError:
+        return None
+    return seen if seen > 0 else None
 
 
 def post_json(rpc_url: str, payload: dict) -> dict:
@@ -266,7 +340,9 @@ def _paid_account(reply: dict) -> str:
     )
 
 
-def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Receipt:
+def verify(
+    block_hash: str, expect_raw: int, account: str, rpc_url: str, not_after: int | None = None
+) -> Receipt:
     """Prove a Nano send block settled for expect_raw to account.
 
     Returns a settled Receipt when it did, and an unsettled one when the node
@@ -286,6 +362,13 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     or a rate-limit envelope looks like. That lands with the transport failures
     a seller is told to catch, rather than as a bare KeyError through its
     request path.
+
+    With `not_after` (unix seconds; see parse_not_after), a settled block must
+    also have been seen by this node at or before it - inclusive. Raises Late
+    when it was seen after, and UnknownTime when the node reports no time
+    (missing or 0). The time is the node's own local_timestamp: a Nano block
+    carries no sender-signed time, so the deadline is checked against the node
+    the caller chose, and another node can differ by seconds.
     """
     if isinstance(expect_raw, bool) or not isinstance(expect_raw, int):
         # A float expect_raw silently loses digits above 2**53, so 1 XNO written
@@ -312,9 +395,21 @@ def verify(block_hash: str, expect_raw: int, account: str, rpc_url: str) -> Rece
     paid = _paid_account(reply)
     if not _same_account(paid, account):
         raise Mismatch(paid, account)
-    return Receipt(
+    receipt = Receipt(
         settled=True,
         amount_raw=amount,
         height=int(_required(reply, "height")),
         account=paid,
     )
+    if not_after is None:
+        return receipt
+    # The order's expiry. Checked last, so a wrong amount or payee is still a
+    # Mismatch whatever its time. Inclusive: seen exactly at not_after is on time.
+    seen_at = _seen_at(reply)
+    receipt = Receipt(receipt.settled, receipt.amount_raw, receipt.height, receipt.account,
+                      seen_at=seen_at, not_after=not_after)
+    if seen_at is None:
+        raise UnknownTime(not_after, receipt)
+    if seen_at > not_after:
+        raise Late(seen_at, not_after, receipt)
+    return receipt
