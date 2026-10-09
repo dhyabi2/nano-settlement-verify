@@ -19,6 +19,12 @@ wallet would merge them - pass its account in `ignore` (the caller decides which
 accounts are hubs; there is deliberately no built-in registry). The default is one
 hop, the direct funder, because every extra hop reaches further towards the hubs.
 
+Every attribution carries what it rests on (`witness`): for each hop, the account's
+frontier and block count when it was checked, its open block, and the funding send
+that open block names. The open block and its funding send cannot change once
+confirmed; the frontier can, so a later read whose frontier differs says that
+account has moved since, and its money may since have come from somewhere else.
+
 Standard library only; it only reads (`account_info`, `block_info`), through the
 same bounded `post_json` as `nano_settlement_verify`. No signing, no sending.
 """
@@ -27,6 +33,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import nano_settlement_verify
 from nano_settlement_verify import _account_body, _contents
@@ -50,29 +57,73 @@ def _check_hops(hops: object) -> int:
 _UNOPENED = object()
 
 
+def _utc_now() -> str:
+    """When a reading is taken, UTC ISO-8601 with a Z; a function so a test can fix it."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _count(value: object) -> int | None:
+    text = str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+    return int(text) if text.isdigit() else None
+
+
 def _funder(account: str, rpc_url: str):
-    """The account whose send opened `account`; None when that cannot be read;
-    _UNOPENED when the node has no such account."""
+    """(funder, step) for `account`: the account whose send opened it, and the
+    blocks that attribution rests on. funder is None when that cannot be read;
+    _UNOPENED (with step None) when the node has no such account."""
     post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
     info = post(rpc_url, {"action": "account_info", "account": account})
     if "error" in info:
-        return _UNOPENED
+        return _UNOPENED, None
+    step = {
+        "account": account,
+        "checked_at_frontier": info.get("frontier") or None,
+        "block_count": _count(info.get("block_count")),
+        "open_block": info.get("open_block") or None,
+        "funding_send": None,
+        "funder": None,
+    }
     if not info.get("open_block"):
-        return None
+        return None, step
     opened = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": info["open_block"]})
     if "error" in opened:
-        return None
+        return None, step
     contents = _contents(opened)
     # A state open block carries the funding send's hash as its link; a pre-state
     # open block carries it as source.
     source = contents.get("link") or contents.get("source")
     if not source:
-        return None
+        return None, step
     send = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": source})
     if "error" in send:
-        return None
+        return None, step
     funder = send.get("block_account") or _contents(send).get("account")
-    return str(funder) if funder else None
+    if not funder:
+        return None, step
+    step["funding_send"] = str(source)
+    step["funder"] = str(funder)
+    return str(funder), step
+
+
+def _funding_trail(account: str, rpc_url: str, hops: int):
+    """(chain, steps): `funding_chain`, plus one witness step per account read."""
+    first, step = _funder(account, rpc_url)
+    if first is _UNOPENED:
+        return None, []
+    steps = [step]
+    if first is None:
+        return [], steps
+    chain = [first]
+    seen = {_key(account), _key(first)}
+    while len(chain) < hops:
+        nxt, step = _funder(chain[-1], rpc_url)
+        if step is not None:
+            steps.append(step)
+        if nxt is None or nxt is _UNOPENED or _key(nxt) in seen:
+            break
+        seen.add(_key(nxt))
+        chain.append(nxt)
+    return chain, steps
 
 
 def funding_chain(account: str, rpc_url: str, hops: int = 1) -> list[str] | None:
@@ -82,20 +133,7 @@ def funding_chain(account: str, rpc_url: str, hops: int = 1) -> list[str] | None
     chain stops early at an account whose origin cannot be read or at a loop.
     """
     hops = _check_hops(hops)
-    first = _funder(account, rpc_url)
-    if first is _UNOPENED:
-        return None
-    if first is None:
-        return []
-    chain = [first]
-    seen = {_key(account), _key(first)}
-    while len(chain) < hops:
-        nxt = _funder(chain[-1], rpc_url)
-        if nxt is None or nxt is _UNOPENED or _key(nxt) in seen:
-            break
-        seen.add(_key(nxt))
-        chain.append(nxt)
-    return chain
+    return _funding_trail(account, rpc_url, hops)[0]
 
 
 @dataclass
@@ -109,6 +147,12 @@ class Independence:
     unopened: list[str]
     hops: int
     chains: dict[str, list[str]] = field(default_factory=dict)
+    # Per payer, one step per account read along its chain: that account's
+    # frontier and block count when checked, its open block, the funding send
+    # the open block names, and the funder. Compare frontiers on a re-read to see
+    # which account moved before comparing any count.
+    witness: dict[str, list[dict]] = field(default_factory=dict)
+    read_at: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -120,6 +164,8 @@ class Independence:
                 "unopened": self.unopened,
                 "hops": self.hops,
                 "chains": self.chains,
+                "read_at": self.read_at,
+                "witness": self.witness,
             }
         )
 
@@ -149,16 +195,19 @@ def independence(
         if k is not None and k not in unique:
             unique[k] = payer
 
+    read_at = _utc_now()
     chains: dict[str, list[str]] = {}
+    witness: dict[str, list[dict]] = {}
     unopened: list[str] = []
     circular: list[str] = []
     counted: list[str] = []
     for k, payer in unique.items():
-        chain = funding_chain(payer, rpc_url, hops)
+        chain, steps = _funding_trail(payer, rpc_url, hops)
         if chain is None:
             unopened.append(payer)
             continue
         chains[payer] = chain
+        witness[payer] = steps
         if seller_key is not None and seller_key in {_key(a) for a in chain}:
             circular.append(payer)
         else:
@@ -201,4 +250,6 @@ def independence(
         unopened=unopened,
         hops=hops,
         chains=chains,
+        witness=witness,
+        read_at=read_at,
     )

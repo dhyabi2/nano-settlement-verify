@@ -404,6 +404,20 @@ advertises one payee across 24 resources priced from `10000000000000000000000000
 **10 distinct accounts have paid it, 27 confirmed payments, 71618000000000000000000000000000
 raw**, of which 5 accounts paid only whole multiples of the advertised per-call price.
 
+### Witness: what a reading is true as of
+
+A payer count, and any "this payer is our own money" attribution, is true as of a block,
+not forever. Each payer report therefore carries `read_at` (UTC, when the read started) and
+`witness`: `frontier`, the newest block of the payee's chain the history was read down from,
+and `block_count`, its height. A partial read witnesses nothing (`frontier` and
+`block_count` are `null`), and a corroborated report carries a frontier only when every node
+read from the same one. `independence` does the same per payer: for each hop, the account's
+`checked_at_frontier` and `block_count`, its `open_block`, and the `funding_send` the
+attribution rests on. The re-read rule: compare frontiers before comparing counts. A later
+read whose frontier is the same read the same chain; one whose frontier differs has seen
+that account move, and may flip an attribution - a payer once funded only by its operator
+can since have been paid from elsewhere, and the reverse.
+
 ## How many independent payers?
 
 Counting paying keys is not counting buyers: one operator can pay from ten accounts.

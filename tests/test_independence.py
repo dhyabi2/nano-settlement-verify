@@ -168,6 +168,9 @@ def test_report_is_json_with_every_field(node):
 
     node({"nano_1a": "nano_1x", "nano_1b": "nano_1x"})
     data = json.loads(independence(["nano_1a", "nano_1b"], URL).to_json())
+    # The witness fields are added beside the original keys, which keep their values.
+    assert set(data.pop("witness")) == {"nano_1a", "nano_1b"}
+    assert data.pop("read_at").endswith("Z")
     assert data == {
         "keys": 2,
         "independent": 1,
@@ -204,3 +207,24 @@ def test_an_ignored_hub_is_not_walked_past(node):
     # by one account. Walking past the ignored hub would merge them through its funder.
     node({"nano_1a": EXCHANGE, "nano_1b": EXCHANGE, EXCHANGE: "nano_1genesis"})
     assert independence(["nano_1a", "nano_1b"], URL, hops=2, ignore=[EXCHANGE]).independent == 2
+
+
+def test_each_attribution_carries_the_blocks_it_rests_on(node, monkeypatch):
+    """A later re-read can show which account moved: every hop names its frontier and its funding send."""
+    monkeypatch.setattr(nano_independence, "_utc_now", lambda: "2026-10-09T06:00:00Z", raising=False)
+    node({"nano_1a": "nano_1op", "nano_1op": SELLER})
+    report = independence(["nano_1a"], URL, seller=SELLER, hops=2)
+    assert report.funded_by_seller == ["nano_1a"]
+    assert report.read_at == "2026-10-09T06:00:00Z"
+    assert report.witness == {
+        "nano_1a": [
+            {"account": "nano_1a", "checked_at_frontier": "OPEN_nano_1a", "block_count": None,
+             "open_block": "OPEN_nano_1a", "funding_send": "SEND_nano_1a", "funder": "nano_1op"},
+            {"account": "nano_1op", "checked_at_frontier": "OPEN_nano_1op", "block_count": None,
+             "open_block": "OPEN_nano_1op", "funding_send": "SEND_nano_1op", "funder": SELLER},
+        ]
+    }
+    import json
+
+    data = json.loads(report.to_json())
+    assert data["witness"] == report.witness and data["read_at"] == "2026-10-09T06:00:00Z"

@@ -777,3 +777,79 @@ def test_a_corroborated_report_carries_the_repeat_rate(monkeypatch):
     nodes(monkeypatch, {A: same, B: same})
     report = payers_corroborated(PAYEE, [A, B])
     assert (report.distinct_payers, report.repeat_payers, report.repeat_rate) == (2, 1, 0.5)
+
+
+# --------------------------------------------------------------------------
+# witness - what a reading is true as of
+# --------------------------------------------------------------------------
+
+HEAD = "B7DBFAE80F19685DAE4D6CECF25DE5FAF3CDE1C212EC68E5CEF62FB17CD6E441"
+NOW = "2026-10-09T06:00:00Z"
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    monkeypatch.setattr(nano_payers, "_utc_now", lambda: NOW, raising=False)
+
+
+def test_a_report_names_the_block_it_was_read_up_to_and_when(monkeypatch, clock):
+    nodes(monkeypatch, {A: history(
+        receive(PAYER_1, CALL_PRICE, height=3, block_hash=HEAD),
+        receive(PAYER_2, CALL_PRICE, height=2),
+        open_block(FUNDER, CALL_PRICE),
+    )})
+    report = payers(PAYEE, [A])
+    assert report.read_at == NOW
+    assert report.witness == {"frontier": HEAD, "block_count": 3}
+    body = json.loads(report.to_json())
+    assert body["read_at"] == NOW
+    assert body["witness"] == {"frontier": HEAD, "block_count": 3}
+    # The keys that were already there are untouched.
+    assert body["distinct_payers"] == 3 and body["complete"] is True
+
+
+def test_the_witness_is_the_newest_block_however_the_page_is_ordered(monkeypatch, clock):
+    nodes(monkeypatch, {A: history(
+        receive(PAYER_1, CALL_PRICE, height=3),
+        open_block(PAYER_1, CALL_PRICE),
+        receive(FUNDER, CALL_PRICE, height=4, block_hash=HEAD),
+    )})
+    assert payers(PAYEE, [A]).witness == {"frontier": HEAD, "block_count": 4}
+
+
+def test_a_partial_read_does_not_witness_a_frontier(monkeypatch, clock):
+    chain = long_chain(HISTORY_PAGE + 5)
+    nodes(monkeypatch, {A: lambda payload: {"account": PAYEE, "history": chain[:HISTORY_PAGE]}})
+    report = payers(PAYEE, [A], allow_partial=True)
+    assert report.complete is False
+    assert report.witness == {"frontier": None, "block_count": None}
+    assert json.loads(report.to_json())["witness"]["frontier"] is None
+
+
+def test_an_unopened_payee_is_witnessed_as_an_empty_chain(monkeypatch, clock):
+    nodes(monkeypatch, {A: {"account": PAYEE, "history": ""}})
+    report = payers(PAYEE, [A])
+    assert report.witness == {"frontier": None, "block_count": 0}
+    assert report.read_at == NOW
+
+
+def test_outside_payers_keeps_the_witness_and_the_time(monkeypatch, clock):
+    report = report_with(monkeypatch)
+    outside = outside_payers(report, [FUNDER])
+    assert outside.witness == report.witness
+    assert outside.witness["frontier"] is not None
+    assert outside.read_at == NOW
+    body = json.loads(outside.to_json())
+    assert body["witness"] == report.witness and body["read_at"] == NOW
+
+
+def test_corroboration_witnesses_a_frontier_only_when_every_node_had_it(monkeypatch, clock):
+    same = history(receive(PAYER_1, CALL_PRICE, height=2, block_hash=HEAD), open_block(PAYER_2, CALL_PRICE))
+    nodes(monkeypatch, {A: same, B: same})
+    assert payers_corroborated(PAYEE, [A, B]).witness == {"frontier": HEAD, "block_count": 2}
+    # Same payer set, but one node has a newer head (a send out, say): which
+    # block the reading is true as of is then not one answer.
+    nodes(monkeypatch, {A: same, B: history(send(height=3), *same["history"])})
+    report = payers_corroborated(PAYEE, [A, B])
+    assert report.distinct_payers == 2
+    assert report.witness == {"frontier": None, "block_count": None}

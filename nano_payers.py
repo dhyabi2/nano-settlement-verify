@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import nano_quorum
 import nano_settlement_verify
@@ -184,6 +185,14 @@ class PayerReport:
     blocks_read: int
     complete: bool
     asked: tuple[str, ...] = field(default=())
+    # What this reading is true as of: the newest block of the payee's chain the
+    # history was read down from (`frontier`) and its height (`block_count`), and
+    # when the read started. A later read whose frontier differs may count
+    # differently; one with the same frontier read the same chain. A partial read
+    # witnesses nothing - frontier and block_count are None - because it is not
+    # true as of any block. An unopened payee is frontier None, block_count 0.
+    witness: dict = field(default_factory=lambda: dict(_NO_WITNESS))
+    read_at: str | None = None
 
     # Derived from `payers` rather than stored, so a report rebuilt from a
     # subset of payers - `outside_payers` removing our own accounts - cannot
@@ -218,6 +227,8 @@ class PayerReport:
                 "blocks_read": self.blocks_read,
                 "complete": self.complete,
                 "asked": list(self.asked),
+                "read_at": self.read_at,
+                "witness": dict(self.witness),
                 "payers": [
                     {
                         "account": payer.account,
@@ -230,6 +241,14 @@ class PayerReport:
                 ],
             }
         )
+
+
+def _utc_now() -> str:
+    """The time a reading is taken, as UTC ISO-8601 with a Z; a function so a test can fix it."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_NO_WITNESS = {"frontier": None, "block_count": None}
 
 
 def _network_of(entry: dict) -> str:
@@ -471,8 +490,13 @@ def _tally_chain(account: str, rpc_url: str, allow_partial: bool) -> PayerReport
     seen_hashes: set[str] = set()
     oldest_height: int | None = None
     head: str | None = None
+    read_at = _utc_now()
+    # The newest block of the first page: every later page is asked for by
+    # `head`, so the whole read hangs from this block and is true as of it.
+    newest: tuple[int, str] | None = None
 
     for _ in range(HISTORY_PAGES_MAX):
+        first_page = head is None
         page = _history_page(account, rpc_url, head)
         fresh = 0
         for block in page:
@@ -492,6 +516,8 @@ def _tally_chain(account: str, rpc_url: str, allow_partial: bool) -> PayerReport
             height = _int_field(block, "height", account)
             if oldest_height is None or height < oldest_height:
                 oldest_height = height
+            if first_page and (newest is None or height > newest[0]):
+                newest = (height, block_hash)
             if block.get("type") != "receive":
                 continue
             if not _confirmed(block):
@@ -537,6 +563,13 @@ def _tally_chain(account: str, rpc_url: str, allow_partial: bool) -> PayerReport
     if not complete and not allow_partial:
         raise HistoryIncomplete(account, len(seen_hashes), oldest_height or 0)
 
+    if not complete:
+        witness = dict(_NO_WITNESS)
+    elif newest is None:
+        witness = {"frontier": None, "block_count": 0}
+    else:
+        witness = {"frontier": newest[1] or None, "block_count": newest[0] if newest[1] else None}
+
     ordered = sorted(tally.values(), key=lambda slot: (-slot["raw"], slot["account"]))
     return PayerReport(
         account=account,
@@ -558,6 +591,8 @@ def _tally_chain(account: str, rpc_url: str, allow_partial: bool) -> PayerReport
         blocks_read=len(seen_hashes),
         complete=complete,
         asked=(rpc_url,),
+        witness=witness,
+        read_at=read_at,
     )
 
 
@@ -679,6 +714,15 @@ def payers_corroborated(
         blocks_read=first.blocks_read,
         complete=first.complete,
         asked=tuple(url for report in reports for url in report.asked),
+        # One block the reading is true as of only when every node read down
+        # from the same one; nodes that agree on payers but not on the head
+        # witness nothing, rather than the first node's head standing for all.
+        witness=(
+            dict(first.witness)
+            if all(report.witness == first.witness for report in rest)
+            else dict(_NO_WITNESS)
+        ),
+        read_at=first.read_at,
     )
 
 
@@ -720,6 +764,8 @@ def outside_payers(report: PayerReport, our_accounts) -> PayerReport:
         blocks_read=report.blocks_read,
         complete=report.complete,
         asked=report.asked,
+        witness=dict(report.witness),
+        read_at=report.read_at,
     )
 
 
@@ -754,6 +800,7 @@ def _main(argv: list[str]) -> int:
     except ManifestRefused as error:
         print(json.dumps({"verdict": error.reason, "detail": error.detail}))
         return 3
+    read_at = _utc_now()
     out = []
     for payee in payees:
         try:
@@ -767,7 +814,7 @@ def _main(argv: list[str]) -> int:
                         "detail": str(error)})
             continue
         out.append({"payee": json.loads(payee.to_json()), "payers": json.loads(report.to_json())})
-    print(json.dumps({"source": url, "payees": out}, indent=1))
+    print(json.dumps({"source": url, "read_at": read_at, "payees": out}, indent=1))
     return 0
 
 
