@@ -284,9 +284,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-327 tests: for `verify`, the four acceptance cases, the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines), the error paths around them, the
+330 tests: for `verify`, the four acceptance cases, the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines), the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
-the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
+the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
+codes `verify_cli.py` actually returns are the same set in all three directions;
+for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for

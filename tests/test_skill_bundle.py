@@ -10,6 +10,7 @@ These tests drive the vendored files as the skill ships them.
 """
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -85,7 +86,7 @@ sys.exit(verify_cli.main(["verify_cli.py", %r, %r, %r]))
 def test_the_skill_cli_answers_node_unreachable_the_way_skill_md_promises():
     """A proxy's JSON envelope must be exit 4 and a verdict, not a traceback.
 
-    SKILL.md documents four exit codes and no others. Before this fix the
+    SKILL.md documents a fixed set of exit codes. Before this fix the
     bundle exited 1 with an empty stdout and a `KeyError` traceback, so an
     agent following that table got no verdict at all on the one outcome the
     table tells it to retry.
@@ -147,7 +148,7 @@ def test_a_decimal_amount_is_refused_with_a_verdict_not_a_traceback():
 
 
 def test_every_unparseable_amount_stays_inside_the_documented_table():
-    """SKILL.md documents four exit codes and no others; 1 is not one of them."""
+    """Every exit code the CLI emits is in SKILL.md's table; 1 is not one of them."""
     for amount in ("1e27", "abc", "", "0x10", "1.0", "  ", "1,000"):
         done = _run_with_amount(amount)
         assert done.returncode == 3, (
@@ -170,3 +171,78 @@ def test_a_plain_integer_amount_is_untouched_by_the_guard():
         "a valid raw amount was refused as invalid: %s" % (done.stdout or done.stderr)
     )
     assert '"invalid_amount"' not in done.stdout, done.stdout
+
+
+# --------------------------------------------------------------------------
+# The contract is written in three places and only one of them is executable.
+#
+# `verify_cli.py` RETURNS the exit codes; its module docstring LISTS them for
+# whoever runs `--help`; SKILL.md's table is what an agent installing the skill
+# reads. Nothing tied the three together, so `#21` could add `late` (5) and
+# `unknown_time` (6) with every test green while a stale table said there were
+# four codes - and a parked submission bundle carrying a fourth copy of the
+# table shipped the old contract for a day. These two laws make the drift a
+# test failure instead of something somebody has to notice.
+
+_EXIT_TABLE_ROW = re.compile(r"^\|\s*(\d+)\s*\|")
+#: `return 0` / `return 64` in the CLI's own control flow.
+_CLI_RETURN = re.compile(r"^\s*return\s+(\d+)\s*$", re.MULTILINE)
+#: `exit 0 settled, 2 not confirmed yet, ...` in the usage docstring.
+_DOCSTRING_CODE = re.compile(r"\b(\d+)\s+(?:settled|not confirmed|mismatch|node unreachable|late|unknown_time|usage)")
+
+
+def _documented_in_skill_md():
+    codes = set()
+    for line in (SKILL / "SKILL.md").read_text().splitlines():
+        found = _EXIT_TABLE_ROW.match(line.strip())
+        if found:
+            codes.add(int(found.group(1)))
+    return codes
+
+
+def _emitted_by_the_cli():
+    source = (SKILL / "verify_cli.py").read_text()
+    body = source.split('"""', 2)[2]          # past the usage docstring
+    codes = {int(n) for n in _CLI_RETURN.findall(body)}
+    # The settled path is one statement with two outcomes, which the bare
+    # `return <int>` pattern cannot see: `return 0 if receipt.settled else 2`.
+    tail = re.search(r"return\s+(\d+)\s+if\s+receipt\.settled\s+else\s+(\d+)", body)
+    assert tail, "the settled return changed shape; this reader needs updating"
+    codes.update({int(tail.group(1)), int(tail.group(2))})
+    return codes
+
+
+def test_skill_md_documents_every_exit_code_the_cli_can_return():
+    """A code the CLI emits and the table lacks is a seller with no rule for it.
+
+    This is the one that bites: `case $?` in SKILL.md's own example has an arm
+    per documented code, so an undocumented code falls through every arm and
+    the gate neither serves nor refuses.
+    """
+    emitted = _emitted_by_the_cli()
+    documented = _documented_in_skill_md()
+    assert emitted - documented == set(), (
+        "verify_cli.py returns %s, absent from SKILL.md's exit table (%s)"
+        % (sorted(emitted - documented), sorted(documented))
+    )
+
+
+def test_the_table_promises_no_exit_code_the_cli_cannot_return():
+    """The other direction: a row for a code that cannot happen is a false promise."""
+    emitted = _emitted_by_the_cli()
+    documented = _documented_in_skill_md()
+    assert documented - emitted == set(), (
+        "SKILL.md's table lists %s, which verify_cli.py never returns (%s)"
+        % (sorted(documented - emitted), sorted(emitted))
+    )
+
+
+def test_the_usage_docstring_names_every_code_the_table_does():
+    """`verify_cli.py` with no arguments prints the contract; it must be the same one."""
+    docstring = (SKILL / "verify_cli.py").read_text().split('"""')[1]
+    named = {int(n) for n in _DOCSTRING_CODE.findall(docstring)}
+    missing = _documented_in_skill_md() - named
+    assert missing == set(), (
+        "the usage docstring names no outcome for exit %s, which SKILL.md's table has"
+        % sorted(missing)
+    )
