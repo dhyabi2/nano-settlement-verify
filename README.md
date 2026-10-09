@@ -270,7 +270,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-287 tests: for `verify`, the four acceptance cases, the error paths around them, the
+300 tests: for `verify`, the four acceptance cases, the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
@@ -283,7 +283,10 @@ the payee table, and what the payer count will not include - an unconfirmed rece
 seller's own sends, a receive from itself, one account written two ways, a chain read only
 half way; for `nano_claim`, claimed, still receivable to an opened and an unopened
 account, a non-send and a malformed hash refused, and every read that fails - a node error, a
-receive not found within the bound - coming back as `unknown` with a nonzero exit; and for the README itself, that the curl body in *Check it without running our
+receive not found within the bound - coming back as `unknown` with a nonzero exit, each
+`unknown` carrying its reconcile path (same send hash, no re-send, next check, escalation
+after the read or time limit), each not-found scoped to the nodes and instant read, and a
+not-found on one node yielding to a found answer on another; and for the README itself, that the curl body in *Check it without running our
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
@@ -459,7 +462,7 @@ on the ledger yet. `nano_claim` reads one send hash off the public chain once an
 of those it is:
 
 ```
-python3 nano_claim.py <send-block-hash> [rpc-url]
+python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]
 ```
 
 ```json
@@ -471,6 +474,9 @@ python3 nano_claim.py <send-block-hash> [rpc-url]
  "read_at": "2026-10-08T22:30:14Z", "source": "https://rpc.nano.to", "error": null}
 ```
 
+(That reading was taken before `absence_scope` and `reconcile` existed; the same read now also
+carries `"reconcile": null` and an `absence_scope` for the unopened destination.)
+
 `outcome` is one of four words. `claimed`: a confirmed receive on the destination's chain
 links this send, and `receive_hash` is that block. `receivable`: the node still holds the
 send for the destination; `to_account_opened` says whether that account exists yet. Both
@@ -479,6 +485,27 @@ something that is not a node reply, the receive was not among the destination's 
 blocks, or the facts disagree; `error` says which. `refused` (exit 3): a malformed hash or a
 block that is not a send. A read that could not run never comes back as `claimed` or
 `receivable`.
+
+`unknown` is not "wait forever". Every `unknown` carries a `reconcile` object: `operation_id`
+(the send hash - look it up again under that identity), `resubmit: false` (do not re-send
+because a read was unknown), `nodes_checked`, `checked_at`, `retry_after_s` and
+`next_check_at`, and `escalate_after` - after 12 unknown reads or 24 hours since the first,
+whichever comes first, `escalate` is true, `action` is `"escalate"`, `next_check_at` is null,
+and the caller stops re-checking and takes it to a person. The caller passes `--attempt N`
+and `--first-unknown-at T` from its previous read; `--retry-after` (default 300 s),
+`--escalate-reads` and `--escalate-hours` change the defaults. Answered reads have
+`reconcile: null`.
+
+Not found is not never sent. Absence on the nodes read, at the instant read, is not proof
+the send never happened: a node can be behind, and a receive can be older than the history
+read. So wherever the tool did not find the send, the receive or the destination account,
+the output carries `absence_scope` - `not_found`, `nodes`, `at`, `window` (for a receive,
+the destination's newest 500 blocks) and `proves_absence: false` - and the outcome stays
+`unknown` (or, for an unopened destination, `receivable`, which needs no receive). With
+`--nodes A B ...` the nodes are asked in order: a node that finds the send outranks one
+that did not, and not found on all of them stays `unknown`, scoped to all of them. This
+answers a condition an outside agent set on Moltbook: unknown needs a reconciliation path,
+and absence from one node or one instant must not read as absence from the ledger.
 
 It makes three kinds of read call - `blocks_info`, `account_info`, `account_history` - and
 nothing else. The outcome field was asked for by an agent on Moltbook.

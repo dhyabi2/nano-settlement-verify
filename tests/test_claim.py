@@ -275,3 +275,177 @@ def test_cli_prints_claimed_and_exits_zero(monkeypatch, capsys):
          history=[history_row()], receives={RECEIVE: receive_block()})
     assert nano_claim._main([SEND, A]) == 0
     assert json.loads(capsys.readouterr().out)["outcome"] == "claimed"
+
+
+# --- unknown is a state with a way out, and not-found is scoped ------------------
+#
+# An outside agent put the condition: `unknown` must not be a polite word for
+# "wait forever" - it must say do not re-send, and how to look again under the
+# same identity, and when to stop and escalate. And absence on one node at one
+# instant is not proof a send never happened, so every not-found says where and
+# when it was read.
+
+B = "http://127.0.0.1:7072"
+LATER = "2026-10-08T12:05:00Z"
+
+
+def nodes(monkeypatch, per_url):
+    """Several stub nodes: `per_url` maps a URL to node() keyword arguments."""
+    asked = []
+
+    def post_json(rpc_url, payload):
+        asked.append((rpc_url, payload["action"]))
+        spec = per_url[rpc_url]
+        if spec == "not found":
+            return {"error": "Block not found"}
+        fail = spec.get("fail", {})
+        action = payload["action"]
+        if action in fail:
+            raise fail[action]
+        if action == "blocks_info":
+            hashes = payload["hashes"]
+            if hashes == [SEND]:
+                return {"blocks": {SEND: spec["send"]}}
+            receives = spec.get("receives") or {}
+            return {"blocks": {h: receives[h] for h in hashes if h in receives}}
+        if action == "account_info":
+            return spec["account"]
+        if action == "account_history":
+            return {"account": DEST, "history": spec.get("history", [])}
+        raise AssertionError(f"unexpected action {action}")
+
+    monkeypatch.setattr(nano_settlement_verify, "post_json", post_json)
+    return asked
+
+
+CLAIMED_NODE = {"send": send_block(receivable="0"), "account": opened(),
+                "history": [history_row()], "receives": {RECEIVE: receive_block()}}
+
+
+def test_unknown_carries_a_reconcile_path_under_the_same_operation_id(monkeypatch):
+    node(monkeypatch, fail={"blocks_info": OSError("timed out")})
+    status = read()
+    rec = status["reconcile"]
+    assert rec["operation_id"] == SEND
+    assert rec["resubmit"] is False
+    assert rec["nodes_checked"] == [A]
+    assert rec["checked_at"] == NOW
+    assert rec["retry_after_s"] == nano_claim.RETRY_AFTER_S
+    assert rec["next_check_at"] == LATER
+    assert rec["attempt"] == 1
+    assert rec["escalate"] is False and rec["action"] == "recheck"
+    assert rec["escalate_after"] == {
+        "unknown_reads": nano_claim.ESCALATE_AFTER_READS,
+        "hours": nano_claim.ESCALATE_AFTER_HOURS,
+        "first_unknown_at": NOW,
+        "deadline": "2026-10-09T12:00:00Z",
+    }
+
+
+def test_an_answered_read_carries_no_reconcile_and_no_absence(monkeypatch):
+    node(monkeypatch, **CLAIMED_NODE)
+    status = read()
+    assert status["outcome"] == "claimed"
+    assert status["reconcile"] is None and status["absence_scope"] is None
+
+
+def test_unknown_escalates_after_the_read_limit(monkeypatch):
+    node(monkeypatch, fail={"blocks_info": OSError("timed out")})
+    status = read(attempt=nano_claim.ESCALATE_AFTER_READS)
+    rec = status["reconcile"]
+    assert rec["escalate"] is True and rec["action"] == "escalate"
+    assert rec["next_check_at"] is None
+    assert rec["resubmit"] is False
+    assert nano_claim.exit_code(status) == 2
+
+
+def test_unknown_escalates_after_the_time_limit(monkeypatch):
+    node(monkeypatch, fail={"blocks_info": OSError("timed out")})
+    rec = read(attempt=2, first_unknown_at="2026-10-07T11:00:00Z")["reconcile"]
+    assert rec["escalate"] is True and rec["action"] == "escalate"
+    assert rec["escalate_after"]["deadline"] == "2026-10-08T11:00:00Z"
+
+
+def test_reconcile_limits_are_settable(monkeypatch):
+    node(monkeypatch, fail={"blocks_info": OSError("timed out")})
+    rec = read(attempt=2, retry_after_s=30, escalate_after_reads=3,
+               escalate_after_hours=1)["reconcile"]
+    assert rec["retry_after_s"] == 30
+    assert rec["next_check_at"] == "2026-10-08T12:00:30Z"
+    assert rec["escalate_after"]["unknown_reads"] == 3
+    assert rec["escalate_after"]["deadline"] == "2026-10-08T13:00:00Z"
+    assert rec["escalate"] is False
+
+
+def test_a_send_not_found_is_scoped_never_claimed_absent(monkeypatch):
+    nodes(monkeypatch, {A: "not found"})
+    status = read()
+    assert status["outcome"] == "unknown"
+    scope = status["absence_scope"]
+    assert scope["not_found"] == "send block"
+    assert scope["nodes"] == [A] and scope["at"] == NOW
+    assert scope["proves_absence"] is False
+    assert "ledger" in scope["window"]
+
+
+def test_a_receive_not_found_within_the_bound_is_scoped_to_the_bound(monkeypatch):
+    rows = [history_row(block_hash=f"{i:064X}", account=OTHER) for i in range(5)]
+    receives = {row["hash"]: receive_block(link="CD" * 32) for row in rows}
+    node(monkeypatch, send=send_block(receivable="0"), account=opened(),
+         history=rows, receives=receives)
+    scope = read(history_bound=5)["absence_scope"]
+    assert scope["not_found"] == "receive linking this send"
+    assert "newest 5" in scope["window"] and DEST in scope["window"]
+    assert scope["proves_absence"] is False
+
+
+def test_an_unopened_destination_is_scoped_too(monkeypatch):
+    node(monkeypatch, send=send_block(receivable="1"), account=NOT_OPENED)
+    status = read()
+    assert status["outcome"] == "receivable"
+    scope = status["absence_scope"]
+    assert scope["not_found"] == "destination account"
+    assert scope["nodes"] == [A] and scope["proves_absence"] is False
+
+
+def test_not_found_on_one_node_and_found_on_another_is_the_found_answer(monkeypatch):
+    nodes(monkeypatch, {A: "not found", B: CLAIMED_NODE})
+    status = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+    assert status["outcome"] == "claimed"
+    assert status["source"] == B
+    assert status["receive_hash"] == RECEIVE
+    assert nano_claim.exit_code(status) == 0
+
+
+def test_a_failing_node_then_a_receivable_one_is_receivable(monkeypatch):
+    nodes(monkeypatch, {A: {"fail": {"blocks_info": OSError("refused")}},
+                        B: {"send": send_block(receivable="1"), "account": opened()}})
+    status = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+    assert status["outcome"] == "receivable" and status["source"] == B
+
+
+def test_not_found_on_every_node_stays_unknown_scoped_to_all_of_them(monkeypatch):
+    nodes(monkeypatch, {A: "not found", B: "not found"})
+    status = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+    assert status["outcome"] == "unknown"
+    assert status["reconcile"]["nodes_checked"] == [A, B]
+    assert status["absence_scope"]["nodes"] == [A, B]
+    assert A in status["error"] and B in status["error"]
+    assert nano_claim.exit_code(status) == 2
+
+
+def test_cli_takes_nodes_and_reconcile_flags(monkeypatch, capsys):
+    nodes(monkeypatch, {A: "not found", B: "not found"})
+    code = nano_claim._main([SEND, "--nodes", A, B, "--retry-after", "30",
+                             "--escalate-reads", "3", "--attempt", "3"])
+    status = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert status["reconcile"]["nodes_checked"] == [A, B]
+    assert status["reconcile"]["retry_after_s"] == 30
+    assert status["reconcile"]["escalate"] is True
+
+
+def test_cli_usage_error_is_not_confused_with_unknown(monkeypatch, capsys):
+    node(monkeypatch)
+    assert nano_claim._main([SEND, "--attempt", "zero"]) == 64
+    assert nano_claim._main([]) == 64
