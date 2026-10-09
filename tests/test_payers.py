@@ -704,3 +704,76 @@ def test_a_bad_price_on_an_unnamed_resource_still_refuses_cleanly():
         )
     assert caught.value.reason == "amount_not_raw"
     assert caught.value.detail.endswith("exponent")
+
+
+# --------------------------------------------------------------------------
+# repeat behaviour - a payer seen once and a payer seen weekly are not alike
+# --------------------------------------------------------------------------
+
+
+def repeat_chain(monkeypatch):
+    """PAYER_1 pays three times, PAYER_2 once."""
+    nodes(monkeypatch, {A: history(
+        receive(PAYER_1, CALL_PRICE, height=4, when=1790594630),
+        receive(PAYER_2, CALL_PRICE, height=3, when=1790594620),
+        receive(PAYER_1, CALL_PRICE, height=2, when=1790594610),
+        open_block(PAYER_1, CALL_PRICE, when=1790000000),
+    )})
+    return payers(PAYEE, [A])
+
+
+def test_repeat_payers_and_repeat_rate_come_with_the_distinct_count(monkeypatch):
+    report = repeat_chain(monkeypatch)
+    assert report.distinct_payers == 2
+    by_account = {payer.account: payer for payer in report.payers}
+    assert by_account[PAYER_1].payments == 3
+    assert by_account[PAYER_2].payments == 1
+    assert report.repeat_payers == 1
+    assert report.repeat_rate == 0.5
+    body = json.loads(report.to_json())
+    assert body["repeat_payers"] == 1
+    assert body["repeat_rate"] == 0.5
+    # The fields that were already there keep their meaning.
+    assert body["distinct_payers"] == 2
+    assert body["payments"] == 4
+
+
+def test_removing_our_own_repeat_payer_recomputes_the_repeat_rate(monkeypatch):
+    report = repeat_chain(monkeypatch)
+    outside = outside_payers(report, [PAYER_1])
+    assert outside.distinct_payers == 1
+    assert outside.repeat_payers == 0
+    assert outside.repeat_rate == 0
+    assert json.loads(outside.to_json())["repeat_rate"] == 0
+
+
+def test_no_payers_is_a_repeat_rate_of_zero_not_a_division_error(monkeypatch):
+    nodes(monkeypatch, {A: {"account": PAYEE, "history": ""}})
+    report = payers(PAYEE, [A])
+    assert report.distinct_payers == 0
+    assert report.repeat_payers == 0
+    assert report.repeat_rate == 0
+    assert json.loads(report.to_json())["repeat_rate"] == 0
+
+
+def test_repeat_rate_is_rounded_to_four_places(monkeypatch):
+    nodes(monkeypatch, {A: history(
+        receive(PAYER_1, CALL_PRICE, height=3),
+        receive(PAYER_2, CALL_PRICE, height=2),
+        open_block(PAYER_1, CALL_PRICE),
+        receive(FUNDER, CALL_PRICE, height=4),
+    )})
+    report = payers(PAYEE, [A])
+    assert (report.distinct_payers, report.repeat_payers) == (3, 1)
+    assert report.repeat_rate == 0.3333
+
+
+def test_a_corroborated_report_carries_the_repeat_rate(monkeypatch):
+    same = history(
+        receive(PAYER_1, CALL_PRICE, height=3),
+        receive(PAYER_1, CALL_PRICE, height=2),
+        open_block(PAYER_2, CALL_PRICE),
+    )
+    nodes(monkeypatch, {A: same, B: same})
+    report = payers_corroborated(PAYEE, [A, B])
+    assert (report.distinct_payers, report.repeat_payers, report.repeat_rate) == (2, 1, 0.5)
