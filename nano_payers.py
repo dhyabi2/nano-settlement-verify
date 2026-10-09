@@ -23,6 +23,7 @@ to pay us.
     for payee in payees_from_manifest(doc):
         report = payers(payee.account, ["https://rpc.nano.to"])
         print(payee.account, report.distinct_payers, report.received_raw)
+        print(report.repeat_payers, report.repeat_rate)  # payers with >= 2 payments
         print(report.to_json())     # per payer: payments, raw, first and last seen
 
 What it is not:
@@ -154,6 +155,9 @@ class Payer:
     account: str
     payments: int
     received_raw: int
+    # The earliest and latest `local_timestamp` of this payer's receive blocks:
+    # when the node saw the payee COLLECT the money, not when the payer sent it,
+    # and 0 when the node does not know. They bound the relationship.
     first_timestamp: int
     last_timestamp: int
 
@@ -181,11 +185,32 @@ class PayerReport:
     complete: bool
     asked: tuple[str, ...] = field(default=())
 
+    # Derived from `payers` rather than stored, so a report rebuilt from a
+    # subset of payers - `outside_payers` removing our own accounts - cannot
+    # carry a repeat rate that belongs to the payer set before the removal.
+    @property
+    def repeat_payers(self) -> int:
+        """Payers with two or more confirmed payments.
+
+        `distinct_payers` cannot tell an account that paid once from one that
+        pays every week; this can. It is still a count of keys, not of buyers.
+        """
+        return sum(1 for payer in self.payers if payer.payments >= 2)
+
+    @property
+    def repeat_rate(self) -> float:
+        """`repeat_payers / distinct_payers`, to four places; 0 when nobody has paid."""
+        if not self.payers:
+            return 0.0
+        return round(self.repeat_payers / len(self.payers), 4)
+
     def to_json(self) -> str:
         return json.dumps(
             {
                 "account": self.account,
                 "distinct_payers": self.distinct_payers,
+                "repeat_payers": self.repeat_payers,
+                "repeat_rate": self.repeat_rate,
                 "payments": self.payments,
                 "received_raw": str(self.received_raw),
                 "self_payments": self.self_payments,

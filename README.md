@@ -347,7 +347,16 @@ for payee in payees_from_manifest(doc):     # offline: it parses, it does not fe
     report = payers(payee.account, ["https://rpc.nano.to"])
     print(payee.account, payee.prices_raw)
     print(report.distinct_payers, report.payments, report.received_raw)
+    print(report.repeat_payers, report.repeat_rate)
 ```
+
+`distinct_payers` cannot tell an account that paid once from one that pays every week, so
+each report also carries `repeat_payers` (accounts with two or more confirmed payments) and
+`repeat_rate` (`repeat_payers / distinct_payers`, four places, `0` when nobody has paid);
+per payer, `payments` and `first_timestamp`/`last_timestamp` (when the payee's receive was
+seen, i.e. when the money was collected). Both are recomputed by `outside_payers`.
+A repeat is any second payment, including one seconds after the first: read `repeat_rate`
+together with each payer's first and last timestamps before calling it returning custom.
 
 Both x402 shapes are read, because they are different documents: a **catalogue**
 (`resources[]`, what a seller serves at `/.well-known/x402`) and a single **challenge**
@@ -387,6 +396,7 @@ from nano_payers import outside_payers
 
 real = outside_payers(report, ["nano_<our own funding account>"])
 real.distinct_payers       # accounts that are not us
+real.repeat_rate           # the share of them that paid more than once
 ```
 
 Measured against a live seller on 2026-10-08 — `extract.paypercall.dev`, whose document
