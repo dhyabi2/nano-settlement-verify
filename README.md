@@ -420,6 +420,12 @@ different exchange withdrawals read as separate payers. `hops` (default 1) follo
 funding chain further back; pass hub accounts in `ignore` so strangers who withdrew from
 one exchange are not merged.
 
+Nor can it see collusion. Two parties with money of their own who agree to pay each other
+read as two independent payers, because they are: the ledger shows where money came from,
+never why it moved. A count of independent payers says the payers do not share a funder; it
+does not say the payments were for real work. That needs a delivery record the buyer signed,
+which lives outside the ledger.
+
 ## Was the send claimed?
 
 A Nano send does not land in the destination by itself: the account it paid has to publish
