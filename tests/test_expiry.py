@@ -224,3 +224,60 @@ def test_cli_an_unreadable_deadline_is_a_usage_error():
     done = run_cli(reply(), HASH, AMOUNT, ACCOUNT, "--not-after", "tomorrow")
     assert done.returncode == 64
     assert json.loads(done.stdout)["verdict"] == "invalid_not_after"
+
+
+# --- a deadline that is not a number ------------------------------------------
+#
+# `not_after` is compared LAST - after the block is confirmed and the amount and
+# payee have matched - so a deadline of the wrong type failed only on payments
+# that had actually arrived, and it failed with a TypeError, which is neither
+# OSError nor ValueError and so escaped the arm the README tells a seller to wrap
+# `verify` in. It is checked beside `expect_raw` now, before the node is called.
+
+RAW = int(AMOUNT)
+
+
+@pytest.mark.parametrize("deadline", [str(SEEN), "2026-09-23T07:55:10Z", b"1790150110",
+                                      [SEEN], {"not_after": 1}, True, False])
+def test_a_deadline_that_is_not_a_number_is_refused_before_the_node_is_asked(node, deadline):
+    calls = node(reply())
+
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+    assert "not_after must be unix seconds" in str(caught.value)
+    assert "parse_not_after" in str(caught.value), "the message names the function that reads a string"
+    assert calls == [], "no node was asked for a deadline the caller cannot have meant"
+
+
+def test_the_sellers_own_handler_catches_a_bad_deadline(node):
+    """The README's seller wraps verify in (OSError, ValueError) and holds the
+    call. A TypeError went straight through that and dropped a paid request."""
+    node(reply())
+    held = False
+    try:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=str(SEEN))
+    except (OSError, ValueError):
+        held = True
+    assert held, "the deadline check must land in the arm the README documents"
+
+
+def test_a_string_deadline_read_through_parse_not_after_still_works(node):
+    """The supported route is unchanged: parse it, then pass the int."""
+    node(reply())
+
+    receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=parse_not_after(str(SEEN)))
+
+    assert receipt.settled is True and receipt.seen_at == SEEN
+
+
+def test_an_int_and_a_float_deadline_are_both_still_accepted(node):
+    """`time.time() + 300` is a float and is how a deadline is ordinarily written."""
+    for deadline in (SEEN, float(SEEN), SEEN + 0.5):
+        node(reply())
+        assert verify(HASH, RAW, ACCOUNT, URL, not_after=deadline).settled is True
+
+    for deadline in (SEEN - 1, float(SEEN) - 0.5):
+        node(reply())
+        with pytest.raises(Late):
+            verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
