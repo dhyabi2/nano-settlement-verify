@@ -349,8 +349,8 @@ def verify(
     has the block but has not confirmed it yet.
 
     Raises NotFound when the node has no such block, and Mismatch when the
-    amount differs, when the block is not a send, or when it paid an account
-    other than the one expected. `account` may be given in either the `nano_` or
+    amount differs, when the block names an operation other than "send", or when
+    it paid an account other than the one expected. `account` may be given in either the `nano_` or
     the `xrb_` spelling; they are two names for one account. The receipt records
     the account as the node spelled it, which is the canonical `nano_` form.
 
@@ -361,7 +361,10 @@ def verify(
     that is not a node's block_info reply, which is what a proxy's status page
     or a rate-limit envelope looks like. That lands with the transport failures
     a seller is told to catch, rather than as a bare KeyError through its
-    request path.
+    request path. A reply that carries `confirmed` and an amount but names no
+    operation or no payee - a node that ignored json_block and sent `contents`
+    as a string, or dropped `subtype` - is the same family: nothing was read, so
+    nothing is claimed about the payment.
 
     With `not_after` (unix seconds; see parse_not_after), a settled block must
     also have been seen by this node at or before it - inclusive. Raises Late
@@ -388,11 +391,33 @@ def verify(
     # was credited, so without this check the hash of any confirmed inbound block
     # of the seller's own chain would verify with nothing paid for this call.
     operation = _operation(reply)
+    # "" is not an answer about the block, it is the absence of one: a reply with
+    # no subtype and a contents.type of "state", or a contents the node sent as an
+    # opaque string because it ignored json_block. Reporting that as
+    # `Mismatch("", "send")` says "this block is not a send" - a verdict about the
+    # money, and the one arm the README tells a seller to refuse on - when the
+    # truth is "we could not look", which is what NotANodeReply is for. A real
+    # non-send names itself ("receive", "open", "change", "epoch") and is still a
+    # Mismatch below.
+    if not operation:
+        raise NotANodeReply(
+            f"the reply for {block_hash} names no operation: no subtype, and "
+            f"contents {'is not an object' if not isinstance(reply.get('contents'), dict) else 'names no type'}"
+        )
     if operation != "send":
         raise Mismatch(operation, "send")
     # block_account is the account whose chain the block sits on - for a send, the
     # payer. The account paid is the block's link.
     paid = _paid_account(reply)
+    # Same distinction: every send names its payee, in one of the four places
+    # `_paid_account` looks, so "" means the reply carried none of them - not that
+    # the block paid somebody else. `Mismatch("", account)` told a seller whose
+    # buyer really had paid that it had been paid by nobody.
+    if not paid:
+        raise NotANodeReply(
+            f"the reply for {block_hash} names no payee: no link_as_account and no "
+            f"destination, in contents or at the top level"
+        )
     if not _same_account(paid, account):
         raise Mismatch(paid, account)
     receipt = Receipt(

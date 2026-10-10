@@ -449,3 +449,86 @@ def test_cli_usage_error_is_not_confused_with_unknown(monkeypatch, capsys):
     node(monkeypatch)
     assert nano_claim._main([SEND, "--attempt", "zero"]) == 64
     assert nano_claim._main([]) == 64
+
+
+# --- node order must not decide the verdict ----------------------------------
+
+B = "http://127.0.0.1:7072"
+
+
+def two_nodes(monkeypatch, per_url):
+    """Answer each action per endpoint. `per_url` maps a URL to a `node`-style dict."""
+    asked = []
+
+    def post_json(rpc_url, payload):
+        action = payload["action"]
+        asked.append((rpc_url, action))
+        spec = per_url[rpc_url]
+        if action == "blocks_info":
+            hashes = payload["hashes"]
+            if hashes == [SEND]:
+                return {"blocks": {SEND: spec["send"]}}
+            return {"blocks": {h: spec.get("receives", {})[h]
+                               for h in hashes if h in spec.get("receives", {})}}
+        if action == "account_info":
+            return spec["account"]
+        if action == "account_history":
+            return {"account": DEST, "history": spec.get("history", [])}
+        raise AssertionError(f"unexpected action {action}")
+
+    monkeypatch.setattr(nano_settlement_verify, "post_json", post_json)
+    return asked
+
+
+def _honest():
+    return {"send": send_block(receivable="0"), "account": opened(),
+            "history": [history_row()], "receives": {RECEIVE: receive_block()}}
+
+
+def _proxy():
+    """An endpoint that answers 200 but drops `subtype`, so the block names no
+    operation. `nano_settlement_verify._operation` reads "" - which is this
+    endpoint being unreadable, not a fact about the block."""
+    send = send_block(receivable="0")
+    del send["subtype"]
+    return {"send": send, "account": opened(),
+            "history": [history_row()], "receives": {RECEIVE: receive_block()}}
+
+
+def test_a_proxy_listed_first_does_not_turn_a_claimed_send_into_a_refusal(monkeypatch):
+    """`Refused` is terminal - no reconcile path, no absence_scope, no retry -
+    and it is re-raised out of the node loop, so the honest endpoint after the
+    proxy was never asked. The same two nodes in the other order read `claimed`.
+    A seller that WAS paid concluded from exit 3 that its hash is not a send.
+    """
+    asked = two_nodes(monkeypatch, {A: _proxy(), B: _honest()})
+
+    status = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+
+    assert status["outcome"] == "claimed"
+    assert status["receive_hash"] == RECEIVE
+    assert nano_claim.exit_code(status) == 0
+    assert B in {url for url, _ in asked}, "the honest endpoint was asked"
+
+
+def test_the_same_two_nodes_read_the_same_either_way_round(monkeypatch):
+    first = two_nodes(monkeypatch, {A: _honest(), B: _proxy()})
+    forwards = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+    assert first  # the stub was used
+    two_nodes(monkeypatch, {A: _proxy(), B: _honest()})
+    backwards = nano_claim.claim_status(SEND, [A, B], now=lambda: NOW)
+
+    assert forwards["outcome"] == backwards["outcome"] == "claimed"
+
+
+def test_a_lone_proxy_is_unknown_with_a_reconcile_path_not_refused(monkeypatch):
+    """One endpoint, unreadable: "we could not look" (exit 2, retry), which is
+    what the module docstring says an unreadable reply must be."""
+    two_nodes(monkeypatch, {A: _proxy()})
+
+    status = nano_claim.claim_status(SEND, [A], now=lambda: NOW)
+
+    assert status["outcome"] == "unknown"
+    assert "names no operation" in status["error"]
+    assert status["reconcile"]
+    assert nano_claim.exit_code(status) == 2

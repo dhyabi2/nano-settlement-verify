@@ -363,3 +363,46 @@ def test_an_account_not_found_reply_is_zero_even_though_it_carries_a_balance(mon
     not_found = {"error": "Account not found", "balance": "0"}
     nodes(monkeypatch, {A: not_found, B: not_found})
     assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
+
+
+# --- one broken proxy must not override a node that read the ledger -----------
+
+
+def test_a_proxy_that_ignores_json_block_is_skipped_not_believed(monkeypatch):
+    """`verify_corroborated` raises on the first `mismatch` it hears, because a
+    confirmed block's contents are fixed and no later endpoint can overturn
+    them. That reasoning holds for an endpoint that READ the block. An endpoint
+    whose `contents` came back as an opaque string read nothing, so its
+    "mismatch" was manufactured - and raising on it refused a good payment and
+    left the honest endpoints after it unasked.
+    """
+    good = send_block()
+    proxy = {**good, "contents": json.dumps(good["contents"])}
+    called = nodes(monkeypatch, {A: proxy, B: good, C: good})
+
+    result = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=2)
+
+    assert result.receipt.settled is True
+    assert result.agreed == (B, C)
+    assert A in result.failed
+    assert called == [A, B, C], "the proxy was asked, skipped, and the others still answered"
+
+
+def test_an_endpoint_that_really_reports_another_payee_still_refuses(monkeypatch):
+    """The control: a readable mismatch is still immediate and still terminal."""
+    nodes(monkeypatch, {A: send_block(payee="nano_1someoneelse"), B: send_block()})
+
+    with pytest.raises(Mismatch):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], agree=2)
+
+
+def test_every_endpoint_unreadable_is_not_corroborated_not_a_mismatch(monkeypatch):
+    """"Nobody could tell us" keeps its own name even when every node is a proxy."""
+    good = send_block()
+    proxy = {**good, "contents": json.dumps(good["contents"])}
+    nodes(monkeypatch, {A: proxy, B: proxy})
+
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], agree=2)
+
+    assert caught.value.answered == 0
