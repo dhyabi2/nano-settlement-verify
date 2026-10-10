@@ -355,7 +355,9 @@ def verify(
     the account as the node spelled it, which is the canonical `nano_` form.
 
     Raises TypeError when expect_raw is not an int, because raw is an integer
-    and a float expectation cannot be compared to one safely.
+    and a float expectation cannot be compared to one safely, and ValueError
+    when not_after is neither None nor a number of unix seconds - both before
+    the node is called. A string deadline goes through parse_not_after first.
 
     Raises NotANodeReply - a ValueError - when the endpoint answers with JSON
     that is not a node's block_info reply, which is what a proxy's status page
@@ -378,6 +380,25 @@ def verify(
         # as 1e30 would "match" an amount 19884624838656 raw short of it. Refuse
         # the comparison rather than settle on it.
         raise TypeError(f"expect_raw must be an int of raw, got {type(expect_raw).__name__}")
+    # Checked here, beside expect_raw and before the node is called, because the
+    # comparison that uses it (`seen_at > not_after`) is the LAST thing verify
+    # does - after the block is confirmed and the amount and payee have matched.
+    # A deadline read back as a string from a JSON order record or a config file
+    # therefore raised `TypeError: '>' not supported between instances of 'int'
+    # and 'str'` only on payments that had actually arrived, and TypeError is
+    # neither OSError nor ValueError, so it escaped the arm the README tells a
+    # seller to wrap this call in and dropped a call the buyer had paid for.
+    # A ValueError holds instead, in the family `parse_not_after` already uses
+    # for a deadline it cannot read. A float is accepted: `time.time() + 300` is
+    # the ordinary way to write one, and unlike raw, a time is not an amount.
+    if not_after is not None and (
+        isinstance(not_after, bool) or not isinstance(not_after, (int, float))
+    ):
+        raise ValueError(
+            f"not_after must be unix seconds as an int or a float, got "
+            f"{type(not_after).__name__} ({not_after!r}); parse_not_after() reads "
+            f"a string deadline, in unix seconds or ISO-8601 with a UTC offset"
+        )
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
     if "error" in reply:
         raise NotFound(block_hash)
