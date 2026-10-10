@@ -250,8 +250,18 @@ def _read_one(send_hash: str, rpc_url: str, history_bound: int, now) -> tuple[di
     try:
         block = _send(send_hash, rpc_url)
         operation = nano_settlement_verify._operation(block)
+        # An operation of "" is this node's reply being unreadable, not a fact
+        # about the block - and `Refused` is terminal: no `reconcile`, no
+        # `absence_scope`, no retry, and it is re-raised below past the `_Unknown`
+        # arm, so it leaves `claim_status`'s node loop and the remaining nodes are
+        # never asked. The verdict then depended on which node happened to be
+        # first. The destination two lines down already treats an unreadable
+        # answer as `_Unknown`; so does this one now. A block that names a real
+        # operation other than "send" is still `Refused`.
+        if not operation:
+            raise _Unknown(f"the node's reply for block {send_hash} names no operation")
         if operation != "send":
-            raise Refused("not_a_send", f"block {send_hash} is a {operation or 'unknown'} block")
+            raise Refused("not_a_send", f"block {send_hash} is a {operation} block")
         destination = nano_settlement_verify._paid_account(block)
         if not is_valid_account(destination):
             raise _Unknown(f"the send's destination {destination!r} is not a valid account")
