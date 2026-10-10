@@ -479,20 +479,29 @@ def test_an_open_block_never_settles(node):
 
 
 def test_a_block_whose_operation_is_unknown_fails_closed(node):
-    """contents.type "state" names no operation, and no subtype came with it."""
+    """contents.type "state" names no operation, and no subtype came with it.
+
+    Fails closed as NotANodeReply - "we could not look" - rather than as
+    `Mismatch("", "send")`, which is a verdict about the money the reply did not
+    support. Nothing settles either way; exit 4 (retry, another node), not 3.
+    """
     reply = state_send()
     del reply["subtype"]
 
     node(reply)
 
-    with pytest.raises(Mismatch) as caught:
+    with pytest.raises(NotANodeReply):
         verify(HASH, SEND_RAW, SELLER, URL)
-
-    assert caught.value.expected == "send"
 
 
 def test_a_reply_with_no_link_at_all_fails_closed(node):
-    """contents arrives as an opaque string when a node ignores json_block."""
+    """contents arrives as an opaque string when a node ignores json_block.
+
+    The block, the amount and the payee are all fine on the ledger; only this
+    endpoint's serialisation is unreadable. `Mismatch("", SELLER)` told the
+    seller its buyer had paid nobody, which is the refuse-the-sale arm. It fails
+    closed as NotANodeReply instead: nothing read, nothing claimed.
+    """
     node({
         "block_account": PAYER,
         "amount": str(SEND_RAW),
@@ -502,10 +511,8 @@ def test_a_reply_with_no_link_at_all_fails_closed(node):
         "contents": "{\"type\":\"state\"}",
     })
 
-    with pytest.raises(Mismatch) as caught:
+    with pytest.raises(NotANodeReply):
         verify(HASH, SEND_RAW, SELLER, URL)
-
-    assert caught.value.got == ""
 
 
 def test_the_amount_is_still_reported_before_the_payee(node):
@@ -598,6 +605,18 @@ def test_two_identical_non_addresses_do_not_match_each_other(node):
 
 
 def test_an_empty_expectation_never_matches_an_absent_link(node):
+    """Two ways "" must not match "", kept apart.
+
+    An empty expectation against a READABLE reply is a Mismatch: the block paid
+    a real account and the caller named none. An empty expectation against a
+    reply that names no payee is NotANodeReply, because the left-hand side was
+    never read. Neither settles, which is the law this test exists for.
+    """
+    calls = node(state_send(paid_to=SELLER))
+    with pytest.raises(Mismatch):
+        verify(HASH, SEND_RAW, "", URL)
+    assert calls, "the node was asked"
+
     node({
         "block_account": PAYER,
         "amount": str(SEND_RAW),
@@ -606,8 +625,7 @@ def test_an_empty_expectation_never_matches_an_absent_link(node):
         "subtype": "send",
         "contents": "{\"type\":\"state\"}",
     })
-
-    with pytest.raises(Mismatch):
+    with pytest.raises(NotANodeReply):
         verify(HASH, SEND_RAW, "", URL)
 
 
@@ -703,3 +721,70 @@ def test_the_readme_names_the_node_unreachable_outcome():
         assert promise in text, "the README does not name %s as an outcome" % promise
     # And the quickstart a reader copies must catch it.
     assert "except (OSError, ValueError)" in text
+
+
+# --- an unreadable reply is not a verdict about the money ---------------------
+#
+# `verify` fails closed two ways and they are not interchangeable. `Mismatch`
+# means the ledger says something other than what was expected: refuse the sale,
+# exit 3, and no later node can overturn it (nano_quorum raises on the first one
+# it hears). `NotANodeReply` - a ValueError - means nothing was read: hold, exit
+# 4, ask another node. A reply that carries `confirmed` and the right amount but
+# no readable operation or payee belongs in the second family, and used to land
+# in the first.
+
+
+def test_a_proxy_that_ignores_json_block_does_not_accuse_the_buyer(node):
+    """The payment is good; only this endpoint's serialisation is unreadable.
+
+    The amount, the payee and the confirmation are all correct on the ledger.
+    This must not come back as "it paid nobody".
+    """
+    good = state_send(paid_to=SELLER)
+    node({**good, "contents": json.dumps(good["contents"])})
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert "names no payee" in str(caught.value)
+    assert isinstance(caught.value, ValueError), "must land in the seller's (OSError, ValueError) arm"
+
+
+def test_a_legacy_send_whose_contents_are_a_string_does_not_accuse_the_buyer(node):
+    """Same reply shape, read before the payee: the operation is unreadable too."""
+    node({
+        "block_account": PAYER,
+        "amount": str(SEND_RAW),
+        "confirmed": "true",
+        "height": "58",
+        "contents": json.dumps({"type": "send", "destination": SELLER}),
+    })
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert "names no operation" in str(caught.value)
+
+
+def test_a_block_that_names_a_real_other_operation_is_still_a_mismatch(node):
+    """The control. A reply that DOES say what the block did, and it is not a
+    send, is a verdict about the money and stays one."""
+    for operation in ("receive", "open", "change", "epoch"):
+        reply = state_send(paid_to=SELLER)
+        reply["subtype"] = operation
+        node(reply)
+
+        with pytest.raises(Mismatch) as caught:
+            verify(HASH, SEND_RAW, SELLER, URL)
+
+        assert (caught.value.got, caught.value.expected) == (operation, "send")
+
+
+def test_a_send_that_really_paid_someone_else_is_still_a_mismatch(node):
+    """The other control: a readable payee that is the wrong one still refuses."""
+    node(state_send(paid_to="nano_3someoneelse"))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, SEND_RAW, SELLER, URL)
+
+    assert caught.value.got == "nano_3someoneelse"
