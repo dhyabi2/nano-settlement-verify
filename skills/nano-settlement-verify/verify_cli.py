@@ -5,8 +5,9 @@ usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-afte
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
-as %40; credentials are never sent, and %40 or %3A in the host part counts as one); any
-other URL is refused (4), a configuration error that retrying will not fix.
+as %40; credentials are never sent, and %40 or %3A in the host part counts as one) and a
+port, if any, must be a number; any other URL is refused (4), a configuration error that
+retrying will not fix.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -56,6 +57,7 @@ AT_SIGN_REFUSED = (
 )
 SCHEME_REFUSED = "the RPC URL must be http or https"
 UNPARSEABLE_REFUSED = "the RPC URL could not be parsed"
+PORT_REFUSED = "the RPC URL's port must be a number"
 # A reply that is JSON but not an object (`[]`, `"x"`, `null`, `1`) makes the
 # library raise TypeError, and one nested deeper than the parser's recursion
 # limit RecursionError. Neither is a verdict about the money: nothing was
@@ -107,8 +109,15 @@ def _objects_only(post_json):
 # function to call instead, so the object check can only be put in place by
 # swapping that global. The swap is held under this lock for the whole verify
 # call, so two callers of main in one process never interleave a swap and a
-# restore, and the second sees the library as the first found it.
-_SWAP_LOCK = threading.Lock()
+# restore, and the second sees the library as the first found it. That also
+# means in-process callers on different threads take turns for the whole
+# network call; each run of the CLI as its own process is unaffected.
+#
+# It is re-entrant: a post_json that itself calls main on the same thread (a
+# wrapper, a test double) used to block on a plain Lock this thread already
+# held, forever. Each frame restores only the wrapper it installed itself, so
+# nested frames unwind to exactly what each found.
+_SWAP_LOCK = threading.RLock()
 
 
 def _verify_objects_only(**arguments):
@@ -161,6 +170,12 @@ def _url_pieces(url):
     pieces = [userinfo, port if not port.isdigit() else ""]
     if parts:
         pieces += [parts.path, parts.query, parts.fragment]
+        # A node may echo one segment of the path rather than all of it
+        # ("HTTP Error 401: bad key SECRETKEY" for `/rpc/SECRETKEY`), and may
+        # split before or after decoding it, so each segment counts on its
+        # own: split on `/` and `;` as written, and again once decoded.
+        for path in (parts.path, urllib.parse.unquote(parts.path)):
+            pieces += path.replace(";", "/").split("/")
         for field in parts.query.split("&"):
             pieces += [field, field.partition("=")[2]]
     found = set()
@@ -227,6 +242,38 @@ def _refuse_rpc_url(url):
     scheme = parts.scheme
     if scheme.lower() not in ("http", "https"):
         return SCHEME_REFUSED
+    return _refuse_port(parts.netloc)
+
+
+_DIGITS = frozenset("0123456789")
+
+
+def _refuse_port(netloc):
+    """PORT_REFUSED unless netloc's port, if any, is ASCII digits; else None.
+
+    The check above parses the port after the FIRST colon and http.client
+    after the LAST, so `localhost:SECRETKEY:443` is host `localhost:SECRETKEY`
+    to the request - and through an HTTPS proxy, a TLS hostname-mismatch error
+    then names it. A host is a name or a bracketed IPv6 address, so outside
+    brackets at most one colon may appear, and what follows it must be a
+    number (or nothing, which means the default port).
+    """
+    if netloc.startswith("["):
+        host_end = netloc.find("]")
+        if host_end < 0:
+            return UNPARSEABLE_REFUSED
+        rest = netloc[host_end + 1:]
+        if rest and not rest.startswith(":"):
+            return PORT_REFUSED
+        port = rest[1:]
+    else:
+        if "[" in netloc or "]" in netloc:
+            return UNPARSEABLE_REFUSED
+        if netloc.count(":") > 1:
+            return PORT_REFUSED
+        port = netloc.partition(":")[2]
+    if not set(port) <= _DIGITS:
+        return PORT_REFUSED
     return None
 
 

@@ -4,7 +4,7 @@ Previous audit 2026-10-10. Audited at `e39e37e` (`main` after #25).
 Lens unchanged: can an agent get PAID in XNO with this today without being hurt —
 refused when it was paid, told it was paid when it was not, or dropped mid-request.
 
-`python3 -m pytest -q`: **350 passed** on `e39e37e`, **416** on this branch (354 after
+`python3 -m pytest -q`: **350 passed** on `e39e37e`, **472** on this branch (354 after
 the first commit; each review round below gives its own count).
 
 ## What I checked
@@ -251,6 +251,45 @@ library is untouched, root and vendored copies still byte-identical.
    piece under four characters hides nothing.
 
 Suite: **449 passed** (416 before this round).
+
+## Sixth review round: the port, path segments and re-entry
+
+Review found these on `5f98855`; all fixed in `verify_cli.py`, the tests and the
+docs. The library is untouched, root and vendored copies still byte-identical.
+
+1. **The port was split at a different colon than the request used.** The
+   piece matching took the port after the *first* colon of the netloc and
+   `http.client` takes it after the *last*, so `https://localhost:SECRETKEY:443/`
+   was asked as host `localhost:SECRETKEY` port 443, and through an HTTPS proxy
+   the TLS hostname-mismatch error named `localhost:SECRETKEY` - a piece the
+   check never listed. Now any netloc whose port part (after the host, or after
+   a bracketed IPv6 address) is not ASCII digits, or that has more than one
+   colon outside brackets, is refused before anything is sent, with the fixed
+   detail *"the RPC URL's port must be a number"* (exit 4, a configuration
+   error). An empty port still means the default. Tested through the CLI, as
+   the argument and as `NANO_RPC_URL`, for two-colon, word, IPv6 and fullwidth
+   digit ports; no network is needed, since the refusal comes first.
+2. **A path was a piece only whole.** A node whose reason phrase echoes one
+   segment of the path (`/rpc/SECRETKEY` answered *"HTTP Error 401: bad key
+   SECRETKEY"*) put the key in stdout. The path is now also split at `/` and
+   `;`, both as written and percent-decoded, and each segment is a piece under
+   the same four-character rule. Tested against a loopback node echoing the
+   last segment raw and decoded, for `/rpc/SECRETKEY`, `/x;SECRETKEY`,
+   `/a%2FSECRETKEY` and `/S%45CRETKEY`; a three-character segment (`/v1/rpc`)
+   still shows the node's text.
+3. **Same-thread re-entry deadlocked.** A `post_json` that calls `main` again
+   on its own thread blocked forever on the plain `threading.Lock` its thread
+   already held. The lock is now an `RLock`; each frame still restores the
+   global only if it is still the wrapper that frame installed, so nested calls
+   unwind to exactly what each found. Tested in a subprocess with a timeout, so
+   a regression fails rather than hangs.
+4. **In-process callers take turns.** The lock is held for the whole network
+   call, so threads calling `main` in one process wait on a slow node one after
+   another. Not changed - it is what keeps the swap correct - and now said in
+   the README; running the CLI as its own process, the documented use, is
+   unaffected.
+
+Suite: **472 passed** (449 before this round).
 
 ## A separate finding of this run, on its own branch (#27)
 

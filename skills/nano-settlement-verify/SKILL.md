@@ -39,16 +39,17 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   whitespace around the URL is ignored.
   The URL must be `http` or `https` and must not contain an `@` anywhere: a URL with
   credentials (`http://user:password@host/`), with an `@` in its path or query, of any
-  other scheme (`file://`, `ftp://`, none), or that cannot be parsed, is refused before
+  other scheme (`file://`, `ftp://`, none), with a port that is not a number
+  (`http://host:key:443/`), or that cannot be parsed, is refused before
   anything is sent, as `node_unreachable` (exit 4) with a fixed detail that quotes no part
   of the URL. Credentials are never sent: put a node's key somewhere other than the URL's
   userinfo. An `@` that belongs in a path or query is written `%40`
   (`http://host/?key=a%40b`), and is sent as written; a `%40` or `%3A` in the host part
   (`http://user:pw%40host/`) is a credential and is refused the same way. An
-  `InvalidURL` error (a space or control character in the URL, a non-numeric port) is
+  `InvalidURL` error (a space or control character in the URL) is
   reported by its error class only - its text quotes the URL, so it is never shown - and
   so is any other failure whose text would repeat a piece of the URL four characters or
-  longer.
+  longer, including any one segment of its path.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 
@@ -66,7 +67,7 @@ One JSON object on stdout, and an exit code:
 | 0 | `{"settled": true, ...}` - confirmed send of exactly that amount to that account | serve the call |
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
 | 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
-| 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment. A detail of *the RPC URL contains '@'*, *must be http or https* or *could not be parsed* is a configuration error that retrying will not fix: correct the URL |
+| 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment. A detail of *the RPC URL contains '@'*, *must be http or https*, *port must be a number* or *could not be parsed* is a configuration error that retrying will not fix: correct the URL |
 | 5 | `{"verdict": "late", "seen_at": ..., "not_after": ...}` - right amount and account, seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
 | 6 | `{"verdict": "unknown_time", "seen_at": null, ...}` - settled, but the node reports no time for it | do not treat as on time; ask another node |
 | 64 | usage error, or `{"verdict": "invalid_not_after"}` | fix the command |

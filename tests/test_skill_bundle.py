@@ -1225,3 +1225,137 @@ def test_the_piece_matching_hides_exactly_what_it_should(case):
     cli = _verify_cli_module()
     expected = _hidden("OSError") if hidden else text
     assert cli._error_detail(OSError(text), url) == expected
+
+
+# --------------------------------------------------------------------------
+# Review round six. The URL check took the port after the FIRST colon and
+# http.client takes it after the LAST, so `https://localhost:SECRETKEY:443/` was
+# asked as host `localhost:SECRETKEY` - and through an HTTPS proxy the TLS
+# hostname-mismatch error named it. A port that is not a number is refused up
+# front, before any request, so none of these needs a network.
+
+PORT_DETAIL = "the RPC URL's port must be a number"
+
+BAD_PORT_URLS = {
+    "two colons, https": "https://localhost:SECRETKEY:443/",
+    "two colons, http": "http://127.0.0.1:SECRETKEY:1/",
+    "secret host, two ports": "https://SECRETKEY.localhost:1:2/",
+    "word as port": "http://127.0.0.1:SECRETKEY/",
+    "IPv6 host, word as port": "http://[::1]:SECRETKEY/",
+    "IPv6 host, two ports": "http://[::1]:1:SECRETKEY/",
+    "fullwidth digits": "http://127.0.0.1:７０７６/SECRETKEY",
+}
+
+
+@pytest.mark.parametrize("case", sorted(BAD_PORT_URLS))
+def test_a_port_that_is_not_a_number_is_refused_before_any_request(case):
+    url = BAD_PORT_URLS[case]
+    for done in _both_ways(url):
+        _assert_refused(done, PORT_DETAIL, ["SECRETKEY"])
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:7076/", "http://127.0.0.1/", "http://127.0.0.1:/",
+    "https://[::1]:7076/", "https://[::1]/", "https://node.example:443/rpc?k=a:b",
+])
+def test_a_numeric_or_absent_port_passes_the_url_check(url):
+    assert _verify_cli_module()._refuse_rpc_url(url) is None
+
+
+# A node may echo one segment of the path in its reason phrase rather than the
+# whole path ("HTTP Error 401: bad key SECRETKEY" for `/rpc/SECRETKEY`), raw or
+# after decoding it. Each segment, split at `/` and `;`, is a piece of its own.
+
+import http.server
+import urllib.parse
+
+
+def _last_segment(path, decode):
+    path = path.split("?", 1)[0]
+    if decode:
+        path = urllib.parse.unquote(path)
+    return path.replace(";", "/").rstrip("/").split("/")[-1]
+
+
+@contextlib.contextmanager
+def _segment_echoing_node(decode):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            self.send_response(401, "bad key " + _last_segment(self.path, decode))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+SEGMENT_PATHS = ["/rpc/SECRETKEY", "/x;SECRETKEY", "/a%2FSECRETKEY", "/S%45CRETKEY"]
+
+
+@pytest.mark.parametrize("decode", [False, True], ids=["raw", "decoded"])
+@pytest.mark.parametrize("path", SEGMENT_PATHS)
+def test_a_reason_phrase_echoing_one_path_segment_is_not_shown(path, decode):
+    with _segment_echoing_node(decode) as port:
+        for done in _both_ways("http://127.0.0.1:%d%s" % (port, path)):
+            output = done.stdout + done.stderr
+            assert "CRETKEY" not in output, output
+            _assert_unreachable(done, _hidden("HTTPError"))
+
+
+def test_a_reason_phrase_echoing_a_short_segment_is_still_shown():
+    """A segment under four characters is no secret: `/v1/rpc` keeps the text."""
+    with _segment_echoing_node(False) as port:
+        done = _run_cli({}, "http://127.0.0.1:%d/v1/rpc" % port)
+        _assert_unreachable(done, "HTTP Error 401: bad key rpc")
+
+
+# A post_json that calls main again on the same thread blocked forever on the
+# plain Lock its own thread held. The lock is re-entrant now, and each frame
+# restores only the wrapper it installed. Run in a subprocess with a timeout,
+# so a regression fails rather than hanging the suite.
+
+_REENTRY_DRIVER = r'''
+import contextlib, io, sys
+sys.path.insert(0, ".")
+import nano_settlement_verify as library
+import verify_cli
+ARGS = ["verify_cli.py", %(hash)r, %(raw)r, %(account)r, "http://127.0.0.1:7076/"]
+seen = {}
+def nested(rpc_url, payload):
+    if "inner" not in seen:
+        outer_wrapper = library.post_json
+        with contextlib.redirect_stdout(io.StringIO()):
+            seen["inner"] = verify_cli.main(ARGS)
+        seen["restored_to_outer"] = library.post_json is outer_wrapper
+    return {"error": "Block not found"}
+library.post_json = nested
+with contextlib.redirect_stdout(io.StringIO()):
+    seen["outer"] = verify_cli.main(ARGS)
+seen["restored"] = library.post_json is nested
+print(sorted(seen.items()))
+''' % {"hash": HASH, "raw": ONE_XNO_RAW, "account": ACCOUNT}
+
+
+def test_a_post_json_that_calls_main_again_does_not_deadlock():
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", _REENTRY_DRIVER],
+            cwd=SKILL, capture_output=True, text=True, env=_clean_environ(), timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("main called again from inside post_json deadlocked")
+    assert done.stdout.strip() == (
+        "[('inner', 3), ('outer', 3), ('restored', True), ('restored_to_outer', True)]"
+    ), done.stdout + done.stderr

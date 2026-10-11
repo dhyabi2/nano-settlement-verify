@@ -48,14 +48,23 @@ never sent, and is reported as `node_unreachable` (exit 4) with a fixed message 
 part of it. An `@` that belongs in a path or query is written `%40`
 (`http://host/?key=a%40b`, `/v1/acct%40zone/rpc`), which is sent as written; a `%40` or
 `%3A` in the host part (`http://user:pw%40host/`) is a credential and is refused like an `@`; a
-URL that cannot be parsed at all is refused the same way, with its own fixed message. These
+URL whose port is not a number (`https://host:key:443/`, which the URL check and
+`http.client` would split at different colons) and a URL that cannot be parsed at all are
+refused the same way, each with its own fixed message. These
 refusals are configuration errors: retrying will not fix them. The text of an
-`http.client.InvalidURL` error (a control character or a space in the URL, a non-numeric
-port) is never shown, because it quotes the URL back: it is reported by its error class only.
+`http.client.InvalidURL` error (a control character or a space in the URL) is never shown, because it quotes the URL back: it is reported by its error class only.
 Any other failure whose text would repeat a piece of the URL four characters or longer (its
-userinfo, a non-numeric port, path, query, a query field or value, or fragment - raw, decoded
-or escaped) is reported by its class only too; a shorter piece, like the `1` in `?page=1`, is
-no secret, and every other failure keeps the library's own text.
+userinfo, path, any one segment of the path split at `/` or `;`, query, a query field or
+value, or fragment - raw, decoded or escaped) is reported by its class only too; a shorter
+piece, like the `1` in `?page=1`, is no secret, and every other failure keeps the library's
+own text.
+
+Called in-process (importing `verify_cli` and calling `main`), the CLI holds a module-wide
+lock for each verification, network call included, because it swaps the library's
+`post_json` for the length of the call: two threads calling `main` at once take turns, so a
+slow node delays every other in-process caller. The lock is re-entrant, so a `post_json` that
+calls `main` again on the same thread does not deadlock. Running the CLI as its own process,
+the documented use, is unaffected: each process has its own lock.
 
 ## Use it
 
@@ -302,7 +311,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-449 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+472 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
 codes `verify_cli.py` actually returns are the same set in all three directions, and that
