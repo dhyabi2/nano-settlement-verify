@@ -289,6 +289,39 @@ developer tools and are untouched. If `NANO_RPC` is meant to be canonical, the
 cheap follow-up is the CLI accepting it as a second fallback — one line, and the
 new law already covers whichever name the manifest ends up declaring.
 
+## Checked and deliberately not changed: redirects to another scheme
+
+`nano-receipt-ledger`'s own run today found its node opener following a redirect
+to `ftp`, `file` or `data` over a connection its deadline never watched, and
+hardened the opener to http and https only. The same question here, since
+`post_json` uses `urllib.request.urlopen` with the default handlers and this
+PR's scheme check covers only the URL the caller gives, not where a redirect
+leads. Measured against an HTTP stub that answers `302` with a `Location` of
+each scheme:
+
+- `file:///…/crafted.json` — **refused by urllib itself**:
+  `HTTPError: Redirection to url 'file://…' is not allowed`. An `HTTPError` is
+  an `OSError`, so it lands in the arm `README.md:78` tells a seller to write.
+  Tried on `main` and on this branch; a crafted local file cannot be reached
+  this way. (Contrast the *configured* `file://` URL, which `main` does follow
+  and settle from — fixed in round 3 above.)
+- `ftp://127.0.0.1:1/x` — **followed**: the error is
+  `URLError: [Errno 111] Connection refused`, i.e. urllib attempted the FTP
+  connection rather than refusing the scheme. `urllib`'s redirect handler allows
+  `http`, `https` and `ftp`.
+
+Not fixed, and not a defect I can show hurting anyone: reaching it requires the
+node the operator chose to answer `302` to an attacker's FTP server, and a node
+that will do that can simply answer with a crafted reply directly — the reply is
+already trusted by design (`README.md`: "Fetch this block from any public Nano
+node", the operator picks it). So the ceiling is the same either way and no
+privilege is gained. An opener restricted to http and https would be tidier, but
+it is hardening with no demonstrated harm, and this repository's rule is that a
+finding has to be shown before it is built against.
+
+Recorded so a later run does not repeat the experiment. If the owner would
+rather have the opener restricted anyway, it is a handful of lines and one test.
+
 ## Could not verify
 
 - **No live payment of our own.** The measurement above uses a loopback stub
