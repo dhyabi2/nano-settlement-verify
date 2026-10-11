@@ -108,7 +108,11 @@ exception, so the transport failure reaches you as itself:
 | a body that **is** JSON but is not a node reply — a proxy's status page, a rate-limit envelope | `NotANodeReply` (also a `ValueError`) |
 | a body that is JSON but not an object — `"error"`, `["error"]`, a bare number | `NotANodeReply` too: hold and retry. It used to come out as `NotFound`, or a `TypeError` |
 
-The last row is the one worth knowing about, because a public RPC behind a proxy
+A replacement `post_json`, such as a test stub, must return a plain `dict`: a mapping that
+is not one, such as `UserDict` or `MappingProxyType`, is refused as `NotANodeReply`. Real
+nodes are unaffected, because `json.loads` returns a `dict`.
+
+The proxy's status page and rate-limit envelope row is the one worth knowing about, because a public RPC behind a proxy
 answers 200 with its own JSON at least as often as it answers with HTML, and
 none of those bodies carries `confirmed`. It used to raise a bare `KeyError`,
 which is neither an `OSError` nor a `ValueError`, so it went straight through

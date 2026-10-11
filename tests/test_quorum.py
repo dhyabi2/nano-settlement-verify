@@ -267,6 +267,7 @@ def test_a_reply_that_is_not_a_json_object_counts_as_failed_not_answered(monkeyp
     assert list(caught.value.failures) == [B]
     assert "NotANodeReply" in caught.value.failures[B]
 
+
 def test_a_dead_endpoint_does_not_stop_two_live_ones_agreeing(monkeypatch):
     nodes(monkeypatch, {A: OSError("refused"), B: send_block(), C: send_block()})
     out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])
