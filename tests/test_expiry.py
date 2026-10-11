@@ -17,6 +17,7 @@ No test touches the network: the node reply is stubbed, as in test_verify.py.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -172,9 +173,13 @@ sys.exit(verify_cli.main(["verify_cli.py"] + sys.argv[2:]))
 
 
 def run_cli(body, *args):
+    # NANO_RPC_URL is scrubbed: the CLI reads it, and a value exported in the
+    # developer's shell (or a CI step) would otherwise choose - or refuse - the
+    # node these tests stub.
+    env = {name: value for name, value in os.environ.items() if name != "NANO_RPC_URL"}
     return subprocess.run(
         [sys.executable, "-c", _DRIVER, json.dumps(body), *args],
-        cwd=SKILL, capture_output=True, text=True,
+        cwd=SKILL, capture_output=True, text=True, env=env,
     )
 
 

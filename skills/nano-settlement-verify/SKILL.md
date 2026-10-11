@@ -37,10 +37,13 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   `https://rpc.nano.to`. The argument wins over the variable, so a per-call endpoint
   overrides the operator's default. An empty or blank `NANO_RPC_URL` counts as unset, and
   whitespace around the URL is ignored.
-  The URL must be `http` or `https` and must not contain an `@`: a URL with credentials
-  (`http://user:password@host/`), or of any other scheme (`file://`, `ftp://`, none), is
-  refused before anything is sent, as `node_unreachable` (exit 4) with a fixed detail
-  that quotes no part of the URL. Put a node's key somewhere other than the URL.
+  The URL must be `http` or `https` and must not contain an `@` anywhere: a URL with
+  credentials (`http://user:password@host/`), with an `@` in its path or query, of any
+  other scheme (`file://`, `ftp://`, none), or that cannot be parsed, is refused before
+  anything is sent, as `node_unreachable` (exit 4) with a fixed detail that quotes no part
+  of the URL. Credentials are never sent: put a node's key somewhere other than the URL's
+  userinfo. An `@` that belongs in a path or query is written `%40`
+  (`http://host/?key=a%40b`), and is sent as written.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 

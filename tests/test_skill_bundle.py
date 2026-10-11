@@ -85,6 +85,13 @@ sys.exit(verify_cli.main(["verify_cli.py", %r, %r, %r]))
 """ % (HASH, ONE_XNO_RAW, ACCOUNT)
 
 
+def _clean_environ():
+    """os.environ without NANO_RPC_URL, so an exported value never steers a CLI test."""
+    import os
+
+    return {name: value for name, value in os.environ.items() if name != "NANO_RPC_URL"}
+
+
 def test_the_skill_cli_answers_node_unreachable_the_way_skill_md_promises():
     """A proxy's JSON envelope must be exit 4 and a verdict, not a traceback.
 
@@ -98,6 +105,7 @@ def test_the_skill_cli_answers_node_unreachable_the_way_skill_md_promises():
         cwd=SKILL,
         capture_output=True,
         text=True,
+        env=_clean_environ(),
     )
     assert done.returncode == 4, (
         "expected exit 4 (node_unreachable), got %d; stderr:\n%s"
@@ -129,6 +137,7 @@ def _run_with_amount(amount):
         cwd=SKILL,
         capture_output=True,
         text=True,
+        env=_clean_environ(),
     )
 
 
@@ -363,9 +372,12 @@ CHOSEN = "http://127.0.0.1:7076/chosen-by-the-operator"
 
 
 def _environment(env, unset=()):
-    import os
+    """This process's environment without its own NANO_RPC_URL, then env on top.
 
-    merged = {**os.environ, **env}
+    A developer who exported NANO_RPC_URL for the e2e scripts must not have it
+    choose the node for these tests.
+    """
+    merged = {**_clean_environ(), **env}
     for name in unset:
         merged.pop(name, None)
     return merged
@@ -492,9 +504,11 @@ def test_a_url_with_userinfo_as_the_argument_is_unreachable_and_not_echoed():
 # no scrubbing of that text could follow.
 
 CREDENTIALS_DETAIL = (
-    "the RPC URL carries user credentials, which are never sent; give a URL without them"
+    "the RPC URL contains '@': user credentials are never sent, so remove them;"
+    " an '@' in a path or query must be written %40"
 )
 SCHEME_DETAIL = "the RPC URL must be http or https"
+UNPARSEABLE_DETAIL = "the RPC URL could not be parsed"
 
 # (url, the userinfo it carries, raw and decoded)
 CREDENTIAL_URLS = {
@@ -506,7 +520,8 @@ CREDENTIAL_URLS = {
     "unencoded question mark": ("http://zqop:pq?xv@127.0.0.1/", ["zqop:pq?xv"]),
     "unencoded hash": ("http://zqop:pq#xv@127.0.0.1/", ["zqop:pq#xv"]),
     "user only": ("http://k3yqzw@127.0.0.1:1/", ["k3yqzw"]),
-    "@ in the path": ("http://127.0.0.1:1/zqpath@xvq", ["zqpath@xvq"]),
+    "@ in the path": ("http://127.0.0.1:1/zqdir@xvq", ["zqdir@xvq"]),
+    "@ in the query": ("http://127.0.0.1:1/?zkey=zq@xv", ["zkey=zq@xv"]),
 }
 
 SCHEME_URLS = {
@@ -601,3 +616,179 @@ def test_an_error_for_a_url_without_credentials_is_reported_unchanged():
     for done in _both_ways(url):
         assert done.returncode == 4, done.stdout + done.stderr
         assert json.loads(done.stdout) == {"verdict": "node_unreachable", "detail": expected}
+
+
+# --------------------------------------------------------------------------
+# An `@` is refused wherever it falls, so one that belongs in a path or query
+# is written `%40`. That spelling must reach the node untouched.
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:7076/?key=zq%40xv",
+    "http://127.0.0.1:7076/v1/acct%40zone/rpc",
+])
+def test_an_at_sign_written_as_percent_40_is_asked(url):
+    assert _asked_endpoint({"NANO_RPC_URL": url}) == url
+    assert _asked_endpoint({}, url) == url
+
+
+def test_a_percent_40_in_a_query_reaches_a_loopback_node():
+    """The request is really made, to the path and query as written."""
+    with _loopback(_http_reply(_settled_reply())) as server:
+        url = "http://127.0.0.1:%d/rpc?key=zq%%40xv" % server.port
+        for done in _both_ways(url):
+            assert done.returncode == 0, done.stdout + done.stderr
+            assert json.loads(done.stdout)["settled"] is True
+        assert server.paths == ["/rpc?key=zq%40xv"] * 2
+
+
+# A URL urlsplit cannot parse has its own fixed detail. urllib's message for it
+# quotes the netloc or the bracketed host, so it must never be passed on.
+UNPARSEABLE_URLS = {
+    "unclosed bracket": "http://[::1",
+    "bracketed host that is no address": "http://[SECRETV6]:1/",
+    "fullwidth solidus in the netloc": "http://h／SECRETX/",
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNPARSEABLE_URLS))
+def test_a_url_that_cannot_be_parsed_is_refused_with_its_own_detail(case):
+    url = UNPARSEABLE_URLS[case]
+    for done in _both_ways(url):
+        assert "SECRET" not in done.stdout and "SECRET" not in done.stderr
+        _assert_refused(done, UNPARSEABLE_DETAIL, [url])
+
+
+# --------------------------------------------------------------------------
+# Failures past the URL check, against a real socket on loopback. Each is
+# "nothing was checked": exit 4 with a node_unreachable verdict, never a
+# traceback with exit 1, which SKILL.md's table has no row for.
+
+import contextlib
+import json
+import socket
+import threading
+
+
+def _settled_reply():
+    return {
+        "block_account": ACCOUNT,
+        "amount": ONE_XNO_RAW,
+        "confirmed": "true",
+        "height": "1",
+        "subtype": "send",
+        "contents": {"type": "state", "account": ACCOUNT, "link_as_account": ACCOUNT},
+    }
+
+
+def _http_reply(body, declared_length=None):
+    """A raw HTTP/1.0 response carrying body (JSON-encoded unless bytes)."""
+    if not isinstance(body, bytes):
+        body = json.dumps(body).encode("utf-8")
+    length = len(body) if declared_length is None else declared_length
+    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % length
+    return head.encode("ascii") + body
+
+
+class _Server:
+    def __init__(self, response):
+        self.response = response
+        self.paths = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.stopping = False
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self):
+        while not self.stopping:
+            try:
+                conn, _ = self.sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            with conn:
+                conn.settimeout(10)
+                data = b""
+                try:
+                    while b"\r\n\r\n" not in data:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    head, _, rest = data.partition(b"\r\n\r\n")
+                    lines = head.decode("latin-1").split("\r\n")
+                    self.paths.append(lines[0].split(" ")[1])
+                    length = 0
+                    for line in lines[1:]:
+                        name, _, value = line.partition(":")
+                        if name.strip().lower() == "content-length":
+                            length = int(value.strip())
+                    while len(rest) < length:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        rest += chunk
+                    conn.sendall(self.response)
+                except OSError:
+                    pass
+
+
+@contextlib.contextmanager
+def _loopback(response):
+    server = _Server(response)
+    server.thread.start()
+    try:
+        yield server
+    finally:
+        server.stopping = True
+        server.thread.join(5)
+        server.sock.close()
+
+
+def _assert_unreachable(done, detail=None):
+    output = done.stdout + done.stderr
+    assert "Traceback" not in output, output
+    assert done.returncode == 4, "got exit %d\n%s" % (done.returncode, output)
+    verdict = json.loads(done.stdout)
+    assert verdict["verdict"] == "node_unreachable", output
+    if detail is not None:
+        assert verdict == {"verdict": "node_unreachable", "detail": detail}
+
+
+def test_a_non_numeric_port_is_unreachable_not_a_traceback():
+    """urllib raises http.client.InvalidURL for it - an HTTPException."""
+    for done in _both_ways("http://127.0.0.1:abc/"):
+        _assert_unreachable(done)
+
+
+def test_a_reply_shorter_than_its_content_length_is_unreachable():
+    """The node closes early: http.client.IncompleteRead, an HTTPException."""
+    with _loopback(_http_reply(b'{"block_acc', declared_length=4096)) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done)
+        assert len(server.paths) == 2
+
+
+REPLY_NOT_AN_OBJECT = "the node's reply was not a JSON object"
+REPLY_TOO_DEEP = "the node's reply was nested too deeply to read"
+
+NOT_AN_OBJECT = {"list": [], "string": "x", "null": None, "number": 1}
+
+
+@pytest.mark.parametrize("case", sorted(NOT_AN_OBJECT))
+def test_a_reply_that_is_json_but_not_an_object_is_unreachable(case):
+    """The library raised TypeError on it: a traceback and exit 1."""
+    with _loopback(_http_reply(NOT_AN_OBJECT[case])) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done, REPLY_NOT_AN_OBJECT)
+
+
+@pytest.mark.parametrize("opening, closing", [("[", "]"), ('{"a":', "}")])
+def test_a_reply_nested_too_deeply_is_unreachable(opening, closing):
+    """json.loads raised RecursionError on it: a traceback and exit 1."""
+    depth = 200000
+    body = (opening * depth + "1" * (opening != "[") + closing * depth).encode("ascii")
+    with _loopback(_http_reply(body)) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done, REPLY_TOO_DEEP)

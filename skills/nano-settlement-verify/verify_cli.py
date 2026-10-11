@@ -4,7 +4,8 @@
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
-RPC_URL must be http or https with no user:password@ in it; any other URL is refused (4).
+RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
+as %40; credentials are never sent); any other URL is refused (4).
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -40,32 +41,42 @@ def _take_not_after(argv):
 
 DEFAULT_RPC_URL = "https://rpc.nano.to"
 
-# Two refusals for the RPC URL, made before anything is sent. Their details are
+# Three refusals for the RPC URL, made before anything is sent. Their details are
 # fixed strings and never quote the URL: urllib's own messages echo pieces of it
 # back - percent-decoded, and cut wherever a `/`, `?` or `#` falls - so no
 # scrubbing of those messages can promise that a credential in the URL stays out
 # of stdout, stderr and the logs that keep them. Refusing every URL that carries
 # an `@` can.
-CREDENTIALS_REFUSED = (
-    "the RPC URL carries user credentials, which are never sent; give a URL without them"
+AT_SIGN_REFUSED = (
+    "the RPC URL contains '@': user credentials are never sent, so remove them;"
+    " an '@' in a path or query must be written %40"
 )
 SCHEME_REFUSED = "the RPC URL must be http or https"
+UNPARSEABLE_REFUSED = "the RPC URL could not be parsed"
+# A reply that is JSON but not an object (`[]`, `"x"`, `null`, `1`) makes the
+# library raise TypeError, and one nested deeper than the parser's recursion
+# limit RecursionError. Neither is a verdict about the money: nothing was
+# checked, so it is node_unreachable, with a fixed detail.
+REPLY_NOT_AN_OBJECT = "the node's reply was not a JSON object"
+REPLY_TOO_DEEP = "the node's reply was nested too deeply to read"
 
 
 def _refuse_rpc_url(url):
     """A fixed reason the CLI will not ask url, or None when it may.
 
     Any `@` is refused, wherever it falls: telling userinfo from a path apart is
-    the parse this guards against getting wrong. Only http and https are asked;
+    the parse this guards against getting wrong - an unencoded `/` in a password
+    moves the split, and the password lands in the "path". An `@` that really
+    belongs in a path or query is written `%40`, which is sent as is. Only http and https are asked;
     a `file://` URL would let whoever sets the URL hand `verify` a reply they
     wrote themselves, and `settled: true` with it.
     """
     if "@" in url:
-        return CREDENTIALS_REFUSED
+        return AT_SIGN_REFUSED
     try:
         scheme = urllib.parse.urlsplit(url).scheme
     except ValueError:
-        return SCHEME_REFUSED
+        return UNPARSEABLE_REFUSED
     if scheme.lower() not in ("http", "https"):
         return SCHEME_REFUSED
     return None
@@ -133,6 +144,12 @@ def main(argv):
     except Mismatch as error:
         print(json.dumps({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}))
         return 3
+    except TypeError:
+        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}))
+        return 4
+    except RecursionError:
+        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}))
+        return 4
     except (OSError, ValueError, http.client.HTTPException) as error:
         # http.client.HTTPException covers InvalidURL, which urllib raises for
         # a URL it cannot even connect to; it is neither an OSError nor a

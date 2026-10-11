@@ -43,9 +43,11 @@ The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
 `$NANO_RPC_URL` when no `RPC_URL` argument is given - so if you export that variable for
 another tool, the CLI's verifications go there too; an empty or blank value means the
 default, `https://rpc.nano.to`. The CLI asks only `http` and `https` URLs, and refuses any
-URL containing an `@` - so a URL with credentials (`http://user:password@host/`) is never
-sent, and is reported as `node_unreachable` (exit 4) with a fixed message that quotes no
-part of it.
+URL containing an `@` anywhere - so a URL with credentials (`http://user:password@host/`) is
+never sent, and is reported as `node_unreachable` (exit 4) with a fixed message that quotes no
+part of it. An `@` that belongs in a path or query is written `%40`
+(`http://host/?key=a%40b`, `/v1/acct%40zone/rpc`), which is sent as written; a URL
+that cannot be parsed at all is refused the same way, with its own fixed message.
 
 ## Use it
 
@@ -292,7 +294,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-376 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+391 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
 codes `verify_cli.py` actually returns are the same set in all three directions, and that
@@ -300,10 +302,14 @@ every environment variable SKILL.md declares is read by the bundle - `NANO_RPC_U
 selects the node that decides the payment, with an explicit `RPC_URL` argument winning
 over it, the default unchanged when neither is set or the variable is empty or blank, a
 padded value stripped, and a URL with credentials (percent-encoded or carrying `/`, `?` or
-`#` in the password, user-only, or any `@` at all) or a scheme other than http/https
-(`file://`, `ftp://`, none) refused as `node_unreachable` (exit 4) before any request, with a
-fixed detail and no piece of the URL in stdout or stderr, while every other failure's detail
-is left exactly as the library reported it;
+`#` in the password, user-only, or any `@` at all, in the path or query too) or a scheme other
+than http/https (`file://`, `ftp://`, none) or a URL that cannot be parsed (an unclosed or
+non-address bracketed host, a fullwidth solidus in the host) refused as `node_unreachable`
+(exit 4) before any request, with a fixed detail and no piece of the URL in stdout or stderr,
+an `@` written `%40` in a path or query asked as written, and against a loopback node a
+non-numeric port, a reply cut short of its Content-Length, a reply that is JSON but not an
+object and one nested too deeply each answered as `node_unreachable` (exit 4), never a
+traceback - while every other failure's detail is left exactly as the library reported it;
 for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
@@ -322,7 +328,8 @@ not-found on one node yielding to a found answer on another; and for the README 
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
-and a fixture fails any test that tries to open a socket.
+and a fixture fails any test that tries to open a socket; the skill-bundle CLI tests that
+need a real socket use a throwaway server on loopback.
 
 There is also a hand check that exercises the real `urllib` path against a throwaway HTTP
 node stub on loopback:

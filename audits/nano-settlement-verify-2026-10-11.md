@@ -63,7 +63,7 @@ an explicit `RPC_URL` argument is the narrower instruction and still wins, and a
 unset or empty variable leaves the default byte-identical to before. No verdict
 about any payment changes for any caller that was already passing the endpoint.
 
-Five tests, two of which fail on `e39e37e`:
+Four new tests, two of which fail on `e39e37e`:
 
 - `test_nano_rpc_url_chooses_the_node_that_decides_the_payment` — fails before
   (asks `https://rpc.nano.to`), passes after.
@@ -73,7 +73,8 @@ Five tests, two of which fail on `e39e37e`:
 - `test_an_explicit_rpc_url_argument_still_wins_over_the_variable` and
   `test_the_default_endpoint_is_unchanged_when_the_variable_is_unset` are
   controls: both pass before and after, which is what makes this a narrowing.
-- The README test-count law (#19) required the page's count to move 350 → 354.
+
+The README test-count law (#19) required the page's count to move 350 → 354.
 
 ## Two gaps in that fix, found in review and fixed on the same branch
 
@@ -121,6 +122,42 @@ sent: any `@` in it, a scheme other than http or https, or a URL urlsplit cannot
 parse is `node_unreachable` (exit 4) with a fixed detail that quotes no part of
 the URL. The redaction is gone; every other failure's detail is `str(error)[:200]`
 as on `main`. Suite: **376 passed**.
+
+## Third review round: the `@` rule, unparseable URLs and non-object replies
+
+Review of the refusal above found five things; all fixed in `verify_cli.py` and
+the tests, the vendored library untouched (still byte-identical to the root copy).
+
+1. **The `@` refusal's detail was wrong for half of what it refuses.** Any `@`
+   is still refused - an unencoded `/` in a password moves the userinfo split,
+   so telling a credential from a path `@` is the parse not to trust - but
+   `http://h/?key=a@b` and `/v1/acct@zone/rpc` carry no credentials, and
+   both worked on `main`. The detail now says so and names the workaround:
+   *"the RPC URL contains '@': user credentials are never sent, so remove them;
+   an '@' in a path or query must be written %40"*. The usage docstring,
+   SKILL.md and README state the rule; a test shows `%40` in a query reaches a
+   loopback node exactly as written.
+2. **An unparseable URL got the scheme message.** urlsplit's `ValueError` now
+   has its own fixed detail, *"the RPC URL could not be parsed"*; urllib's own
+   text for it quotes the bracketed host or netloc and is never passed on.
+   Pinned with `http://[::1`, `http://[SECRETV6]:1/` and a fullwidth solidus in
+   the netloc, none of whose pieces reach stdout or stderr.
+3. **The `HTTPException` arm is pinned**: a non-numeric port (`InvalidURL`) and a
+   loopback node that closes short of its Content-Length (`IncompleteRead`) are
+   both exit 4, no traceback.
+4. **Pre-existing: a reply that is JSON but not an object** (`[]`, `"x"`, `null`,
+   `1`) raised `TypeError` in the library, and one nested past the parser's
+   recursion limit `RecursionError` - a traceback and exit 1, outside SKILL.md's
+   table. The CLI now answers both as `node_unreachable` (exit 4) with fixed
+   details, *"the node's reply was not a JSON object"* and *"the node's reply was
+   nested too deeply to read"*. Each is tested against a loopback node.
+5. **The CLI tests inherited `NANO_RPC_URL`.** `tests/test_expiry.py`'s `run_cli`
+   and the skill-bundle helpers passed the developer's environment through, so
+   with `NANO_RPC_URL=ws://x` exported four expiry tests failed and one bundle
+   test passed for the wrong reason (the refusal, not the stubbed proxy reply).
+   They now drop it; the suite passes with it exported.
+
+Suite: **391 passed** (376 before this round).
 
 ## Still open — the owner's one sentence, not a blocker
 
