@@ -75,6 +75,37 @@ Five tests, two of which fail on `e39e37e`:
   controls: both pass before and after, which is what makes this a narrowing.
 - The README test-count law (#19) required the page's count to move 350 → 354.
 
+## Two gaps in that fix, found in review and fixed on the same branch
+
+The review of the above (commit `2f6fca9`) found two things my fix did not cover.
+Both are real; I reproduced each independently before accepting it, and the note
+records them because the second one was a credential leak.
+
+1. **A whitespace-only `NANO_RPC_URL` was truthy**, so `"   "` was asked as the
+   endpoint and every verification exited 4 — the same holding-a-paid-call
+   failure the fix exists to remove, reintroduced for a padded `export`. My
+   control test used `""`, which the `or` already handled, and so proved less
+   than it looked. Now `.strip() or DEFAULT_RPC_URL`: empty, blank and padded
+   all behave. Measured by hand on the merged branch — blank and empty both ask
+   `https://rpc.nano.to`, and `"  http://127.0.0.1:7177/x  "` asks
+   `http://127.0.0.1:7177/x`.
+2. **A URL with userinfo printed its password in a traceback.** urllib raises
+   `http.client.InvalidURL` for `http://user:pw@host/`, which is an
+   `HTTPException` — neither `OSError` nor `ValueError` — so it escaped the arm
+   the README tells a seller to write *and* the CLI's own handler, exiting 1
+   with the credential on stderr, outside SKILL.md's exit table entirely. This
+   is the `not_after` defect of 2026-10-10 one argument over, with a secret in
+   it. `HTTPException` now joins the unreachable-node arm and the detail is
+   redacted. Measured: `NANO_RPC_URL=http://seller:sup3rsecret@127.0.0.1:1/`
+   exits **4**, and `sup3rsecret` appears in neither stdout nor stderr.
+
+The declared-variable law I wrote was also tightened, and it needed to be: it
+searched the bundle's `.py` text for the name, which a comment or a docstring
+mentioning `NANO_RPC_URL` would have satisfied without any code reading it. It
+now requires a real `os.environ` / `os.getenv` read.
+
+Suite on the branch head: **360 passed** (350 on `main`, 354 after my commit).
+
 ## Still open — the owner's one sentence, not a blocker
 
 The repository spells the variable two ways: SKILL.md declares `NANO_RPC_URL`,
