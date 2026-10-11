@@ -792,3 +792,172 @@ def test_a_reply_nested_too_deeply_is_unreachable(opening, closing):
     with _loopback(_http_reply(body)) as server:
         for done in _both_ways("http://127.0.0.1:%d/" % server.port):
             _assert_unreachable(done, REPLY_TOO_DEEP)
+
+
+# --------------------------------------------------------------------------
+# Review round four. urllib percent-decodes the netloc before it complains, so
+# `user:hunter2%40host` came out as "nonnumeric port: 'hunter2@host'"; a
+# credential spelled with %40 or %3A in the netloc is refused like an '@'.
+
+PERCENT_CREDENTIAL_URLS = {
+    "%40 before the host": ("http://zqop:hunter2%40127.0.0.1/", ["zqop:hunter2", "hunter2%40127"]),
+    "%40 with a port": ("http://zqop:hunter2%40127.0.0.1:1/", ["zqop:hunter2", "hunter2%40127"]),
+    "%3A and %40": ("http://zqop%3Ahunter2%40127.0.0.1/", ["zqop%3Ahunter2", "zqop:hunter2"]),
+    "lowercase %3a only": ("http://zqop%3ahunter2.example/", ["zqop%3ahunter2", "zqop:hunter2"]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(PERCENT_CREDENTIAL_URLS))
+def test_a_percent_encoded_at_or_colon_in_the_netloc_is_refused(case):
+    url, secrets = PERCENT_CREDENTIAL_URLS[case]
+    for done in _both_ways(url):
+        _assert_refused(done, CREDENTIALS_DETAIL, secrets)
+
+
+def _verify_cli_module():
+    sys.path.insert(0, str(SKILL))
+    try:
+        import verify_cli
+    finally:
+        sys.path.remove(str(SKILL))
+    return verify_cli
+
+
+def _hidden(class_name):
+    return (
+        "the request to the RPC URL failed (%s); its text would repeat part of"
+        " the URL, so it is not shown" % class_name
+    )
+
+
+def test_an_error_that_repeats_the_decoded_userinfo_is_not_shown():
+    """The general rule, apart from the %40 refusal: decoded pieces count too."""
+    import http.client
+
+    cli = _verify_cli_module()
+    error = http.client.InvalidURL("nonnumeric port: 'hunter2@127.0.0.1'")
+    assert cli._error_detail(error, "http://zqop:hunter2%40127.0.0.1/") == _hidden("InvalidURL")
+    error = OSError("could not reach /zq dir")
+    assert cli._error_detail(error, "http://127.0.0.1:1/zq%20dir") == _hidden("OSError")
+
+
+def test_an_error_that_repeats_a_short_query_value_is_not_shown():
+    """A query value is a key more often than not, so its length does not matter."""
+    cli = _verify_cli_module()
+    error = OSError("refused for k=Q7")
+    assert cli._error_detail(error, "http://127.0.0.1:1/?k=Q7") == _hidden("OSError")
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:1/?key=SECRETZQ KEY",
+    "http://127.0.0.1:1/?key=SECRETZQ\x7f",
+    "http://127.0.0.1:1/?key=SECRETZQ\x01",
+])
+def test_a_query_with_a_control_character_is_not_echoed(url):
+    """urllib's InvalidURL quotes the path and query back, control character and all."""
+    for done in _both_ways(url):
+        assert "SECRETZQ" not in done.stdout + done.stderr
+        _assert_unreachable(done, _hidden("InvalidURL"))
+
+
+# post_json replaced by one that raises what sys.argv[1] names, so the CLI's
+# own handling of each failure is seen without a socket.
+_RAISING_DRIVER = """
+import sys
+sys.path.insert(0, ".")
+import nano_settlement_verify
+def _raise(rpc_url, payload):
+    raise eval(sys.argv[1])
+nano_settlement_verify.post_json = _raise
+import verify_cli
+sys.exit(verify_cli.main(["verify_cli.py", %r, %r, %r] + sys.argv[2:]))
+""" % (HASH, ONE_XNO_RAW, ACCOUNT)
+
+
+def _run_raising(expression, *extra_argv):
+    return subprocess.run(
+        [sys.executable, "-c", _RAISING_DRIVER, expression, *extra_argv],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+        env=_clean_environ(),
+        timeout=60,
+    )
+
+
+def test_an_ordinary_error_longer_than_200_characters_is_cut_at_200():
+    """main's `str(error)[:200]` is kept for an error that quotes no part of the URL."""
+    done = _run_raising("OSError('z' * 300)", "http://127.0.0.1:7076/rpc")
+    _assert_unreachable(done, "z" * 200)
+
+
+def test_a_driven_error_that_repeats_the_path_is_not_shown():
+    done = _run_raising("OSError('cannot open /zqrpc/v2')", "http://127.0.0.1:7076/zqrpc/v2")
+    _assert_unreachable(done, _hidden("OSError"))
+
+
+def test_a_memory_error_is_unreachable_with_a_fixed_detail():
+    _assert_unreachable(_run_raising("MemoryError()"), "the node's reply was too large to read")
+
+
+@pytest.mark.parametrize("expression, name", [
+    ("RuntimeError('zq reply text')", "RuntimeError"),
+    ("KeyError('zq')", "KeyError"),
+    ("AssertionError('zq')", "AssertionError"),
+])
+def test_any_other_failure_is_unreachable_never_a_traceback(expression, name):
+    done = _run_raising(expression)
+    _assert_unreachable(done, "the node's reply could not be checked (%s)" % name)
+    assert "zq" not in done.stdout + done.stderr
+
+
+REPLY_NUMBER_TOO_LARGE = "the node's reply carried a number too large to read"
+
+
+@pytest.mark.parametrize("number", ["1e999", "Infinity", "-Infinity"])
+def test_an_amount_too_large_for_an_integer_is_unreachable(number):
+    """The library's int() of an infinite float raised OverflowError: a traceback, exit 1."""
+    body = ('{"confirmed":"true","amount":%s,"height":"1"}' % number).encode("ascii")
+    with _loopback(_http_reply(body)) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done, REPLY_NUMBER_TOO_LARGE)
+
+
+REPLY_WRONG_TYPE = "the node's reply was not a JSON object, or a field in it had the wrong type"
+
+
+@pytest.mark.parametrize("amount", [[], {}])
+def test_a_field_of_the_wrong_type_is_named_as_such(amount):
+    reply = dict(_settled_reply(), amount=amount)
+    with _loopback(_http_reply(reply)) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done, REPLY_WRONG_TYPE)
+
+
+@pytest.mark.parametrize("reply", ["error", "no error here", ["error"]])
+def test_a_reply_that_mentions_error_but_is_not_an_object_is_unreachable(reply):
+    """The library's `"error" in reply` made these no_such_block: exit 3, "do not serve"."""
+    with _loopback(_http_reply(reply)) as server:
+        for done in _both_ways("http://127.0.0.1:%d/" % server.port):
+            _assert_unreachable(done, REPLY_NOT_AN_OBJECT)
+        assert len(server.paths) == 2
+
+
+def test_the_library_post_json_is_restored_after_main():
+    """The CLI's object check wraps post_json only for its own call."""
+    done = subprocess.run(
+        [sys.executable, "-c", _RPC_DRIVER + "print('SAME', nano_settlement_verify.post_json is _record)"],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+        env=_clean_environ(),
+    )
+    assert "SAME True" in done.stdout, done.stdout + done.stderr
+
+
+def test_an_empty_rpc_url_argument_is_refused_not_replaced():
+    """`""` as RPC_URL is an argument, so neither NANO_RPC_URL nor the default stands in."""
+    assert _asked_endpoint({"NANO_RPC_URL": CHOSEN}, "") == "<nothing>"
+    assert _asked_endpoint({}, "", unset=("NANO_RPC_URL",)) == "<nothing>"
+    for done in [_run_cli({}, ""), _run_cli({"NANO_RPC_URL": CHOSEN}, "")]:
+        _assert_refused(done, SCHEME_DETAIL, ["127.0.0.1:7076/chosen-by-the-operator"])

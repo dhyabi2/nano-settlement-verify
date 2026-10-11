@@ -43,7 +43,9 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   anything is sent, as `node_unreachable` (exit 4) with a fixed detail that quotes no part
   of the URL. Credentials are never sent: put a node's key somewhere other than the URL's
   userinfo. An `@` that belongs in a path or query is written `%40`
-  (`http://host/?key=a%40b`), and is sent as written.
+  (`http://host/?key=a%40b`), and is sent as written; a `%40` or `%3A` in the host part
+  (`http://user:pw%40host/`) is a credential and is refused the same way. A failure whose
+  text would repeat part of the URL is reported by its error class only.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 
@@ -61,7 +63,7 @@ One JSON object on stdout, and an exit code:
 | 0 | `{"settled": true, ...}` - confirmed send of exactly that amount to that account | serve the call |
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
 | 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
-| 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment |
+| 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment. A detail of *the RPC URL contains '@'*, *must be http or https* or *could not be parsed* is a configuration error that retrying will not fix: correct the URL |
 | 5 | `{"verdict": "late", "seen_at": ..., "not_after": ...}` - right amount and account, seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
 | 6 | `{"verdict": "unknown_time", "seen_at": null, ...}` - settled, but the node reports no time for it | do not treat as on time; ask another node |
 | 64 | usage error, or `{"verdict": "invalid_not_after"}` | fix the command |

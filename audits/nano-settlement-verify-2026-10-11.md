@@ -4,7 +4,8 @@ Previous audit 2026-10-10. Audited at `e39e37e` (`main` after #25).
 Lens unchanged: can an agent get PAID in XNO with this today without being hurt —
 refused when it was paid, told it was paid when it was not, or dropped mid-request.
 
-`python3 -m pytest -q`: **350 passed** on `e39e37e`, **354** on this branch.
+`python3 -m pytest -q`: **350 passed** on `e39e37e`, **416** on this branch (354 after
+the first commit; each review round below gives its own count).
 
 ## What I checked
 
@@ -158,6 +159,54 @@ the tests, the vendored library untouched (still byte-identical to the root copy
    They now drop it; the suite passes with it exported.
 
 Suite: **391 passed** (376 before this round).
+
+## Fourth review round: decoded credentials, infinite amounts and "error" strings
+
+Review found these; all fixed in `verify_cli.py`, the tests and the docs. The
+library is untouched, root and vendored copies still byte-identical.
+
+1. **A percent-encoded credential leaked through urllib's decoded error text.**
+   `http://user:hunter2%40127.0.0.1/` and `http://user%3Ahunter2%40127.0.0.1/`
+   carry no literal `@`, so they passed the refusal, and urllib answered
+   *"nonnumeric port: 'hunter2@127.0.0.1'"*. Two fixes: a netloc containing
+   `%40` or `%3A` (any case) is refused with the `@` detail; and, generally,
+   before `str(error)[:200]` is printed, the URL's userinfo, path, query,
+   fragment and a non-numeric port - raw, percent-decoded and as `repr`
+   escapes them, four characters or longer, plus every query value at any
+   length - are looked for in the error text. If one is there, the detail is
+   *"the request to the RPC URL failed (<ErrorClass>); its text would repeat
+   part of the URL, so it is not shown"*. That also covers `?key=SECRET KEY`
+   and other control characters in a query, which `InvalidURL` quotes back.
+   An error that repeats no piece keeps main's text exactly, cut at 200
+   characters; both are pinned.
+2. **`{"confirmed":"true","amount":1e999,"height":"1"}`** (and `Infinity`,
+   `-Infinity`) made the library's `int()` raise `OverflowError`: traceback,
+   exit 1. `OverflowError` and `MemoryError` are now exit 4 with fixed details,
+   and a last `except Exception` in the CLI answers anything else as exit 4,
+   *"the node's reply could not be checked (<ErrorClass>)"*, so no reply can
+   end in a traceback.
+3. **The `TypeError` detail was wrong** for an object whose field has the wrong
+   type (`"amount": []`); it is now *"the node's reply was not a JSON object, or
+   a field in it had the wrong type"*.
+4. **SKILL.md's exit 4 row said only "retry"**; it now says the three fixed URL
+   refusals are configuration errors that retrying will not fix.
+5. **Pre-existing: a string or list reply containing "error" was exit 3.** The
+   library's `"error" in reply` is a substring or membership test on a
+   non-object, so `"error"`, `"no error here"` and `["error"]` came out as
+   `no_such_block` - "do not serve" from a reply that says nothing about the
+   money. The README claimed every non-object reply was exit 4. The CLI now
+   wraps the library's `post_json` for the duration of its own call and answers
+   any non-object reply as `node_unreachable` before the library reads it; the
+   original function is restored afterwards (tested).
+6. **An empty `RPC_URL` argument (`""`) is pinned as refused** - not replaced by
+   `NANO_RPC_URL` or the default.
+
+Seen in passing, library behaviour this PR does not change: an `amount` of
+`1.9` or `true`, or a `height` of `1.5`, is read through `int()` and can settle
+(`1.9` as 1 raw). A node that answers JSON numbers there is not a real node, but
+the library's `_required` could refuse non-strings; that is a separate change.
+
+Suite: **416 passed** (391 before this round).
 
 ## Still open — the owner's one sentence, not a blocker
 

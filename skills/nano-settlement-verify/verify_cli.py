@@ -5,7 +5,8 @@ usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-afte
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
-as %40; credentials are never sent); any other URL is refused (4).
+as %40; credentials are never sent, and %40 or %3A in the host part counts as one); any
+other URL is refused (4), a configuration error that retrying will not fix.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -18,6 +19,7 @@ import os
 import sys
 import urllib.parse
 
+import nano_settlement_verify as _library
 from nano_settlement_verify import (
     TIME_SOURCE, Late, Mismatch, NotFound, UnknownTime, parse_not_after, verify,
 )
@@ -58,7 +60,86 @@ UNPARSEABLE_REFUSED = "the RPC URL could not be parsed"
 # limit RecursionError. Neither is a verdict about the money: nothing was
 # checked, so it is node_unreachable, with a fixed detail.
 REPLY_NOT_AN_OBJECT = "the node's reply was not a JSON object"
+REPLY_WRONG_TYPE = (
+    "the node's reply was not a JSON object, or a field in it had the wrong type"
+)
 REPLY_TOO_DEEP = "the node's reply was nested too deeply to read"
+# `1e999`, `Infinity` and `-Infinity` are numbers to json.loads, and the
+# library's int() of one raises OverflowError: an ArithmeticError, neither an
+# OSError nor a ValueError. A reply too large to hold is MemoryError.
+REPLY_NUMBER_TOO_LARGE = "the node's reply carried a number too large to read"
+REPLY_TOO_LARGE = "the node's reply was too large to read"
+
+
+def _reply_not_checked(error):
+    """The fixed detail for a reply failure no other arm names."""
+    return "the node's reply could not be checked (%s)" % type(error).__name__
+
+
+class _NotAnObject(Exception):
+    """The node answered with JSON that is not an object."""
+
+
+def _objects_only(post_json):
+    """post_json, refusing a reply that is not a JSON object.
+
+    The library tests `"error" in reply` before anything else, and for a string
+    or a list that is a substring or membership test: `"error"`, `"no error
+    here"` and `["error"]` all came out as no_such_block (exit 3, "do not
+    serve") - a verdict about the money from a reply that says nothing about
+    it. The CLI sees the reply first, without changing the library.
+    """
+    def ask(rpc_url, payload):
+        reply = post_json(rpc_url, payload)
+        if not isinstance(reply, dict):
+            raise _NotAnObject()
+        return reply
+    return ask
+
+
+def _url_pieces(url):
+    """The parts of url an error message must not repeat: raw, decoded, escaped.
+
+    The userinfo, path, query, fragment and a non-numeric port, each at least
+    four characters long, and every query value whatever its length.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        parts = None
+    netloc = parts.netloc if parts else ""
+    userinfo, _, hostport = netloc.rpartition("@")
+    port = hostport.rpartition("]")[2].partition(":")[2]
+    long_pieces = [userinfo, port if not port.isdigit() else ""]
+    values = []
+    if parts:
+        long_pieces += [parts.path, parts.query, parts.fragment]
+        for field in parts.query.split("&"):
+            values.append(field.partition("=")[2])
+    found = set()
+    for piece, shortest in [(p, 4) for p in long_pieces] + [(v, 1) for v in values]:
+        for form in (piece, urllib.parse.unquote(piece), urllib.parse.unquote_plus(piece)):
+            for spelling in (form, repr(form)[1:-1], ascii(form)[1:-1]):
+                if len(spelling) >= shortest:
+                    found.add(spelling)
+    return found
+
+
+def _error_detail(error, url):
+    """main's `str(error)[:200]`, unless that text repeats a piece of url.
+
+    urllib quotes the URL back in some of its errors - percent-decoded, or with
+    control characters escaped - so a key in a query or a password that dodged
+    the '@' check (`hunter2%40host`) would land in stdout and the logs that keep
+    it. Such an error is named by its class alone.
+    """
+    text = str(error)
+    if any(piece in text for piece in _url_pieces(url)):
+        return (
+            "the request to the RPC URL failed (%s); its text would repeat part of"
+            " the URL, so it is not shown" % type(error).__name__
+        )
+    return text[:200]
 
 
 def _refuse_rpc_url(url):
@@ -74,9 +155,16 @@ def _refuse_rpc_url(url):
     if "@" in url:
         return AT_SIGN_REFUSED
     try:
-        scheme = urllib.parse.urlsplit(url).scheme
+        parts = urllib.parse.urlsplit(url)
     except ValueError:
         return UNPARSEABLE_REFUSED
+    # `%40` is an '@' and `%3A` a ':' once urllib decodes the host: in the
+    # netloc they can only be credentials (`user:hunter2%40host`), and urllib's
+    # "nonnumeric port: 'hunter2@host'" would print them.
+    netloc = parts.netloc.lower()
+    if "%40" in netloc or "%3a" in netloc:
+        return AT_SIGN_REFUSED
+    scheme = parts.scheme
     if scheme.lower() not in ("http", "https"):
         return SCHEME_REFUSED
     return None
@@ -127,6 +215,8 @@ def main(argv):
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
         return 4
+    asked = _library.post_json
+    _library.post_json = _objects_only(asked)
     try:
         receipt = verify(block_hash=block_hash, expect_raw=expect_raw, account=account,
                          rpc_url=rpc_url, not_after=not_after)
@@ -144,8 +234,11 @@ def main(argv):
     except Mismatch as error:
         print(json.dumps({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}))
         return 3
-    except TypeError:
+    except _NotAnObject:
         print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}))
+        return 4
+    except TypeError:
+        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}))
         return 4
     except RecursionError:
         print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}))
@@ -155,8 +248,22 @@ def main(argv):
         # a URL it cannot even connect to; it is neither an OSError nor a
         # ValueError and used to escape as a traceback with exit 1. A URL the
         # node cannot be reached at is still "nothing was checked".
-        print(json.dumps({"verdict": "node_unreachable", "detail": str(error)[:200]}))
+        print(json.dumps({"verdict": "node_unreachable", "detail": _error_detail(error, rpc_url)}))
         return 4
+    except OverflowError:
+        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}))
+        return 4
+    except MemoryError:
+        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}))
+        return 4
+    except Exception as error:  # noqa: BLE001 - no reply may end in a traceback
+        # Whatever else a node's reply makes the library raise, nothing was
+        # checked: exit 4, never a traceback with exit 1, which SKILL.md's
+        # table has no row for. The detail names the class only.
+        print(json.dumps({"verdict": "node_unreachable", "detail": _reply_not_checked(error)}))
+        return 4
+    finally:
+        _library.post_json = asked
     print(receipt.to_json())
     return 0 if receipt.settled else 2
 
