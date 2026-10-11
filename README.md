@@ -48,16 +48,34 @@ never sent, and is reported as `node_unreachable` (exit 4) with a fixed message 
 part of it. An `@` that belongs in a path or query is written `%40`
 (`http://host/?key=a%40b`, `/v1/acct%40zone/rpc`), which is sent as written; a `%40` or
 `%3A` in the host part (`http://user:pw%40host/`) is a credential and is refused like an `@`; a
-URL whose port is not a number (`https://host:key:443/`, which the URL check and
-`http.client` would split at different colons) and a URL that cannot be parsed at all are
-refused the same way, each with its own fixed message. These
-refusals are configuration errors: retrying will not fix them. The text of an
-`http.client.InvalidURL` error (a control character or a space in the URL) is never shown, because it quotes the URL back: it is reported by its error class only.
-Any other failure whose text would repeat a piece of the URL four characters or longer (its
-userinfo, path, any one segment of the path split at `/` or `;`, query, a query field or
-value, or fragment - raw, decoded or escaped) is reported by its class only too; a shorter
-piece, like the `1` in `?page=1`, is no secret, and every other failure keeps the library's
-own text.
+URL whose port is not a number from 0 to 65535 (`https://host:key:443/`, which the URL check
+and `http.client` would split at different colons, or `:99999`) and a URL that cannot be
+parsed at all are refused the same way, each with its own fixed message. These
+refusals are configuration errors: retrying will not fix them. Whitespace around the URL,
+as the argument or the variable, is ignored; a blank argument is refused, not replaced.
+
+When the node cannot be reached or read, the detail is chosen by the error's class alone,
+from parts of it that cannot hold the URL - the URL itself is never consulted:
+
+- an HTTP error status: `HTTP Error <code>` only (`HTTP Error 401`). The server's reason
+  phrase is dropped, because a node can repeat the URL, or one piece of it, in that phrase;
+  main showed it (`HTTP Error 401: Unauthorized`);
+- a connection, DNS or timeout failure: `[Errno N] strerror`, inside `<urlopen error ...>`
+  when urllib wrapped it - exactly main's text for connection refused
+  (`<urlopen error [Errno 111] Connection refused>`), a DNS failure
+  (`<urlopen error [Errno -2] Name or service not known>`) and a timeout (`timed out`);
+- a TLS failure: its reason code, and for a certificate its verify message
+  (`<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname
+  mismatch, certificate is not valid for 'host'.>`), which may name the host;
+- a reply that is not a node's reply, not JSON or not UTF-8: the library's or the parser's
+  own text about the reply, cut at 200 characters, as main printed it;
+- anything else - `http.client.InvalidURL` (a space or control character in the URL), any
+  other `http.client` error, any other `ValueError` - by its class only:
+  `the request to the RPC URL failed (InvalidURL)`.
+
+A node you give a key to (in its path or query) can still repeat it in its reply, and the CLI
+prints what the reply says - the `got` of a mismatch, or the keys named in a "not a node's
+block_info reply" detail - as main does. Put a key only in a URL whose node you trust with it.
 
 Called in-process (importing `verify_cli` and calling `main`), the CLI holds a module-wide
 lock for each verification, network call included, because it swaps the library's
@@ -311,30 +329,33 @@ pip install pytest
 python -m pytest -v
 ```
 
-472 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+510 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
 codes `verify_cli.py` actually returns are the same set in all three directions, and that
 every environment variable SKILL.md declares is read by the bundle - `NANO_RPC_URL`
 selects the node that decides the payment, with an explicit `RPC_URL` argument winning
 over it, the default unchanged when neither is set or the variable is empty or blank, a
-padded value stripped, an empty `RPC_URL` argument refused rather than replaced, and a URL with credentials (percent-encoded or carrying `/`, `?` or
+padded value stripped, a padded `RPC_URL` argument stripped too, an empty or blank `RPC_URL` argument refused rather than replaced, and a URL with credentials (percent-encoded or carrying `/`, `?` or
 `#` in the password, user-only, `%40` or `%3A` in the host part, or any `@` at all, in the path or query too) or a scheme other
 than http/https (`file://`, `ftp://`, none) or a URL that cannot be parsed (an unclosed or
-non-address bracketed host, a fullwidth solidus in the host) refused as `node_unreachable`
+non-address bracketed host, a fullwidth solidus in the host) or a port that is not a number up
+to 65535 refused as `node_unreachable`
 (exit 4) before any request, with a fixed detail and no piece of the URL in stdout or stderr,
 an `@` written `%40` in a path or query asked as written, and against a loopback node a
 non-numeric port, a reply cut short of its Content-Length, a reply that is JSON but not an
 object (`"error"`, `"no error here"` and `["error"]` included, which the library's `"error" in
 reply` would otherwise read as no such block), one with a field of the wrong type, an amount of
 `1e999`, `Infinity` or `-Infinity`, one nested too deeply, and any other exception, each
-answered as `node_unreachable` (exit 4) with a fixed detail, never a traceback - while an error
-whose text would repeat a piece of the URL (a control character in the query, a decoded
-password, a path or query holding both kinds of quote) is named by its class only, as is every
-`InvalidURL`, whose text is never shown, while a query value under four characters (`?page=1`)
-hides nothing and every other failure's detail is left exactly as the library reported it,
-cut at 200 characters, and two overlapping callers of the CLI in one process leave the
-library's `post_json` as they found it;
+answered as `node_unreachable` (exit 4) with a fixed detail, never a traceback - while the
+detail of a failed request is chosen by the error's class alone (each class tested: an HTTP
+status without its reason phrase, `[Errno N] strerror` identical to main's text for connection
+refused, a DNS failure and a timeout, an SSL reason and verify message, the library's own
+reply text - shown in full at a path named `/api/node` - and the class name for `InvalidURL`
+and everything else), a node echoing the URL, a path segment or one value of it in a 401
+reason phrase never prints the key, a URL with a control character or both kinds of quote
+never prints it either, and two overlapping callers of the CLI in one process, or one that
+calls it again from inside `post_json`, leave the library's `post_json` as they found it;
 for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement

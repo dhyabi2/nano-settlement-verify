@@ -4,7 +4,7 @@ Previous audit 2026-10-10. Audited at `e39e37e` (`main` after #25).
 Lens unchanged: can an agent get PAID in XNO with this today without being hurt —
 refused when it was paid, told it was paid when it was not, or dropped mid-request.
 
-`python3 -m pytest -q`: **350 passed** on `e39e37e`, **472** on this branch (354 after
+`python3 -m pytest -q`: **350 passed** on `e39e37e`, **510** on this branch (354 after
 the first commit; each review round below gives its own count).
 
 ## What I checked
@@ -290,6 +290,58 @@ docs. The library is untouched, root and vendored copies still byte-identical.
    unaffected.
 
 Suite: **472 passed** (449 before this round).
+
+## Seventh review round: the detail is chosen by class, not by matching the URL
+
+Six rounds of review kept finding the same thing from both sides. Matching
+pieces of the URL against an error's text leaked a key whenever the node split
+the URL differently than the check did - a 401 reason phrase echoing
+`SECRETKEY` from `/rpc;key=SECRETKEY`, `/rpc/key=SECRETKEY`,
+`/rpc/SECRETKEY.json` or `?a=1;key=SECRETKEY` - and hid ordinary errors whenever
+a word of the URL turned up in them: at `/api/node` the library's own
+"not a node's block_info reply" text was hidden, at `/proxy` an SSL hostname
+mismatch was. No list of pieces closes both sides, so the matching is gone:
+`_url_pieces`, the quote-unescaping and their tests are deleted, and
+`_error_detail(error)` no longer takes the URL at all. The detail is built
+only from parts of the error that cannot hold the URL:
+
+- `NotANodeReply`, `json.JSONDecodeError`, `UnicodeDecodeError`: the library's or
+  the parser's own text about the reply, `str(error)[:200]` as on `main`.
+- `urllib.error.HTTPError`: `HTTP Error <code>`; the server's reason phrase is
+  dropped, which is a change from `main` (`HTTP Error 401: Unauthorized`).
+- A `URLError` around an `OSError`, or a bare `OSError`: `[Errno N] strerror`,
+  in `<urlopen error ...>` when wrapped; an `OSError` with no errno only when
+  its text is one the standard library writes word for word (`timed out`,
+  `Remote end closed connection without response`). Byte-identical with `main`
+  for connection refused, DNS failure, connect and read timeouts, reset and
+  unreachable network, measured by running both CLIs.
+- `ssl.SSLError`: its reason code, and for a certificate its verify message,
+  which may name the host (the host can carry no credential: userinfo and
+  non-numeric ports are refused first). `main`'s `(_ssl.c:NNNN)` suffix is not
+  repeated.
+- Anything else - `InvalidURL`, other `http.client` errors, a `URLError` with a
+  text reason, any other `ValueError` - `the request to the RPC URL failed
+  (<class>)`.
+
+Also: a padded `RPC_URL` argument is stripped as SKILL.md already said (a blank
+one is still refused, not defaulted); a port above 65535 is refused up front
+with the port detail, now *"the RPC URL's port must be a number from 0 to
+65535"*; `ValueError` stays in the handler so `NotANodeReply` keeps its text.
+
+Out of scope and documented in the README: a node given a key in its URL can
+repeat it in its reply, and the CLI prints the reply's `got` on a mismatch and
+the reply's keys in a `NotANodeReply` detail, as `main` does.
+
+Re-run of the reviewers' probes on the new code: the 11,025-URL random fuzz
+(three seeds), the echoing-server fuzz (72 runs), the TLS-through-proxy probe,
+the sub-segment 401 probe and the re-entry probes - no secret printed by the transport
+error path (HTTP status, OS, TLS, `InvalidURL`); it appears only where the probe's node
+puts it in its reply (a mismatch's `got`, the keys of a `NotANodeReply`), as on
+`main`; a class-built rerun of the 31 ordinary messages hides none of
+them, and differs from `main` only by the dropped reason phrase (11) and SSL
+suffix (2).
+
+Suite: **510 passed** (472 before this round).
 
 ## A separate finding of this run, on its own branch (#27)
 

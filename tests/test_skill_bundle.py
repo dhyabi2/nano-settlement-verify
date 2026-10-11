@@ -825,45 +825,8 @@ def _verify_cli_module():
     return verify_cli
 
 
-def _hidden(class_name):
-    return (
-        "the request to the RPC URL failed (%s); its text would repeat part of"
-        " the URL, so it is not shown" % class_name
-    )
-
-
-def test_an_error_that_repeats_the_decoded_userinfo_is_not_shown():
-    """The general rule, apart from the %40 refusal: decoded pieces count too."""
-    import http.client
-
-    cli = _verify_cli_module()
-    error = http.client.InvalidURL("nonnumeric port: 'hunter2@127.0.0.1'")
-    assert cli._error_detail(error, "http://zqop:hunter2%40127.0.0.1/") == _hidden("InvalidURL")
-    error = OSError("could not reach /zq dir")
-    assert cli._error_detail(error, "http://127.0.0.1:1/zq%20dir") == _hidden("OSError")
-
-
-def test_an_error_that_repeats_a_query_value_of_four_characters_is_not_shown():
-    """A query value of four characters or more counts as a piece of the URL."""
-    cli = _verify_cli_module()
-    error = OSError("refused for Q7zx")
-    assert cli._error_detail(error, "http://127.0.0.1:1/?k=Q7zx") == _hidden("OSError")
-
-
-def test_a_query_value_shorter_than_four_characters_does_not_hide_an_error():
-    """`?page=1` must not hide "[Errno 111]": a 1-3 character value is no secret.
-
-    Matched at any length, a value like `1`, `e` or `v1` hid about a third of
-    ordinary errors - connection refused, DNS failures, HTTP 500 - for URLs
-    nobody would call secret.
-    """
-    cli = _verify_cli_module()
-    for value in ("1", "e", "v1", "100"):
-        for text in ("<urlopen error [Errno 111] Connection refused>",
-                     "HTTP Error 500: Internal Server Error",
-                     "<urlopen error [Errno -2] Name or service not known>"):
-            url = "https://node.example/rpc?x=" + value
-            assert cli._error_detail(OSError(text), url) == text, (value, text)
+def _class_only(class_name):
+    return "the request to the RPC URL failed (%s)" % class_name
 
 
 @pytest.mark.parametrize("url", [
@@ -875,13 +838,13 @@ def test_a_query_with_a_control_character_is_not_echoed(url):
     """urllib's InvalidURL quotes the path and query back, control character and all."""
     for done in _both_ways(url):
         assert "SECRETZQ" not in done.stdout + done.stderr
-        _assert_unreachable(done, _hidden("InvalidURL"))
+        _assert_unreachable(done, _class_only("InvalidURL"))
 
 
 # post_json replaced by one that raises what sys.argv[1] names, so the CLI's
 # own handling of each failure is seen without a socket.
 _RAISING_DRIVER = """
-import sys
+import http.client, socket, ssl, sys, urllib.error
 sys.path.insert(0, ".")
 import nano_settlement_verify
 def _raise(rpc_url, payload):
@@ -903,15 +866,24 @@ def _run_raising(expression, *extra_argv):
     )
 
 
-def test_an_ordinary_error_longer_than_200_characters_is_cut_at_200():
-    """main's `str(error)[:200]` is kept for an error that quotes no part of the URL."""
-    done = _run_raising("OSError('z' * 300)", "http://127.0.0.1:7076/rpc")
+def test_the_librarys_own_reply_text_longer_than_200_characters_is_cut_at_200():
+    """NotANodeReply keeps main's `str(error)[:200]`: the library builds it from the reply."""
+    done = _run_raising("nano_settlement_verify.NotANodeReply('z' * 300)", "http://127.0.0.1:7076/rpc")
     _assert_unreachable(done, "z" * 200)
 
 
-def test_a_driven_error_that_repeats_the_path_is_not_shown():
+def test_an_os_error_is_shown_by_errno_and_strerror_only():
+    """A filename, or any text OSError carries besides its errno and strerror, is dropped."""
+    done = _run_raising("FileNotFoundError(2, 'No such file or directory', '/zqrpc/v2')",
+                        "http://127.0.0.1:7076/zqrpc/v2")
+    _assert_unreachable(done, "[Errno 2] No such file or directory")
+    assert "zqrpc" not in done.stdout + done.stderr
+
+
+def test_an_os_error_without_an_errno_is_named_by_its_class():
     done = _run_raising("OSError('cannot open /zqrpc/v2')", "http://127.0.0.1:7076/zqrpc/v2")
-    _assert_unreachable(done, _hidden("OSError"))
+    _assert_unreachable(done, _class_only("OSError"))
+    assert "zqrpc" not in done.stdout + done.stderr
 
 
 def test_a_memory_error_is_unreachable_with_a_fixed_detail():
@@ -1000,7 +972,7 @@ QUOTE_URLS = [
 def test_an_invalid_url_with_both_quote_kinds_is_not_echoed(url):
     for done in _both_ways(url):
         assert "SECRET" not in done.stdout + done.stderr, done.stdout + done.stderr
-        _assert_unreachable(done, _hidden("InvalidURL"))
+        _assert_unreachable(done, _class_only("InvalidURL"))
 
 
 def test_invalid_url_text_is_never_shown_even_when_it_names_no_piece():
@@ -1009,12 +981,12 @@ def test_invalid_url_text_is_never_shown_even_when_it_names_no_piece():
 
     cli = _verify_cli_module()
     error = http.client.InvalidURL("anything at all")
-    assert cli._error_detail(error, "http://127.0.0.1:1/") == _hidden("InvalidURL")
+    assert cli._error_detail(error) == _class_only("InvalidURL")
 
 
 @pytest.mark.parametrize("url", QUOTE_URLS)
 def test_an_other_error_quoting_the_selector_with_escaped_quotes_is_not_shown(url):
-    """Piece matching undoes repr's `\\'` and `\\"` on both sides before comparing."""
+    """An OSError with no errno is named by its class, whatever spelling it quotes."""
     import urllib.parse
 
     parts = urllib.parse.urlsplit(url)
@@ -1022,14 +994,14 @@ def test_an_other_error_quoting_the_selector_with_escaped_quotes_is_not_shown(ur
     text = "could not send %r" % selector
     done = _run_raising("OSError(%r)" % text, url)
     assert "SECRET" not in done.stdout + done.stderr, done.stdout + done.stderr
-    _assert_unreachable(done, _hidden("OSError"))
+    _assert_unreachable(done, _class_only("OSError"))
     cli = _verify_cli_module()
     for spelling in (text, text.replace("\\'", "'"), "could not send \"%s\"" % selector):
-        assert cli._error_detail(OSError(spelling), url) == _hidden("OSError"), spelling
+        assert cli._error_detail(OSError(spelling)) == _class_only("OSError"), spelling
 
 
 # Each URL below leaked its secret under a mutation of the piece matching that
-# the suite let survive. Each is run for real, and with post_json raising an
+# an earlier round of this branch used, and stays as a regression case. Each is run for real, and with post_json raising an
 # OSError that repeats the secret the way urllib would, as the argument and as
 # NANO_RPC_URL; the secret must reach neither stdout nor stderr.
 PINNED = {
@@ -1190,41 +1162,148 @@ def test_a_reply_that_is_not_an_object_is_a_value_error_to_library_users():
     assert issubclass(cli._NotAnObject, ValueError)
 
 
-# Each case below kills a mutation of the piece matching that the cases above
-# let survive: (url, error text, hidden?).
-PIECE_CASES = {
-    # repr escapes `'` only when the string also holds `"`: the text's `\\'`
-    # matches the path's plain `'` only once undone on the text side
-    "text escapes a quote the piece does not": (
-        "http://127.0.0.1:1/my'SECRETKEY x", "bad %r" % "/my'SECRETKEY x\"", True),
-    # control characters escaped but quotes not: only the piece's repr with
-    # its `\\'` undone matches
-    "piece escapes a quote the text does not": (
-        "http://127.0.0.1:1/a'SECRETKEY\x01\"b",
-        "bad " + "/a'SECRETKEY\x01\"b".encode("unicode_escape").decode("ascii"), True),
-    # a JSON-quoted path escapes `"` as `\\"`
-    "text escapes a double quote": (
-        "http://127.0.0.1:1/a\"SECRETKEY", "bad " + json.dumps('/a"SECRETKEY'), True),
-    "fragment": ("http://127.0.0.1:1/#SECRETFRAG", "bad SECRETFRAG", True),
-    "query of short fields": ("http://127.0.0.1:1/?ab&cd", "bad ab&cd", True),
-    "query field without a value": ("http://127.0.0.1:1/?SECRETKEY&b", "bad SECRETKEY", True),
-    "userinfo": ("http://zqop:hunter2@127.0.0.1/", "login zqop:hunter2 failed", True),
-    "percent-encoding as written": ("http://127.0.0.1:1/zq%4Bkey", "cannot open /zq%4Bkey", True),
-    # a numeric port is not a secret, nor is an IPv6 host's last group
-    "numeric port": ("http://127.0.0.1:7076/", "connect to 127.0.0.1:7076 refused", False),
-    "IPv6 host without a port": ("http://[2001:db8::cafe]/", "cannot reach [2001:db8::cafe]", False),
-    # three characters is under the minimum, even when the text repeats them
-    "three-character query value": (
-        "http://127.0.0.1:1/?x=111", "<urlopen error [Errno 111] Connection refused>", False),
+# --------------------------------------------------------------------------
+# Review round seven. The detail of a failed request is decided by the error's
+# class, never by matching pieces of the URL against its text: that matching
+# leaked a key the node echoed in one sub-segment (`/rpc;key=KEY`,
+# `/rpc/KEY.json`), and hid ordinary text that shared a word with the URL
+# (`/api/node` hid the library's "not a node's block_info reply"). Each row:
+# the expression raised, and the detail printed for it.
+
+def _http_error(code, phrase):
+    return "urllib.error.HTTPError('http://h/', %d, %r, {}, None)" % (code, phrase)
+
+
+def _cert_error(message):
+    return (
+        "(lambda e: (setattr(e, 'reason', 'CERTIFICATE_VERIFY_FAILED'),"
+        " setattr(e, 'verify_message', %r), e)[-1])"
+        "(ssl.SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate"
+        " verify failed: ' + %r + ' (_ssl.c:1006)'))" % (message, message)
+    )
+
+
+MAPPING = {
+    # main's exact text
+    "connection refused": (
+        "urllib.error.URLError(ConnectionRefusedError(111, 'Connection refused'))",
+        "<urlopen error [Errno 111] Connection refused>"),
+    "DNS failure": (
+        "urllib.error.URLError(socket.gaierror(-2, 'Name or service not known'))",
+        "<urlopen error [Errno -2] Name or service not known>"),
+    "connect timeout": (
+        "urllib.error.URLError(TimeoutError('timed out'))", "<urlopen error timed out>"),
+    "read timeout": ("TimeoutError('timed out')", "timed out"),
+    "TLS read timeout": (
+        "TimeoutError('The read operation timed out')", "The read operation timed out"),
+    "reset": ("ConnectionResetError(104, 'Connection reset by peer')",
+              "[Errno 104] Connection reset by peer"),
+    "closed without a response": (
+        "http.client.RemoteDisconnected('Remote end closed connection without response')",
+        "Remote end closed connection without response"),
+    "not JSON": ("__import__('json').JSONDecodeError('Expecting value', 'zqKEYzq', 0)",
+                 "Expecting value: line 1 column 1 (char 0)"),
+    "not UTF-8": ("UnicodeDecodeError('utf-8', b'\\xff', 0, 1, 'invalid start byte')",
+                  "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+    "not a node reply": ("nano_settlement_verify.NotANodeReply('keys present: [\\'status\\']')",
+                         "keys present: ['status']"),
+    # the server's reason phrase is dropped
+    "HTTP 500": (_http_error(500, "Internal Server Error"), "HTTP Error 500"),
+    "HTTP 401 echoing a key": (_http_error(401, "bad key SECRETKEY"), "HTTP Error 401"),
+    # SSL: reason code and certificate message only
+    "certificate hostname mismatch": (
+        "urllib.error.URLError(%s)" % _cert_error(
+            "Hostname mismatch, certificate is not valid for 'proxy.example'."),
+        "<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:"
+        " Hostname mismatch, certificate is not valid for 'proxy.example'.>"),
+    "other SSL error": (
+        "(lambda e: (setattr(e, 'reason', 'WRONG_VERSION_NUMBER'), e)[-1])"
+        "(ssl.SSLError(1, '[SSL: WRONG_VERSION_NUMBER] SECRETKEY'))",
+        "[SSL: WRONG_VERSION_NUMBER]"),
+    # the class only
+    "InvalidURL": ("http.client.InvalidURL('nonnumeric port: SECRETKEY')", _class_only("InvalidURL")),
+    "other HTTPException": ("http.client.BadStatusLine('HTTP/1.0 abc /SECRETKEY')",
+                            _class_only("BadStatusLine")),
+    "URLError with a text reason": ("urllib.error.URLError('unknown url type: SECRETKEY')",
+                                    _class_only("URLError")),
+    "URLError around an OSError with no errno": (
+        "urllib.error.URLError(OSError('/SECRETKEY'))", _class_only("URLError")),
+    "other ValueError": ("ValueError(\"invalid literal for int(): 'SECRETKEY'\")",
+                         _class_only("ValueError")),
+    "UnicodeEncodeError": ("UnicodeEncodeError('ascii', '/SECRETKEY\\xe9', 10, 11, 'ordinal')",
+                           _class_only("UnicodeEncodeError")),
+    "OSError with errno but no strerror": ("OSError(5)", _class_only("OSError")),
 }
 
 
-@pytest.mark.parametrize("case", sorted(PIECE_CASES))
-def test_the_piece_matching_hides_exactly_what_it_should(case):
-    url, text, hidden = PIECE_CASES[case]
+@pytest.mark.parametrize("case", sorted(MAPPING))
+def test_each_failure_class_prints_its_own_detail(case):
+    expression, detail = MAPPING[case]
+    done = _run_raising(expression, "http://127.0.0.1:7076/rpc?key=SECRETKEY")
+    _assert_unreachable(done, detail)
+    assert "CRETKEY" not in done.stdout + done.stderr
+
+
+def test_main_and_this_cli_print_the_same_text_for_ordinary_failures():
+    """Computed the way main computes it: `str(error)[:200]` of the same error."""
     cli = _verify_cli_module()
-    expected = _hidden("OSError") if hidden else text
-    assert cli._error_detail(OSError(text), url) == expected
+    for case in ("connection refused", "DNS failure", "connect timeout", "read timeout",
+                 "TLS read timeout", "reset", "closed without a response", "not JSON",
+                 "not UTF-8", "not a node reply"):
+        expression, _ = MAPPING[case]
+        error = eval(expression, {
+            "urllib": __import__("urllib.error"), "socket": socket, "http": __import__("http.client"),
+            "nano_settlement_verify": cli._library,
+        })
+        assert cli._error_detail(error) == str(error)[:200], case
+
+
+def test_the_detail_does_not_depend_on_the_url():
+    """No piece of the URL is consulted, so `/api/node` hides nothing."""
+    import inspect
+
+    cli = _verify_cli_module()
+    assert list(inspect.signature(cli._error_detail).parameters) == ["error"]
+    assert not hasattr(cli, "_url_pieces")
+
+
+def test_a_non_node_reply_at_a_path_named_node_shows_mains_text():
+    """`/api/node` used to hide the library's NotANodeReply text, which says "node's"."""
+    reply = {"message": "rate limited, slow down"}
+    with _loopback(_http_reply(reply)) as server:
+        url = "http://127.0.0.1:%d/api/node" % server.port
+        sys.path.insert(0, str(SKILL))
+        try:
+            import nano_settlement_verify as vendored
+
+            try:
+                vendored.verify(HASH, int(ONE_XNO_RAW), ACCOUNT, url)
+            except vendored.NotANodeReply as error:
+                expected = str(error)[:200]
+            else:
+                raise AssertionError("a rate-limit envelope verified")
+        finally:
+            sys.path.remove(str(SKILL))
+        assert "node's" in expected
+        for done in _both_ways(url):
+            _assert_unreachable(done, expected)
+
+
+def test_a_certificate_mismatch_at_a_proxy_path_shows_the_reason():
+    """`/proxy` used to hide an SSL hostname mismatch, because the message said "proxy"."""
+    expression, detail = MAPPING["certificate hostname mismatch"]
+    _assert_unreachable(_run_raising(expression, "https://proxy.example/proxy"), detail)
+
+
+def test_a_padded_rpc_url_argument_is_stripped():
+    """SKILL.md says whitespace around the URL is ignored: the argument too."""
+    assert _asked_endpoint({}, "  http://127.0.0.1:7076/x \n") == "http://127.0.0.1:7076/x"
+
+
+def test_a_blank_rpc_url_argument_is_refused_not_replaced():
+    assert _asked_endpoint({"NANO_RPC_URL": CHOSEN}, "   ") == "<nothing>"
+    for done in [_run_cli({}, " \t "), _run_cli({"NANO_RPC_URL": CHOSEN}, "  ")]:
+        _assert_refused(done, SCHEME_DETAIL, ["127.0.0.1:7076/chosen-by-the-operator"])
 
 
 # --------------------------------------------------------------------------
@@ -1234,7 +1313,7 @@ def test_the_piece_matching_hides_exactly_what_it_should(case):
 # hostname-mismatch error named it. A port that is not a number is refused up
 # front, before any request, so none of these needs a network.
 
-PORT_DETAIL = "the RPC URL's port must be a number"
+PORT_DETAIL = "the RPC URL's port must be a number from 0 to 65535"
 
 BAD_PORT_URLS = {
     "two colons, https": "https://localhost:SECRETKEY:443/",
@@ -1244,6 +1323,8 @@ BAD_PORT_URLS = {
     "IPv6 host, word as port": "http://[::1]:SECRETKEY/",
     "IPv6 host, two ports": "http://[::1]:1:SECRETKEY/",
     "fullwidth digits": "http://127.0.0.1:７０７６/SECRETKEY",
+    "above 65535": "http://127.0.0.1:65536/SECRETKEY",
+    "far above 65535": "http://127.0.0.1:99999999999999999999/SECRETKEY",
 }
 
 
@@ -1257,33 +1338,37 @@ def test_a_port_that_is_not_a_number_is_refused_before_any_request(case):
 @pytest.mark.parametrize("url", [
     "http://127.0.0.1:7076/", "http://127.0.0.1/", "http://127.0.0.1:/",
     "https://[::1]:7076/", "https://[::1]/", "https://node.example:443/rpc?k=a:b",
+    "http://127.0.0.1:65535/", "http://127.0.0.1:0/", "http://127.0.0.1:080/",
 ])
 def test_a_numeric_or_absent_port_passes_the_url_check(url):
     assert _verify_cli_module()._refuse_rpc_url(url) is None
 
 
-# A node may echo one segment of the path in its reason phrase rather than the
-# whole path ("HTTP Error 401: bad key SECRETKEY" for `/rpc/SECRETKEY`), raw or
-# after decoding it. Each segment, split at `/` and `;`, is a piece of its own.
+# A node may echo the whole path, one segment of it, or one value in it in its
+# reason phrase ("HTTP Error 401: bad key SECRETKEY" for `/rpc/SECRETKEY`), raw
+# or decoded. The reason phrase is never printed, so none of them reaches stdout.
 
 import http.server
 import urllib.parse
 
 
-def _last_segment(path, decode):
-    path = path.split("?", 1)[0]
-    if decode:
-        path = urllib.parse.unquote(path)
-    return path.replace(";", "/").rstrip("/").split("/")[-1]
+def _echoed(path, how):
+    if how == "whole":
+        return path
+    if how == "decoded":
+        return urllib.parse.unquote(path)
+    # the last value or segment, as a server might name "the key"
+    value = urllib.parse.unquote(path).replace("?", "=").replace(";", "=").split("=")[-1]
+    return value.split("/")[-1].split(".")[0]
 
 
 @contextlib.contextmanager
-def _segment_echoing_node(decode):
+def _echoing_node(how):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
         def do_POST(self):
-            self.send_response(401, "bad key " + _last_segment(self.path, decode))
+            self.send_response(401, "bad key " + _echoed(self.path, how))
             self.send_header("Content-Length", "0")
             self.end_headers()
 
@@ -1301,24 +1386,28 @@ def _segment_echoing_node(decode):
         thread.join(5)
 
 
-SEGMENT_PATHS = ["/rpc/SECRETKEY", "/x;SECRETKEY", "/a%2FSECRETKEY", "/S%45CRETKEY"]
+ECHO_PATHS = [
+    "/rpc/SECRETKEY", "/x;SECRETKEY", "/a%2FSECRETKEY", "/S%45CRETKEY",
+    "/rpc;key=SECRETKEY", "/rpc/key=SECRETKEY", "/rpc/SECRETKEY.json",
+    "/rpc?a=1;key=SECRETKEY", "/?key=SECRETKEY",
+]
 
 
-@pytest.mark.parametrize("decode", [False, True], ids=["raw", "decoded"])
-@pytest.mark.parametrize("path", SEGMENT_PATHS)
-def test_a_reason_phrase_echoing_one_path_segment_is_not_shown(path, decode):
-    with _segment_echoing_node(decode) as port:
+@pytest.mark.parametrize("how", ["whole", "decoded", "value"])
+@pytest.mark.parametrize("path", ECHO_PATHS)
+def test_a_reason_phrase_echoing_the_url_is_not_shown(path, how):
+    with _echoing_node(how) as port:
         for done in _both_ways("http://127.0.0.1:%d%s" % (port, path)):
             output = done.stdout + done.stderr
             assert "CRETKEY" not in output, output
-            _assert_unreachable(done, _hidden("HTTPError"))
+            _assert_unreachable(done, "HTTP Error 401")
 
 
-def test_a_reason_phrase_echoing_a_short_segment_is_still_shown():
-    """A segment under four characters is no secret: `/v1/rpc` keeps the text."""
-    with _segment_echoing_node(False) as port:
+def test_a_reason_phrase_is_dropped_even_when_it_holds_no_secret():
+    """The rule is by class: the status code is shown, the server's phrase never."""
+    with _echoing_node("value") as port:
         done = _run_cli({}, "http://127.0.0.1:%d/v1/rpc" % port)
-        _assert_unreachable(done, "HTTP Error 401: bad key rpc")
+        _assert_unreachable(done, "HTTP Error 401")
 
 
 # A post_json that calls main again on the same thread blocked forever on the

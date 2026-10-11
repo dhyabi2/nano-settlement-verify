@@ -6,8 +6,10 @@ WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusiv
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
 as %40; credentials are never sent, and %40 or %3A in the host part counts as one) and a
-port, if any, must be a number; any other URL is refused (4), a configuration error that
-retrying will not fix.
+port, if any, must be a number from 0 to 65535; any other URL is refused (4), a configuration
+error that retrying will not fix. A failure to reach the node prints only text that cannot
+hold the URL: "HTTP Error <code>" without the server's reason phrase, "[Errno N] strerror",
+an SSL reason, the library's own text about the reply, or else the error's class.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -17,8 +19,10 @@ if seconds matter.
 import http.client
 import json
 import os
+import ssl
 import sys
 import threading
+import urllib.error
 import urllib.parse
 
 import nano_settlement_verify as _library
@@ -57,7 +61,7 @@ AT_SIGN_REFUSED = (
 )
 SCHEME_REFUSED = "the RPC URL must be http or https"
 UNPARSEABLE_REFUSED = "the RPC URL could not be parsed"
-PORT_REFUSED = "the RPC URL's port must be a number"
+PORT_REFUSED = "the RPC URL's port must be a number from 0 to 65535"
 # A reply that is JSON but not an object (`[]`, `"x"`, `null`, `1`) makes the
 # library raise TypeError, and one nested deeper than the parser's recursion
 # limit RecursionError. Neither is a verdict about the money: nothing was
@@ -135,86 +139,110 @@ def _verify_objects_only(**arguments):
                 _library.post_json = asked
 
 
-# Pieces shorter than this are not treated as secrets: a 1-3 character piece
-# (`1` in `?page=1`, `rpc` in a path) turns up in ordinary error text by
-# chance - "[Errno 111]" - and hiding those errors hides why the node was not
-# reached. Four characters is the shortest piece the check looks for.
-_SHORTEST_PIECE = 4
+# What a failed request prints. Every text below is built from parts of the
+# error that cannot hold the URL - an errno and the OS's strerror, an HTTP status
+# code, an SSL reason code and certificate message, or text the library builds
+# from the node's reply - and never from the error's own message where that
+# message could quote the URL back. urllib echoes the URL, a path segment or a
+# query value in some messages, and a node may echo it in an HTTP reason phrase
+# ("HTTP Error 401: bad key SECRETKEY"); matching the URL's pieces against those
+# messages leaked a key whenever a piece was split differently than the check
+# expected, and hid ordinary errors whenever a word of the URL turned up in them.
+# So the class of the error decides what is shown, and the URL is not consulted.
+
+# OSError texts with no errno that the standard library writes itself, word for
+# word: socket and ssl timeouts, and http.client's closed-connection message.
+_FIXED_OS_TEXTS = frozenset({
+    "timed out",
+    "The read operation timed out",
+    "The write operation timed out",
+    "The handshake operation timed out",
+    "Remote end closed connection without response",
+})
 
 
-def _unescape_quotes(text):
-    """text with repr's `\\'` and `\\"` written as plain quotes.
+def _class_only(error):
+    """The fixed detail for a failure whose text could carry the URL."""
+    return "the request to the RPC URL failed (%s)" % type(error).__name__
 
-    repr picks its quote by what the string holds, so the same piece is
-    spelled `my'KEY` inside one repr and `my\\'KEY` inside another that also
-    holds a `"`. Both sides are compared in this form.
+
+def _ssl_text(error):
+    """`[SSL: REASON] ...` from the SSL reason code and certificate message only.
+
+    The certificate message may name the host asked for ("certificate is not
+    valid for 'node.example'"); the host carries no credential, because a URL
+    with userinfo or a non-numeric port is refused before anything is sent.
     """
-    return text.replace("\\'", "'").replace('\\"', '"')
+    reason = getattr(error, "reason", None)
+    if not isinstance(reason, str) or not reason:
+        return "[SSL] %s" % type(error).__name__
+    if isinstance(error, ssl.SSLCertVerificationError):
+        message = getattr(error, "verify_message", None)
+        if isinstance(message, str) and message:
+            return "[SSL: %s] certificate verify failed: %s" % (reason, message)
+        return "[SSL: %s] certificate verify failed" % reason
+    return "[SSL: %s]" % reason
 
 
-def _url_pieces(url):
-    """The parts of url an error message must not repeat: raw, decoded, escaped.
+def _os_text(error):
+    """`[Errno N] strerror` for an OSError, or None when it has no OS text.
 
-    The userinfo, a non-numeric port, the path, the query, the fragment, and
-    every query field and value - each at least _SHORTEST_PIECE characters
-    long, as written, percent-decoded (with and without `+` as a space), and
-    as repr and ascii escape them, each also with repr's escaped quotes undone.
+    A filename, which OSError's own text appends, is left out. An OSError with
+    no errno is shown only when its text is one the standard library writes
+    word for word (`timed out`).
     """
-    try:
-        parts = urllib.parse.urlsplit(url)
-    except ValueError:
-        parts = None
-    netloc = parts.netloc if parts else ""
-    userinfo, _, hostport = netloc.rpartition("@")
-    port = hostport.rpartition("]")[2].partition(":")[2]
-    pieces = [userinfo, port if not port.isdigit() else ""]
-    if parts:
-        pieces += [parts.path, parts.query, parts.fragment]
-        # A node may echo one segment of the path rather than all of it
-        # ("HTTP Error 401: bad key SECRETKEY" for `/rpc/SECRETKEY`), and may
-        # split before or after decoding it, so each segment counts on its
-        # own: split on `/` and `;` as written, and again once decoded.
-        for path in (parts.path, urllib.parse.unquote(parts.path)):
-            pieces += path.replace(";", "/").split("/")
-        for field in parts.query.split("&"):
-            pieces += [field, field.partition("=")[2]]
-    found = set()
-    for piece in pieces:
-        for form in (piece, urllib.parse.unquote(piece), urllib.parse.unquote_plus(piece)):
-            for spelling in (form, repr(form)[1:-1], ascii(form)[1:-1]):
-                for written in (spelling, _unescape_quotes(spelling)):
-                    if len(written) >= _SHORTEST_PIECE:
-                        found.add(written)
-    return found
+    if isinstance(error, ssl.SSLError):
+        return _ssl_text(error)
+    errno, strerror = error.errno, error.strerror
+    if isinstance(errno, int) and isinstance(strerror, str):
+        return "[Errno %d] %s" % (errno, strerror)
+    if errno is None and len(error.args) == 1 and error.args[0] in _FIXED_OS_TEXTS:
+        return error.args[0]
+    return None
 
 
-def _hidden_detail(error):
-    return (
-        "the request to the RPC URL failed (%s); its text would repeat part of"
-        " the URL, so it is not shown" % type(error).__name__
-    )
+def _error_detail(error):
+    """The detail printed for a failure to reach or read the node.
 
+    Main printed `str(error)[:200]` for every one; that text is kept, cut at 200,
+    where it is built from something other than the URL:
 
-def _error_detail(error, url):
-    """main's `str(error)[:200]`, unless that text could repeat a piece of url.
+    - NotANodeReply, json.JSONDecodeError and UnicodeDecodeError: the library's
+      own text about the node's reply, or the JSON parser's about its bytes.
+    - urllib.error.HTTPError: `HTTP Error <code>`; the reason phrase is the
+      server's own text, which can repeat the URL, so it is dropped.
+    - urllib.error.URLError around an OSError, and a bare OSError (a timeout, a
+      reset connection, a DNS failure): `[Errno N] strerror`, inside
+      `<urlopen error ...>` when urllib wrapped it - main's exact text for
+      connection refused, a DNS failure and a timeout.
+    - ssl.SSLError: its reason code, and for a certificate its verify message.
 
-    http.client.InvalidURL is never shown: its message is the URL or its
-    selector, quoted with repr - whose quote style and escapes depend on what
-    the URL holds - so no matching can prove a secret absent from it. Any
-    other error is named by its class alone when its text, as written or with
-    repr's escaped quotes undone, contains a piece of the URL in any spelling
-    _url_pieces lists: urllib quotes the URL back in some errors,
-    percent-decoded or with control characters escaped, and a key in a query
-    or a password that dodged the '@' check would land in stdout and the logs
-    that keep it.
+    Anything else - http.client.InvalidURL, which quotes the URL, any other
+    http.client.HTTPException, a URLError whose reason is not an OSError, any
+    other ValueError - is named by its class only.
     """
-    if isinstance(error, http.client.InvalidURL):
-        return _hidden_detail(error)
-    text = str(error)
-    texts = (text, _unescape_quotes(text))
-    if any(piece in written for piece in _url_pieces(url) for written in texts):
-        return _hidden_detail(error)
-    return text[:200]
+    if isinstance(error, _library.NotANodeReply):
+        return str(error)[:200]
+    if isinstance(error, json.JSONDecodeError):
+        return ("%s: line %d column %d (char %d)"
+                % (error.msg, error.lineno, error.colno, error.pos))[:200]
+    if isinstance(error, UnicodeDecodeError):
+        return str(error)[:200]
+    if isinstance(error, urllib.error.HTTPError):
+        if isinstance(error.code, int):
+            return "HTTP Error %d" % error.code
+        return _class_only(error)
+    if isinstance(error, urllib.error.URLError):
+        if isinstance(error.reason, OSError):
+            text = _os_text(error.reason)
+            if text is not None:
+                return ("<urlopen error %s>" % text)[:200]
+        return _class_only(error)
+    if isinstance(error, OSError):
+        text = _os_text(error)
+        if text is not None:
+            return text[:200]
+    return _class_only(error)
 
 
 def _refuse_rpc_url(url):
@@ -249,7 +277,7 @@ _DIGITS = frozenset("0123456789")
 
 
 def _refuse_port(netloc):
-    """PORT_REFUSED unless netloc's port, if any, is ASCII digits; else None.
+    """PORT_REFUSED unless netloc's port, if any, is ASCII digits up to 65535.
 
     The check above parses the port after the FIRST colon and http.client
     after the LAST, so `localhost:SECRETKEY:443` is host `localhost:SECRETKEY`
@@ -273,6 +301,10 @@ def _refuse_port(netloc):
             return PORT_REFUSED
         port = netloc.partition(":")[2]
     if not set(port) <= _DIGITS:
+        return PORT_REFUSED
+    # urllib refuses a port above 65535 with a ValueError of its own; refused
+    # here, it gets the same fixed detail as any other port that cannot work.
+    if port and int(port) > 65535:
         return PORT_REFUSED
     return None
 
@@ -317,7 +349,10 @@ def main(argv):
     # RPC_URL argument is the narrower instruction and still wins; an unset or
     # empty or blank variable leaves the default exactly as it was, and
     # surrounding whitespace (a padded `export`) is not part of the URL.
-    rpc_url = argv[4] if len(argv) == 5 else _rpc_url_from_env()
+    # The argument is stripped like the variable, so `"http://127.0.0.1:7076 "`
+    # is asked as written without the space; a blank argument stays blank and
+    # is refused below, never replaced by the variable or the default.
+    rpc_url = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
     refused = _refuse_rpc_url(rpc_url)
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
@@ -349,11 +384,14 @@ def main(argv):
         print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}))
         return 4
     except (OSError, ValueError, http.client.HTTPException) as error:
+        # ValueError stays here: the library's NotANodeReply is one, and its
+        # text - built from the node's reply - is printed as main printed it.
         # http.client.HTTPException covers InvalidURL, which urllib raises for
         # a URL it cannot even connect to; it is neither an OSError nor a
         # ValueError and used to escape as a traceback with exit 1. A URL the
         # node cannot be reached at is still "nothing was checked".
-        print(json.dumps({"verdict": "node_unreachable", "detail": _error_detail(error, rpc_url)}))
+        # _error_detail decides the text by the error's class alone.
+        print(json.dumps({"verdict": "node_unreachable", "detail": _error_detail(error)}))
         return 4
     except OverflowError:
         print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}))
