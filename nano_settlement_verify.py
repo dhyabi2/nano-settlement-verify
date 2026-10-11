@@ -400,6 +400,29 @@ def verify(
             f"a string deadline, in unix seconds or ISO-8601 with a UTC offset"
         )
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
+    # A node's block_info answer is a JSON object. Anything else is not an answer
+    # about this block, and it must not become one: the test below is `in`, which
+    # on a string is a substring test and on a list a membership test, so a
+    # proxy answering `"error"`, `"no error here"` or `["error"]` came out as
+    # NotFound -- "no such block", the one verdict a seller refuses a call on --
+    # from a reply that says nothing about the payment. A number or an object-less
+    # array instead reached `reply["confirmed"]` and raised TypeError, which is
+    # neither OSError nor ValueError and so escaped the `except (OSError,
+    # ValueError)` arm README.md's "Use it" example tells a seller to write. Both are the distinction #23 drew for an unreadable reply:
+    # "we could not look" is NotANodeReply and holds; only a readable answer may
+    # be a verdict. The skill bundle's CLI has no check of its own: through it
+    # this turns exit 3 (no_such_block) into exit 4 (node_unreachable), and a
+    # bare number, which used to crash it with a traceback, into exit 4 too. The
+    # same refusal reaches every caller that imports verify, which is what
+    # README.md documents first, and nano_quorum, where such an endpoint now
+    # counts as failed, not as answered. (nano_claim does not call verify; its
+    # own _call already refuses a reply that is not a dict.)
+    if not isinstance(reply, dict):
+        raise NotANodeReply(
+            "the endpoint's reply is %s, not a JSON object, so it is not a node's "
+            "block_info reply and says nothing about this block"
+            % type(reply).__name__
+        )
     if "error" in reply:
         raise NotFound(block_hash)
     if _required(reply, "confirmed") != "true":

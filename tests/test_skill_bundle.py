@@ -10,6 +10,7 @@ These tests drive the vendored files as the skill ships them.
 """
 
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -112,6 +113,49 @@ def test_the_skill_cli_answers_node_unreachable_the_way_skill_md_promises():
         % (done.returncode, done.stderr)
     )
     assert '"node_unreachable"' in done.stdout, done.stdout or done.stderr
+
+
+# The same stub, answering with JSON that is not an object. verify_cli.py has
+# no type check of its own: before the library refused these, `"error"` exited
+# 3 (no_such_block) - a verdict about the money from a reply that says nothing
+# about it - and a bare number crashed the CLI with a TypeError traceback.
+_NON_OBJECT_DRIVER = """
+import json
+import sys
+sys.path.insert(0, ".")
+import nano_settlement_verify
+_reply = json.loads(sys.argv[1])
+nano_settlement_verify.post_json = lambda rpc_url, payload: _reply
+import verify_cli
+sys.exit(verify_cli.main(["verify_cli.py", %r, %r, %r]))
+""" % (HASH, ONE_XNO_RAW, ACCOUNT)
+
+
+def _run_with_reply(reply_json):
+    return subprocess.run(
+        [sys.executable, "-c", _NON_OBJECT_DRIVER, reply_json],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_node_unreachable(done):
+    assert done.returncode == 4, (
+        "expected exit 4 (node_unreachable), got %d; stdout: %s stderr:\n%s"
+        % (done.returncode, done.stdout, done.stderr)
+    )
+    assert json.loads(done.stdout)["verdict"] == "node_unreachable", done.stdout
+
+
+def test_a_string_reply_through_the_cli_is_node_unreachable_not_no_such_block():
+    """A proxy answering `"error"` used to exit 3: do not serve, from no answer."""
+    _assert_node_unreachable(_run_with_reply('"error"'))
+
+
+def test_a_bare_number_reply_through_the_cli_is_node_unreachable_not_a_traceback():
+    """A proxy answering `42` used to crash the CLI with a TypeError."""
+    _assert_node_unreachable(_run_with_reply("42"))
 
 
 # The same defect as the test above, one line earlier in `main`. `EXPECT_RAW`
