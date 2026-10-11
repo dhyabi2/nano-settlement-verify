@@ -252,6 +252,33 @@ library is untouched, root and vendored copies still byte-identical.
 
 Suite: **449 passed** (416 before this round).
 
+## A separate finding of this run, on its own branch (#27)
+
+Checking one claim of the round above — that the "not a JSON object" refusal is a
+`ValueError` so a library caller's handler catches it — showed that the refusal
+exists only in the skill bundle's CLI (`verify_cli.py::_objects_only`, added
+deliberately "without changing the library"). The library, which `README.md`
+documents first and which `nano_quorum` and `nano_claim` call internally, still
+read a non-object reply through `"error" in reply` — a substring test on a
+string, a membership test on a list. Measured on `main`:
+
+| reply | raises | in README's `except (OSError, ValueError)` |
+| --- | --- | --- |
+| `"error"`, `"no error here"`, `["error"]` | `NotFound` — *do not serve* | no |
+| `[1,2,3]`, `7`, `1.5`, `None` | `TypeError` | no |
+
+The first row is a verdict about the money from a reply that says nothing about
+it: a seller whose buyer really paid refuses the call. The second escapes the arm
+`README.md:78` tells a seller to write.
+
+Fixed in **#27**, off `main`, as its own concern: `verify` raises
+`NotANodeReply` for a reply that is not a dict, before the `in` test. 14 tests
+fail on `main` and pass there; 2 controls hold either way. 350 → 366.
+
+The lesson for a later run: a guard at one layer can hide a defect at the layer
+the README actually documents. The CLI's own tests passed either way, which is
+why nothing here caught it.
+
 ## Still open — the owner's one sentence, not a blocker
 
 The repository spells the variable two ways: SKILL.md declares `NANO_RPC_URL`,
