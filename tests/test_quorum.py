@@ -253,6 +253,20 @@ def test_json_that_is_not_a_node_reply_counts_as_silence(monkeypatch):
     assert "NotANodeReply" in caught.value.failures[A]
 
 
+def test_a_reply_that_is_not_a_json_object_counts_as_failed_not_answered(monkeypatch):
+    """A proxy answering `"error"` is silence, not a node saying "not seen".
+
+    It used to reach `verify` as NotFound and count as an answer, so with A
+    confirming the pair came back as an unsettled Corroboration. Now `verify`
+    raises NotANodeReply, B is a failed endpoint, and one witness is short.
+    """
+    nodes(monkeypatch, {A: send_block(), B: "error"})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], agree=2)
+    assert caught.value.answered == 1
+    assert list(caught.value.failures) == [B]
+    assert "NotANodeReply" in caught.value.failures[B]
+
 def test_a_dead_endpoint_does_not_stop_two_live_ones_agreeing(monkeypatch):
     nodes(monkeypatch, {A: OSError("refused"), B: send_block(), C: send_block()})
     out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])

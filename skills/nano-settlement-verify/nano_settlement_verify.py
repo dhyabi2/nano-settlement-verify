@@ -410,10 +410,12 @@ def verify(
     # neither OSError nor ValueError and so escaped the arm README.md:78 tells a
     # seller to write. Both are the distinction #23 drew for an unreadable reply:
     # "we could not look" is NotANodeReply and holds; only a readable answer may
-    # be a verdict. The skill bundle's CLI already refuses a non-object reply
-    # before the library sees it; this is the same refusal for every caller that
-    # imports verify, which is what README.md documents first and what
-    # nano_quorum and nano_claim use.
+    # be a verdict. The skill bundle's CLI has no check of its own: through it
+    # this turns exit 3 (no_such_block) into exit 4 (node_unreachable), and a
+    # bare number, which used to crash it with a traceback, into exit 4 too. The
+    # same refusal reaches every caller that imports verify, which is what
+    # README.md documents first and what nano_quorum and nano_claim use; in a
+    # quorum such an endpoint now counts as failed, not as answered.
     if not isinstance(reply, dict):
         raise NotANodeReply(
             "the endpoint's reply is %s, not a JSON object, so it is not a node's "
