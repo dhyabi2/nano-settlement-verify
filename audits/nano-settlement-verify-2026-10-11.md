@@ -343,6 +343,65 @@ suffix (2).
 
 Suite: **510 passed** (472 before this round).
 
+## Eighth review round: the decoded host, proxy tunnels and the missing host
+
+- **The host, percent-decoded (LOW).** urllib unquotes the host before it
+  connects, and through an HTTPS proxy a TLS hostname mismatch names the decoded
+  host: `https://localhost%2FSECRETKEY/` printed *"not valid for
+  'localhost/SECRETKEY'"*, and `%3F`, `%23`, `%20`, `%25`, `%3B` the same way; on
+  3.12 a `%C2%AD` (soft hyphen) vanished in IDNA mapping. `_ssl_text`'s docstring
+  claimed the host could carry nothing. Now the host is refused before anything
+  is sent unless it is plain ASCII letters, digits, `-`, `.` and `_`, or an IP
+  address (*"the RPC URL's host must be ASCII letters, digits, '-', '.' and '_',
+  or an IP address"*). The only `%` allowed in the host is a bracketed IPv6 zone
+  id written `%25name` (`[fe80::1%25eth0]`), whose name may hold no further `%`.
+  Unicode (IDNA) hosts are refused rather than mapped, a deliberate change from
+  `main` (which tried them): the mapping is where a decoded delimiter or a
+  vanishing character hides. Write the name in its `xn--` form. `_` is allowed
+  because container names use it and it decodes to nothing. The host as written
+  is still named in a certificate error (`SECRETKEY.localhost` is printed as
+  such): a host is not a credential.
+- **Proxy tunnel failures (LOW).** http.client raises
+  `OSError("Tunnel connection failed: 407 Proxy Authentication Required")` with
+  no errno, which the last round printed as the class only. Now
+  `<urlopen error Tunnel connection failed: 407>`: the three-digit status,
+  matched whole by a strict pattern, and none of the proxy's own text. Tested
+  against a loopback `CONNECT` proxy answering 407 and 403.
+- **No host (LOW).** `http:///x`, `http://:7076/` and `http:x` are refused up
+  front with *"the RPC URL has no host"*, in place of the class-only text that
+  replaced `main`'s `<urlopen error no host given>`.
+- **TypeError from the transport (INFO).** A NUL in a tunnelled host made
+  http.client raise `TypeError` on 3.12, which was reported as a reply problem.
+  A control character (C0, DEL or C1) anywhere in the URL is now refused before
+  the request (*"the RPC URL contains a control character"*), and a `TypeError`
+  from `post_json` itself - which only sends and parses JSON text - becomes
+  *"the request to the RPC URL failed (TypeError)"* (an `OSError` to library
+  callers). A `TypeError` from reading the reply keeps its own detail.
+- **3.12's timeouts (INFO).** *"_ssl.c:993: The handshake operation timed out"*
+  did not match the fixed-text list. The ssl timeouts are now matched whole by
+  a pattern that allows that prefix and nothing else, and the text is printed
+  as `main` printed it. `error.args[0] in _FIXED_OS_TEXTS` raised `TypeError`
+  for an unhashable argument (`OSError(['x'])`), out of the except arm, as a
+  traceback; the argument must now be a string first.
+- **Pinned.** An uppercase `HTTP://` or `Http://` reaches a loopback node, as
+  the argument and as the variable. A long `<urlopen error ...>` or
+  `[Errno N] strerror` is cut at 200.
+
+Two existing tests changed expectation: a URL with `\x01` or `\x7f` in its
+path or query was `InvalidURL` by class, and is now the control-character
+refusal.
+
+Probes rerun on 3.11, 3.12 and 3.13: the decoded-host probe (13 URLs) prints no
+secret except the two whose host is literally `SECRETKEY.localhost` or
+`xn--secretkey-`, which are named as written; the TLS-through-proxy probe is
+unchanged; the users' network probe now shows `Tunnel connection failed: 407` and
+`403` without the reason phrase, and refuses the unicode host; the random URL
+fuzz (11,025 URLs, three seeds) flags nothing; the echoing-server fuzz (72
+runs) prints no secret. 39 of the new or changed tests fail on the code before
+this round.
+
+Suite: **576 passed** (529 before this round).
+
 ## A separate finding of this run, on its own branch (#27)
 
 Checking one claim of the round above — that the "not a JSON object" refusal is a

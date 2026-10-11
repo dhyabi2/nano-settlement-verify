@@ -873,16 +873,17 @@ def _class_only(class_name):
     return "the request to the RPC URL failed (%s)" % class_name
 
 
-@pytest.mark.parametrize("url", [
-    "http://127.0.0.1:1/?key=SECRETZQ KEY",
-    "http://127.0.0.1:1/?key=SECRETZQ\x7f",
-    "http://127.0.0.1:1/?key=SECRETZQ\x01",
+@pytest.mark.parametrize("url, detail", [
+    ("http://127.0.0.1:1/?key=SECRETZQ KEY", _class_only("InvalidURL")),
+    # Since round eight a control character is refused before the request.
+    ("http://127.0.0.1:1/?key=SECRETZQ\x7f", "the RPC URL contains a control character"),
+    ("http://127.0.0.1:1/?key=SECRETZQ\x01", "the RPC URL contains a control character"),
 ])
-def test_a_query_with_a_control_character_is_not_echoed(url):
+def test_a_query_with_a_control_character_is_not_echoed(url, detail):
     """urllib's InvalidURL quotes the path and query back, control character and all."""
     for done in _both_ways(url):
         assert "SECRETZQ" not in done.stdout + done.stderr
-        _assert_unreachable(done, _class_only("InvalidURL"))
+        _assert_unreachable(done, detail)
 
 
 # post_json replaced by one that raises what sys.argv[1] names, so the CLI's
@@ -1012,11 +1013,18 @@ QUOTE_URLS = [
 ]
 
 
+def _or_control_refusal(url, detail):
+    """Since round eight a URL with a control character is refused before any request."""
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in url):
+        return "the RPC URL contains a control character"
+    return detail
+
+
 @pytest.mark.parametrize("url", QUOTE_URLS)
 def test_an_invalid_url_with_both_quote_kinds_is_not_echoed(url):
     for done in _both_ways(url):
         assert "SECRET" not in done.stdout + done.stderr, done.stdout + done.stderr
-        _assert_unreachable(done, _class_only("InvalidURL"))
+        _assert_unreachable(done, _or_control_refusal(url, _class_only("InvalidURL")))
 
 
 def test_invalid_url_text_is_never_shown_even_when_it_names_no_piece():
@@ -1038,7 +1046,7 @@ def test_an_other_error_quoting_the_selector_with_escaped_quotes_is_not_shown(ur
     text = "could not send %r" % selector
     done = _run_raising("OSError(%r)" % text, url)
     assert "SECRET" not in done.stdout + done.stderr, done.stdout + done.stderr
-    _assert_unreachable(done, _class_only("OSError"))
+    _assert_unreachable(done, _or_control_refusal(url, _class_only("OSError")))
     cli = _verify_cli_module()
     for spelling in (text, text.replace("\\'", "'"), "could not send \"%s\"" % selector):
         assert cli._error_detail(OSError(spelling)) == _class_only("OSError"), spelling
@@ -1492,3 +1500,186 @@ def test_a_post_json_that_calls_main_again_does_not_deadlock():
     assert done.stdout.strip() == (
         "[('inner', 3), ('outer', 3), ('restored', True), ('restored_to_outer', True)]"
     ), done.stdout + done.stderr
+
+
+# --------------------------------------------------------------------------
+# Review round eight. urllib percent-decodes the host before it connects, and
+# through an HTTPS proxy a TLS hostname mismatch names the decoded host:
+# `https://localhost%2FSECRETKEY/` printed "not valid for 'localhost/SECRETKEY'",
+# and %3F, %23, %20, %25, %3B the same way (on 3.12 a `%C2%AD` simply vanished
+# in IDNA mapping). A host is now plain ASCII letters, digits, '-', '.' and '_',
+# or an IP address, checked before anything is sent.
+
+HOST_DETAIL = "the RPC URL's host must be ASCII letters, digits, '-', '.' and '_', or an IP address"
+NO_HOST_DETAIL = "the RPC URL has no host"
+CONTROL_DETAIL = "the RPC URL contains a control character"
+REQUEST_TYPE_ERROR = "the request to the RPC URL failed (TypeError)"
+
+PERCENT_HOST_URLS = {
+    "%2F": "https://localhost%2FSECRETKEY/",
+    "%3F": "https://localhost%3FSECRETKEY/",
+    "%23": "https://localhost%23SECRETKEY/",
+    "%20": "https://localhost%20SECRETKEY/",
+    "%25": "https://localhost%25SECRETKEY/",
+    "%3B": "https://localhost%3BSECRETKEY/",
+    "%C2%AD soft hyphen": "https://localhost%C2%ADSECRETKEY/",
+    "%00": "https://localhost%00SECRETKEY/",
+    "%2F with a port": "http://localhost%2FSECRETKEY:7076/",
+    "lowercase %2f": "https://localhost%2fSECRETKEY/",
+    "unicode host": "https://n\u00e4n\u00f6SECRETKEY.invalid/",
+    "fullwidth at sign decoded": "https://localhost%EF%BC%A0SECRETKEY/",
+    "zone id that decodes a slash": "http://[fe80::1%25lo%2FSECRETKEY]:1/",
+    "IPvFuture": "http://[v1.SECRETKEY]/",
+}
+
+
+@pytest.mark.parametrize("case", sorted(PERCENT_HOST_URLS))
+def test_a_host_that_urllib_would_decode_is_refused_before_any_request(case):
+    url = PERCENT_HOST_URLS[case]
+    for done in _both_ways(url):
+        assert "SECRETKEY" not in (done.stdout + done.stderr).upper()
+        assert done.returncode == 4, done.stdout + done.stderr
+        assert json.loads(done.stdout)["detail"] in (HOST_DETAIL, UNPARSEABLE_DETAIL)
+        if case not in ("zone id that decodes a slash",):
+            _assert_refused(done, HOST_DETAIL, ["SECRETKEY"])
+
+
+def test_a_percent_in_the_host_is_never_asked():
+    assert _asked_endpoint({"NANO_RPC_URL": "https://localhost%2FSECRETKEY/"}) == "<nothing>"
+    assert _asked_endpoint({}, "https://localhost%2FSECRETKEY/") == "<nothing>"
+
+
+@pytest.mark.parametrize("url", [
+    "http://nano_node:7076/", "https://xn--nn-viaa.example/", "http://NODE.Example:7076/",
+    "http://[fe80::1%25lo]:7076/", "http://[::ffff:127.0.0.1]:7076/", "http://10.0.0.1/",
+])
+def test_a_plain_host_passes_the_url_check(url):
+    assert _verify_cli_module()._refuse_rpc_url(url) is None
+    assert _asked_endpoint({}, url) == url
+
+
+@pytest.mark.parametrize("url", ["http:///x", "https:///", "http://:7076/", "http:x"])
+def test_a_url_without_a_host_is_refused_with_a_readable_detail(url):
+    """urllib said `<urlopen error no host given>`; the class-only text said less."""
+    for done in _both_ways(url):
+        _assert_refused(done, NO_HOST_DETAIL, [])
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost\x01SECRETKEY/", "http://127.0.0.1:7076/\x7fSECRETKEY",
+    "http://127.0.0.1:7076/?k=\x85SECRETKEY", "http://127.0.0.1:7076/\x1bSECRETKEY",
+])
+def test_a_control_character_anywhere_is_refused_before_any_request(url):
+    for done in _both_ways(url):
+        _assert_refused(done, CONTROL_DETAIL, ["SECRETKEY"])
+
+
+def test_a_nul_in_the_host_is_refused_in_process():
+    """A NUL cannot travel in argv or the environment, but main can be called with one."""
+    cli = _verify_cli_module()
+    url = "https://localhost\x00SECRETKEY/"
+    assert cli._refuse_rpc_url(url) == CONTROL_DETAIL
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.main(["verify_cli.py", HASH, ONE_XNO_RAW, ACCOUNT, url])
+    assert code == 4
+    assert json.loads(out.getvalue()) == {"verdict": "node_unreachable", "detail": CONTROL_DETAIL}
+
+
+def test_a_type_error_from_the_transport_is_not_called_a_reply_problem():
+    """http.client's TypeError for a NUL in a tunnelled host came out as "the node's reply..."."""
+    done = _run_raising("TypeError('argument must be encoded string without null bytes SECRETKEY')",
+                        "http://127.0.0.1:7076/")
+    _assert_unreachable(done, REQUEST_TYPE_ERROR)
+    assert "SECRETKEY" not in done.stdout + done.stderr
+
+
+def test_a_request_type_error_is_an_os_error_to_library_users():
+    cli = _verify_cli_module()
+    library = cli._library
+    original = library.post_json
+
+    def _raise(rpc_url, payload):
+        raise TypeError("transport")
+
+    library.post_json = _raise
+    try:
+        with pytest.raises(OSError):
+            cli._verify_objects_only(block_hash=HASH, expect_raw=int(ONE_XNO_RAW),
+                                     account=ACCOUNT, rpc_url="http://127.0.0.1:7076/",
+                                     not_after=None)
+    finally:
+        library.post_json = original
+
+
+ROUND_EIGHT_MAPPING = {
+    "3.12 handshake timeout, wrapped": (
+        "urllib.error.URLError(TimeoutError('_ssl.c:993: The handshake operation timed out'))",
+        "<urlopen error _ssl.c:993: The handshake operation timed out>"),
+    "3.12 read timeout": (
+        "TimeoutError('_ssl.c:1003: The read operation timed out')",
+        "_ssl.c:1003: The read operation timed out"),
+    "handshake timeout without prefix": (
+        "TimeoutError('The handshake operation timed out')", "The handshake operation timed out"),
+    "a timeout text with more after it": (
+        "TimeoutError('The read operation timed out SECRETKEY')", _class_only("TimeoutError")),
+    "unhashable argument": ("OSError(['SECRETKEY'])", _class_only("OSError")),
+    "unhashable argument, wrapped": ("urllib.error.URLError(OSError({'SECRETKEY': 1}))",
+                                     _class_only("URLError")),
+    "tunnel 407": (
+        "urllib.error.URLError(OSError('Tunnel connection failed: 407 Proxy Authentication"
+        " Required SECRETKEY'))", "<urlopen error Tunnel connection failed: 407>"),
+    "tunnel 403 bare": ("OSError('Tunnel connection failed: 403 Forbidden SECRETKEY')",
+                        "Tunnel connection failed: 403"),
+    "tunnel with a long code": (
+        "OSError('Tunnel connection failed: 4031 SECRETKEY')", _class_only("OSError")),
+    "tunnel with text glued to the code": (
+        "OSError('Tunnel connection failed: 407SECRETKEY')", _class_only("OSError")),
+    "long strerror, wrapped": (
+        "urllib.error.URLError(ConnectionRefusedError(111, 'x' * 300))",
+        ("<urlopen error [Errno 111] " + "x" * 300 + ">")[:200]),
+    "long strerror": ("ConnectionResetError(104, 'y' * 300)", ("[Errno 104] " + "y" * 300)[:200]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ROUND_EIGHT_MAPPING))
+def test_round_eight_failure_texts(case):
+    expression, detail = ROUND_EIGHT_MAPPING[case]
+    done = _run_raising(expression, "http://127.0.0.1:7076/rpc")
+    _assert_unreachable(done, detail)
+    assert "SECRETKEY" not in done.stdout + done.stderr
+
+
+def _through_proxy(proxy_port, url):
+    env = {name: value for name, value in _clean_environ().items()
+           if name.lower() not in ("http_proxy", "https_proxy", "no_proxy", "all_proxy")}
+    proxy = "http://127.0.0.1:%d" % proxy_port
+    env.update(HTTPS_PROXY=proxy, https_proxy=proxy)
+    return [subprocess.run(
+        [sys.executable, "verify_cli.py", HASH, ONE_XNO_RAW, ACCOUNT, *argv],
+        cwd=SKILL, capture_output=True, text=True, env=dict(env, **extra), timeout=60,
+    ) for argv, extra in (([url], {}), ([], {"NANO_RPC_URL": url}))]
+
+
+@pytest.mark.parametrize("status", [
+    "407 Proxy Authentication Required SECRETKEY", "403 Forbidden by policy SECRETKEY",
+])
+def test_a_proxy_refusing_the_tunnel_shows_only_its_status(status):
+    """The proxy's own reason phrase is dropped; main printed it, the last round printed nothing."""
+    code = status.split()[0]
+    response = ("HTTP/1.1 %s\r\nContent-Length: 0\r\n\r\n" % status).encode("ascii")
+    with _loopback(response) as proxy:
+        for done in _through_proxy(proxy.port, "https://node.example/rpc"):
+            _assert_unreachable(done, "<urlopen error Tunnel connection failed: %s>" % code)
+            assert "SECRETKEY" not in done.stdout + done.stderr
+        assert proxy.paths == ["node.example:443"] * 2
+
+
+def test_an_uppercase_scheme_reaches_a_loopback_node_both_ways():
+    with _loopback(_http_reply(_settled_reply())) as server:
+        for scheme in ("HTTP", "Http"):
+            url = "%s://127.0.0.1:%d/rpc" % (scheme, server.port)
+            for done in _both_ways(url):
+                assert done.returncode == 0, done.stdout + done.stderr
+                assert json.loads(done.stdout)["settled"] is True
+        assert server.paths == ["/rpc"] * 4
