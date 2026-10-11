@@ -44,8 +44,11 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   of the URL. Credentials are never sent: put a node's key somewhere other than the URL's
   userinfo. An `@` that belongs in a path or query is written `%40`
   (`http://host/?key=a%40b`), and is sent as written; a `%40` or `%3A` in the host part
-  (`http://user:pw%40host/`) is a credential and is refused the same way. A failure whose
-  text would repeat part of the URL is reported by its error class only.
+  (`http://user:pw%40host/`) is a credential and is refused the same way. An
+  `InvalidURL` error (a space or control character in the URL, a non-numeric port) is
+  reported by its error class only - its text quotes the URL, so it is never shown - and
+  so is any other failure whose text would repeat a piece of the URL four characters or
+  longer.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 

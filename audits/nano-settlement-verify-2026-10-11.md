@@ -208,6 +208,50 @@ the library's `_required` could refuse non-strings; that is a separate change.
 
 Suite: **416 passed** (391 before this round).
 
+## Fifth review round: quote styles, short query values and the post_json swap
+
+Review found these; all fixed in `verify_cli.py`, the tests and the docs. The
+library is untouched, root and vendored copies still byte-identical.
+
+1. **`InvalidURL` leaked through repr's quote style.** Its message is *"URL
+   can't contain control characters. %r"* of the selector, and repr escapes a
+   `'` only when the string also holds a `"`. So `http://127.0.0.1:1/"?my'SECRETKEY x`
+   printed `/"?my\'SECRETKEY x`, a spelling no piece of the URL matched, and the
+   key reached stdout (also `/"?token'SECRETKEY\x01`, `/my'SECRETKEY x?"`,
+   `/SECRETKEY'x y?"=` and `/p'SECRETKEY\x01?"`). Now the text of any
+   `http.client.InvalidURL` is never shown: it is always named by its class
+   only. For every other error the piece matching compares the error text and
+   each piece both as written and with `\'` and `\"` undone, so a quote-style
+   mismatch cannot hide a piece. Tested through the CLI for those five URLs, as
+   the argument and as `NANO_RPC_URL`.
+2. **Mutations that leaked are pinned.** The query dropped from the pieces
+   (`?SECRETKEY\x01`), `unquote` against `unquote_plus` (`:SEC+RET%4B`), repr
+   against ascii (`/SECRETé\x01`), `>=` against `>` at four characters
+   (`:SECR`), the port after an IPv6 host (`[::1]:SECRETKEY`) and an uppercase
+   `%3A` in the netloc: each is a test that the secret reaches neither stdout
+   nor stderr, run for real and with an `OSError` that repeats the secret the
+   way urllib would. A table of further cases (fragment, a query field with no
+   value, userinfo, raw percent-encoding, and a numeric port, an IPv6 host and a
+   three-character value that must *not* hide an error) pins the rest; every
+   remaining mutation of the matching is killed by the bundle's tests.
+3. **Short query values hid ordinary errors.** Matching every query value at any
+   length meant `?page=1` hid *"[Errno 111] Connection refused"*, and a reviewer
+   measured about a third of ordinary errors hidden for one-to-three character
+   values. Query values now use the same four-character minimum as every other
+   piece; `?page=1` with connection refused shows main's exact text (tested).
+4. **The `post_json` swap was not thread-safe.** `verify` takes no function to
+   call instead of `post_json`, so the swap stays, but under a module-level
+   lock held for the whole `verify` call, and the original is put back only if
+   the global is still the CLI's wrapper. Tested with two overlapping callers
+   (the library is left as it was found, and the second gets its own correct
+   verdict) and with a `post_json` replaced during the call (it stays).
+   `_NotAnObject` is now a `ValueError`, so the README's `(OSError, ValueError)`
+   handler catches it.
+5. **Docs.** README and SKILL.md say `InvalidURL` text is never shown and that a
+   piece under four characters hides nothing.
+
+Suite: **449 passed** (416 before this round).
+
 ## Still open — the owner's one sentence, not a blocker
 
 The repository spells the variable two ways: SKILL.md declares `NANO_RPC_URL`,

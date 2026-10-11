@@ -17,6 +17,7 @@ import http.client
 import json
 import os
 import sys
+import threading
 import urllib.parse
 
 import nano_settlement_verify as _library
@@ -76,8 +77,13 @@ def _reply_not_checked(error):
     return "the node's reply could not be checked (%s)" % type(error).__name__
 
 
-class _NotAnObject(Exception):
-    """The node answered with JSON that is not an object."""
+class _NotAnObject(ValueError):
+    """The node answered with JSON that is not an object.
+
+    A ValueError, so a library user who calls verify while the CLI's check is
+    in place still catches it with the `(OSError, ValueError)` handler the
+    README tells a seller to wrap verify in.
+    """
 
 
 def _objects_only(post_json):
@@ -97,11 +103,53 @@ def _objects_only(post_json):
     return ask
 
 
+# verify() looks post_json up in the library's module globals and takes no
+# function to call instead, so the object check can only be put in place by
+# swapping that global. The swap is held under this lock for the whole verify
+# call, so two callers of main in one process never interleave a swap and a
+# restore, and the second sees the library as the first found it.
+_SWAP_LOCK = threading.Lock()
+
+
+def _verify_objects_only(**arguments):
+    """verify(**arguments) with post_json refusing a reply that is not an object."""
+    with _SWAP_LOCK:
+        asked = _library.post_json
+        checked = _objects_only(asked)
+        _library.post_json = checked
+        try:
+            return verify(**arguments)
+        finally:
+            # Restore only what we put there: if something else replaced the
+            # global meanwhile, theirs stays.
+            if _library.post_json is checked:
+                _library.post_json = asked
+
+
+# Pieces shorter than this are not treated as secrets: a 1-3 character piece
+# (`1` in `?page=1`, `rpc` in a path) turns up in ordinary error text by
+# chance - "[Errno 111]" - and hiding those errors hides why the node was not
+# reached. Four characters is the shortest piece the check looks for.
+_SHORTEST_PIECE = 4
+
+
+def _unescape_quotes(text):
+    """text with repr's `\\'` and `\\"` written as plain quotes.
+
+    repr picks its quote by what the string holds, so the same piece is
+    spelled `my'KEY` inside one repr and `my\\'KEY` inside another that also
+    holds a `"`. Both sides are compared in this form.
+    """
+    return text.replace("\\'", "'").replace('\\"', '"')
+
+
 def _url_pieces(url):
     """The parts of url an error message must not repeat: raw, decoded, escaped.
 
-    The userinfo, path, query, fragment and a non-numeric port, each at least
-    four characters long, and every query value whatever its length.
+    The userinfo, a non-numeric port, the path, the query, the fragment, and
+    every query field and value - each at least _SHORTEST_PIECE characters
+    long, as written, percent-decoded (with and without `+` as a space), and
+    as repr and ascii escape them, each also with repr's escaped quotes undone.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -110,35 +158,47 @@ def _url_pieces(url):
     netloc = parts.netloc if parts else ""
     userinfo, _, hostport = netloc.rpartition("@")
     port = hostport.rpartition("]")[2].partition(":")[2]
-    long_pieces = [userinfo, port if not port.isdigit() else ""]
-    values = []
+    pieces = [userinfo, port if not port.isdigit() else ""]
     if parts:
-        long_pieces += [parts.path, parts.query, parts.fragment]
+        pieces += [parts.path, parts.query, parts.fragment]
         for field in parts.query.split("&"):
-            values.append(field.partition("=")[2])
+            pieces += [field, field.partition("=")[2]]
     found = set()
-    for piece, shortest in [(p, 4) for p in long_pieces] + [(v, 1) for v in values]:
+    for piece in pieces:
         for form in (piece, urllib.parse.unquote(piece), urllib.parse.unquote_plus(piece)):
             for spelling in (form, repr(form)[1:-1], ascii(form)[1:-1]):
-                if len(spelling) >= shortest:
-                    found.add(spelling)
+                for written in (spelling, _unescape_quotes(spelling)):
+                    if len(written) >= _SHORTEST_PIECE:
+                        found.add(written)
     return found
 
 
-def _error_detail(error, url):
-    """main's `str(error)[:200]`, unless that text repeats a piece of url.
+def _hidden_detail(error):
+    return (
+        "the request to the RPC URL failed (%s); its text would repeat part of"
+        " the URL, so it is not shown" % type(error).__name__
+    )
 
-    urllib quotes the URL back in some of its errors - percent-decoded, or with
-    control characters escaped - so a key in a query or a password that dodged
-    the '@' check (`hunter2%40host`) would land in stdout and the logs that keep
-    it. Such an error is named by its class alone.
+
+def _error_detail(error, url):
+    """main's `str(error)[:200]`, unless that text could repeat a piece of url.
+
+    http.client.InvalidURL is never shown: its message is the URL or its
+    selector, quoted with repr - whose quote style and escapes depend on what
+    the URL holds - so no matching can prove a secret absent from it. Any
+    other error is named by its class alone when its text, as written or with
+    repr's escaped quotes undone, contains a piece of the URL in any spelling
+    _url_pieces lists: urllib quotes the URL back in some errors,
+    percent-decoded or with control characters escaped, and a key in a query
+    or a password that dodged the '@' check would land in stdout and the logs
+    that keep it.
     """
+    if isinstance(error, http.client.InvalidURL):
+        return _hidden_detail(error)
     text = str(error)
-    if any(piece in text for piece in _url_pieces(url)):
-        return (
-            "the request to the RPC URL failed (%s); its text would repeat part of"
-            " the URL, so it is not shown" % type(error).__name__
-        )
+    texts = (text, _unescape_quotes(text))
+    if any(piece in written for piece in _url_pieces(url) for written in texts):
+        return _hidden_detail(error)
     return text[:200]
 
 
@@ -215,11 +275,9 @@ def main(argv):
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
         return 4
-    asked = _library.post_json
-    _library.post_json = _objects_only(asked)
     try:
-        receipt = verify(block_hash=block_hash, expect_raw=expect_raw, account=account,
-                         rpc_url=rpc_url, not_after=not_after)
+        receipt = _verify_objects_only(block_hash=block_hash, expect_raw=expect_raw,
+                                       account=account, rpc_url=rpc_url, not_after=not_after)
     except Late as error:
         print(json.dumps({"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
                           "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}))
@@ -262,8 +320,6 @@ def main(argv):
         # table has no row for. The detail names the class only.
         print(json.dumps({"verdict": "node_unreachable", "detail": _reply_not_checked(error)}))
         return 4
-    finally:
-        _library.post_json = asked
     print(receipt.to_json())
     return 0 if receipt.settled else 2
 
