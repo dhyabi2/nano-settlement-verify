@@ -106,8 +106,13 @@ exception, so the transport failure reaches you as itself:
 | an HTTP error status — 403, 429, 500 | `urllib.error.HTTPError` (also an `OSError`) |
 | a body that is not JSON — an HTML error or maintenance page | `json.JSONDecodeError` (a `ValueError`) |
 | a body that **is** JSON but is not a node reply — a proxy's status page, a rate-limit envelope | `NotANodeReply` (also a `ValueError`) |
+| a body that is JSON but not an object — `"error"`, `["error"]`, a bare number | `NotANodeReply` too: hold and retry. It used to come out as `NotFound`, or a `TypeError` |
 
-The last row is the one worth knowing about, because a public RPC behind a proxy
+A replacement `post_json`, such as a test stub, must return a plain `dict`: a mapping that
+is not one, such as `UserDict` or `MappingProxyType`, is refused as `NotANodeReply`. Real
+nodes are unaffected, because `json.loads` returns a `dict`.
+
+The proxy's status page and rate-limit envelope row is the one worth knowing about, because a public RPC behind a proxy
 answers 200 with its own JSON at least as often as it answers with HTML, and
 none of those bodies carries `confirmed`. It used to raise a bare `KeyError`,
 which is neither an `OSError` nor a `ValueError`, so it went straight through
@@ -212,7 +217,10 @@ The rules it holds to, each of which is a way of failing closed:
 - **Silence is never a "no".** An endpoint that is refused, times out, or serves an HTML
   maintenance page has told you nothing. Fewer than `agree` endpoints answering raises
   `NotCorroborated`, which means *hold the call*, not *refuse the buyer*. Refusing a call
-  that was paid for costs the sale, and XNO does not come back.
+  that was paid for costs the sale, and XNO does not come back. An endpoint whose reply
+  is not a JSON object (a proxy's `"error"`, a bare number) is silence too: it counts as
+  failed, not as answered. It used to count as a "not seen" answer, so a quorum that
+  returned an unsettled `Corroboration` can now raise `NotCorroborated` instead.
 - **It does not retry.** A failed endpoint is skipped, not asked again. Waiting is yours
   to decide, as it is for `verify`.
 - **It never sends.** `process` is deliberately absent; this reads, like the rest of the
@@ -284,7 +292,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-350 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+369 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
+number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
+object reply and a real `error` answer as controls, and the same reply as exit 4 through the
+CLI and a failed endpoint in a quorum; the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
 codes `verify_cli.py` actually returns are the same set in all three directions;

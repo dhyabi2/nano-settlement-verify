@@ -51,7 +51,7 @@ One JSON object on stdout, and an exit code:
 | 0 | `{"settled": true, ...}` - confirmed send of exactly that amount to that account | serve the call |
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
 | 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
-| 4 | `{"verdict": "node_unreachable"}` - nothing was checked | retry or try another RPC; do NOT treat this as a bad payment |
+| 4 | `{"verdict": "node_unreachable"}` - nothing was checked, including a reply that is not a JSON object (a proxy's `"error"`, a bare number) | retry or try another RPC; do NOT treat this as a bad payment |
 | 5 | `{"verdict": "late", "seen_at": ..., "not_after": ...}` - right amount and account, seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
 | 6 | `{"verdict": "unknown_time", "seen_at": null, ...}` - settled, but the node reports no time for it | do not treat as on time; ask another node |
 | 64 | usage error, or `{"verdict": "invalid_not_after"}` | fix the command |

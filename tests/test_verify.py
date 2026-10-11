@@ -788,3 +788,71 @@ def test_a_send_that_really_paid_someone_else_is_still_a_mismatch(node):
         verify(HASH, SEND_RAW, SELLER, URL)
 
     assert caught.value.got == "nano_3someoneelse"
+
+
+# --------------------------------------------------------------------------
+# A reply that is not a JSON object at all.
+#
+# `post_json` is `json.loads`, so a reply can be any JSON type. A node's
+# block_info answer is always an object; a proxy in front of one answers
+# whatever it likes. The library's first test of the reply is `"error" in
+# reply`, which on a string is a SUBSTRING test and on a list a MEMBERSHIP
+# test, so three shapes of non-answer came out as NotFound - "no such block",
+# the one verdict README.md tells a seller to refuse the call on - about a
+# payment the reply says nothing about. Everything else reached
+# `reply["confirmed"]` and raised TypeError, which is neither OSError nor
+# ValueError and so escaped the arm README.md:78 tells a seller to write,
+# dropping a call the buyer had already paid for.
+#
+# This is the distinction #23 drew one field further in: a reply nobody could
+# read is NotANodeReply and holds; only a readable answer may be a verdict.
+# The skill bundle's CLI already refuses a non-object reply before the library
+# sees it, so the CLI's own tests pass either way - these pin it for every
+# caller that imports `verify`, which is what README.md documents first and
+# what `nano_quorum` and `nano_claim` call internally.
+
+
+@pytest.mark.parametrize("reply", ["error", "no error here", ["error"], [1, 2, 3], 7, 1.5, True, None])
+def test_a_reply_that_is_not_an_object_is_never_a_verdict_about_the_money(node, reply):
+    """Not NotFound, not Mismatch: nothing was read, so nothing is claimed."""
+    node(reply)
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+    assert not isinstance(caught.value, (NotFound, Mismatch))
+
+
+@pytest.mark.parametrize("reply", ["error", ["error"], [1, 2, 3], 7, None])
+def test_a_reply_that_is_not_an_object_lands_in_the_sellers_own_handler(node, reply):
+    """README.md:78 wraps verify in `except (OSError, ValueError)`; this is in it."""
+    node(reply)
+
+    with pytest.raises(ValueError):
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+
+def test_the_refusal_names_what_came_back_instead(node):
+    """A seller reading the message must be able to tell a proxy from a node."""
+    node(["error"])
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+    assert "list" in str(caught.value)
+    assert "not a JSON object" in str(caught.value)
+
+
+def test_an_object_reply_is_untouched_by_the_guard(node):
+    """The control: a real answer still settles exactly as it did before."""
+    node(block_info(amount=str(10**24)))
+
+    receipt = verify(HASH, 10**24, ACCOUNT, URL)
+    assert receipt.settled is True
+    assert receipt.amount_raw == 10**24
+
+
+def test_an_object_carrying_error_is_still_no_such_block(node):
+    """The other control: a real node error answer is still NotFound, as before."""
+    node({"error": "Block not found"})
+
+    with pytest.raises(NotFound):
+        verify(HASH, 10**24, ACCOUNT, URL)
