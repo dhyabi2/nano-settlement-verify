@@ -3,6 +3,7 @@
 
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
+RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -10,6 +11,7 @@ The time is the node's own local_timestamp, not signed by the sender: read it on
 if seconds matter.
 """
 import json
+import os
 import sys
 
 from nano_settlement_verify import (
@@ -58,7 +60,18 @@ def main(argv):
         # documented table has no row for.
         print(json.dumps({"verdict": "invalid_amount", "expect_raw": argv[2][:80]}))
         return 3
-    rpc_url = argv[4] if len(argv) == 5 else "https://rpc.nano.to"
+    # The node asked is the whole evidence that money arrived, so the operator
+    # has to be able to choose it. SKILL.md's frontmatter declares NANO_RPC_URL
+    # for exactly that ("Nano node RPC to ask. Defaults to https://rpc.nano.to")
+    # and nothing read it, so every verification went to rpc.nano.to whatever
+    # the operator exported - including the sellers who set it BECAUSE that
+    # endpoint wants a key and rate-limits a burst, and were rate-limited into
+    # exit 4 while holding calls a buyer had already paid for. An explicit
+    # RPC_URL argument is the narrower instruction and still wins; an unset or
+    # empty variable leaves the default exactly as it was.
+    rpc_url = argv[4] if len(argv) == 5 else (
+        os.environ.get("NANO_RPC_URL") or "https://rpc.nano.to"
+    )
     try:
         receipt = verify(block_hash=block_hash, expect_raw=expect_raw, account=account,
                          rpc_url=rpc_url, not_after=not_after)

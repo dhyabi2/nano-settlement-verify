@@ -246,3 +246,103 @@ def test_the_usage_docstring_names_every_code_the_table_does():
         "the usage docstring names no outcome for exit %s, which SKILL.md's table has"
         % sorted(missing)
     )
+
+
+# --------------------------------------------------------------------------
+# The bundle's manifest declares the environment variables an installing agent
+# may set. A variable the manifest declares and the bundle never reads is worse
+# than an undeclared one: the operator believes they chose the node that decides
+# whether money arrived, and every verification goes somewhere else.
+
+_ENV_VAR_NAME = re.compile(r"^\s*-\s*name:\s*([A-Z_][A-Z0-9_]*)\s*$")
+
+
+def _declared_env_vars():
+    """The envVars SKILL.md's frontmatter declares, by name."""
+    text = (SKILL / "SKILL.md").read_text()
+    front = text.split("---", 2)[1]
+    return {found.group(1) for found in map(_ENV_VAR_NAME.match, front.splitlines()) if found}
+
+
+def test_the_bundle_reads_every_environment_variable_it_declares():
+    """A declared variable nothing reads is a promise the bundle does not keep.
+
+    SKILL.md's frontmatter is the contract an agent installing the skill
+    configures against: a name listed under `envVars` is a name it will export.
+    Nothing tied that list to the code, so `NANO_RPC_URL` was declared from the
+    first version of the manifest and read nowhere in the tree - the one knob
+    the manifest offers, over the one endpoint that decides whether a payment
+    settled.
+    """
+    source = "\n".join(
+        path.read_text() for path in sorted(SKILL.glob("*.py"))
+    )
+    unread = sorted(name for name in _declared_env_vars() if name not in source)
+    assert unread == [], (
+        "SKILL.md declares %s under envVars, which no .py file in the bundle "
+        "reads; an operator setting it would be ignored" % unread
+    )
+
+
+# Runs the bundle as an agent does, with no RPC_URL argument, and records which
+# endpoint the library was actually asked. `post_json` is replaced, so no socket
+# is opened and the chosen URL never has to exist.
+_RPC_DRIVER = """
+import sys
+sys.path.insert(0, ".")
+import nano_settlement_verify
+asked = []
+def _record(rpc_url, payload):
+    asked.append(rpc_url)
+    return {"message": "rate limit exceeded"}
+nano_settlement_verify.post_json = _record
+import verify_cli
+verify_cli.main(["verify_cli.py", %r, %r, %r] + sys.argv[1:])
+print("ASKED " + (asked[0] if asked else "<nothing>"))
+""" % (HASH, ONE_XNO_RAW, ACCOUNT)
+
+CHOSEN = "http://127.0.0.1:7076/chosen-by-the-operator"
+
+
+def _asked_endpoint(env, *extra_argv):
+    import os
+
+    done = subprocess.run(
+        [sys.executable, "-c", _RPC_DRIVER, *extra_argv],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env},
+    )
+    for line in done.stdout.splitlines():
+        if line.startswith("ASKED "):
+            return line[len("ASKED "):]
+    raise AssertionError(
+        "the driver asked no endpoint; stdout:\n%s\nstderr:\n%s" % (done.stdout, done.stderr)
+    )
+
+
+def test_nano_rpc_url_chooses_the_node_that_decides_the_payment():
+    """The variable SKILL.md declares must select the endpoint `verify` asks.
+
+    Measured before this fix: with `NANO_RPC_URL` pointed at a stub, the
+    documented three-argument command sent the stub nothing and asked
+    `https://rpc.nano.to` instead. A seller that set the variable *because*
+    `rpc.nano.to` wants a key and rate-limits a burst got rate-limited into
+    exit 4 and held calls it had been paid for, while README.md's "ask a
+    second node you chose, not one the seller named" was silently untrue.
+    """
+    assert _asked_endpoint({"NANO_RPC_URL": CHOSEN}) == CHOSEN
+
+
+def test_an_explicit_rpc_url_argument_still_wins_over_the_variable():
+    """The argument is the narrower instruction, so the variable is only a default."""
+    argued = "http://127.0.0.1:7076/argued"
+    assert _asked_endpoint({"NANO_RPC_URL": CHOSEN}, argued) == argued
+
+
+def test_the_default_endpoint_is_unchanged_when_the_variable_is_unset():
+    """With nothing set and nothing passed, the bundle asks what it always asked."""
+    import os
+
+    assert _asked_endpoint({k: v for k, v in {"NANO_RPC_URL": ""}.items()}) == "https://rpc.nano.to"

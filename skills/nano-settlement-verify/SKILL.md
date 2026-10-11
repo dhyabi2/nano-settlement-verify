@@ -33,7 +33,9 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   (`1000000000000000000000000000000`); 0.001 XNO is `1000000000000000000000000000`.
   Never use a decimal or a float here: it loses the low digits.
 - `ACCOUNT` - the `nano_` account you expected to be paid.
-- `RPC_URL` - optional; any Nano node RPC.
+- `RPC_URL` - optional; any Nano node RPC. Defaults to `$NANO_RPC_URL`, else
+  `https://rpc.nano.to`. The argument wins over the variable, so a per-call endpoint
+  overrides the operator's default.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 
