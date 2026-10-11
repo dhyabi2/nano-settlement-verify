@@ -106,6 +106,22 @@ now requires a real `os.environ` / `os.getenv` read.
 
 Suite on the branch head: **360 passed** (350 on `main`, 354 after my commit).
 
+## The redaction was unsound, and was replaced
+
+The redaction in gap 2 did not hold. urllib's error text echoes the URL back
+percent-decoded (`http://op:hunter%32@127.0.0.1/` gave `nonnumeric port:
+'hunter2@127.0.0.1'`; `%40`, `%0A` and `%00` likewise) and cut at the first `/`,
+`?` or `#` of a password (`pa/ss` gave `'pa'`), and replacing short user or
+password parts garbled unrelated words. The README's claim that the password
+never reached stdout or stderr was false. A `file://` URL was also accepted, and
+a crafted file was read as the node's reply and settled.
+
+The CLI now checks the RPC URL - argument or `NANO_RPC_URL` - before anything is
+sent: any `@` in it, a scheme other than http or https, or a URL urlsplit cannot
+parse is `node_unreachable` (exit 4) with a fixed detail that quotes no part of
+the URL. The redaction is gone; every other failure's detail is `str(error)[:200]`
+as on `main`. Suite: **376 passed**.
+
 ## Still open — the owner's one sentence, not a blocker
 
 The repository spells the variable two ways: SKILL.md declares `NANO_RPC_URL`,

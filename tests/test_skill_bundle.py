@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / "skills" / "nano-settlement-verify"
 
@@ -479,3 +481,123 @@ def test_a_url_with_userinfo_as_the_argument_is_unreachable_and_not_echoed():
     """The same for a per-call `RPC_URL` argument."""
     for url in USERINFO_URLS:
         _assert_unreachable_without_the_secret(_run_cli({}, url))
+
+
+# --------------------------------------------------------------------------
+# The RPC URL is checked before anything is sent. A URL with an `@` in it, or
+# one that is not http or https, is refused as node_unreachable (exit 4) with a
+# fixed detail that quotes no part of the URL. These used to be tried, and
+# urllib's error text echoed the URL back: percent-decoded (`hunter%32` came
+# out as `hunter2`), and cut at the first `/`, `?` or `#` of a password, which
+# no scrubbing of that text could follow.
+
+CREDENTIALS_DETAIL = (
+    "the RPC URL carries user credentials, which are never sent; give a URL without them"
+)
+SCHEME_DETAIL = "the RPC URL must be http or https"
+
+# (url, the userinfo it carries, raw and decoded)
+CREDENTIAL_URLS = {
+    "percent-encoded digit": ("http://zqop:hunter%32@127.0.0.1/", ["zqop:hunter%32", "zqop:hunter2"]),
+    "percent-encoded @": ("http://zqop:pq%40xv@127.0.0.1/", ["zqop:pq%40xv", "zqop:pq@xv"]),
+    "percent-encoded newline": ("http://zqop:pq%0Axv@127.0.0.1/", ["zqop:pq%0Axv", "zqop:pq\nxv"]),
+    "percent-encoded NUL": ("http://zqop:pq%00xv@127.0.0.1/", ["zqop:pq%00xv", "zqop:pq\x00xv"]),
+    "unencoded slash": ("http://zqop:pq/xv@127.0.0.1/", ["zqop:pq/xv"]),
+    "unencoded question mark": ("http://zqop:pq?xv@127.0.0.1/", ["zqop:pq?xv"]),
+    "unencoded hash": ("http://zqop:pq#xv@127.0.0.1/", ["zqop:pq#xv"]),
+    "user only": ("http://k3yqzw@127.0.0.1:1/", ["k3yqzw"]),
+    "@ in the path": ("http://127.0.0.1:1/zqpath@xvq", ["zqpath@xvq"]),
+}
+
+SCHEME_URLS = {
+    "file": "file:///zqdir/xvreply.json",
+    "ftp": "ftp://127.0.0.1:1/zqreply",
+    "no scheme": "127.0.0.1:1/zqreply",
+    "bare word": "zqxvhost",
+}
+
+
+def _pieces(secret, shortest=4):
+    """Every substring of secret at least `shortest` characters long."""
+    return {secret[i:j] for i in range(len(secret)) for j in range(i + shortest, len(secret) + 1)}
+
+
+def _assert_refused(done, detail, secrets):
+    output = done.stdout + done.stderr
+    leaked = sorted(piece for secret in secrets for piece in _pieces(secret) if piece in output)
+    assert not leaked, "pieces of the URL reached the output: %r\n%s" % (leaked, output)
+    assert done.returncode == 4, "got exit %d\n%s" % (done.returncode, output)
+    assert done.stderr == ""
+    import json
+
+    assert json.loads(done.stdout) == {"verdict": "node_unreachable", "detail": detail}
+
+
+def _both_ways(url):
+    """The CLI run with url as the RPC_URL argument, and as NANO_RPC_URL."""
+    return [_run_cli({}, url), _run_cli({"NANO_RPC_URL": url})]
+
+
+@pytest.mark.parametrize("case", sorted(CREDENTIAL_URLS))
+def test_a_url_with_an_at_sign_is_refused_before_any_request(case):
+    url, secrets = CREDENTIAL_URLS[case]
+    for done in _both_ways(url):
+        _assert_refused(done, CREDENTIALS_DETAIL, secrets + [url])
+
+
+@pytest.mark.parametrize("case", sorted(SCHEME_URLS))
+def test_a_url_that_is_not_http_or_https_is_refused(case):
+    url = SCHEME_URLS[case]
+    for done in _both_ways(url):
+        _assert_refused(done, SCHEME_DETAIL, [url])
+
+
+def test_a_crafted_file_url_cannot_settle_a_payment(tmp_path):
+    """`file://` used to be read as the node's reply, so a file someone wrote said settled."""
+    import json
+
+    reply = tmp_path / "reply.json"
+    reply.write_text(json.dumps({
+        "block_account": ACCOUNT,
+        "amount": ONE_XNO_RAW,
+        "confirmed": "true",
+        "height": "1",
+        "subtype": "send",
+        "contents": {"type": "state", "account": ACCOUNT, "link_as_account": ACCOUNT},
+    }))
+    url = reply.as_uri()
+    for done in _both_ways(url):
+        assert '"settled": true' not in done.stdout
+        _assert_refused(done, SCHEME_DETAIL, [str(reply)])
+
+
+def test_an_uppercase_http_scheme_is_still_asked():
+    """The scheme is compared without case, as URLs define it."""
+    assert _asked_endpoint({"NANO_RPC_URL": "HTTP://127.0.0.1:7076/x"}) == "HTTP://127.0.0.1:7076/x"
+
+
+def test_an_error_for_a_url_without_credentials_is_reported_unchanged():
+    """Only refused URLs get a fixed detail; every other failure keeps main's text.
+
+    Expected is computed the way main's CLI computes it - `str(error)[:200]` of
+    what the library raises for the same URL - so no rewriting pass is allowed
+    to touch it.
+    """
+    import json
+
+    url = "http://127.0.0.1:1/"
+    sys.path.insert(0, str(SKILL))
+    try:
+        import nano_settlement_verify as vendored
+
+        try:
+            vendored.verify(HASH, int(ONE_XNO_RAW), ACCOUNT, url)
+        except OSError as error:
+            expected = str(error)[:200]
+        else:
+            raise AssertionError("nothing listens on 127.0.0.1:1, yet verify returned")
+    finally:
+        sys.path.remove(str(SKILL))
+    for done in _both_ways(url):
+        assert done.returncode == 4, done.stdout + done.stderr
+        assert json.loads(done.stdout) == {"verdict": "node_unreachable", "detail": expected}

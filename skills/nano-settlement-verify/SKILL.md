@@ -10,7 +10,7 @@ metadata:
     envVars:
       - name: NANO_RPC_URL
         required: false
-        description: Nano node RPC to ask. Defaults to https://rpc.nano.to (an empty or blank value counts as unset)
+        description: Nano node RPC to ask, http or https with no credentials in it. Defaults to https://rpc.nano.to (an empty or blank value counts as unset)
 ---
 
 # nano-settlement-verify
@@ -37,6 +37,10 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   `https://rpc.nano.to`. The argument wins over the variable, so a per-call endpoint
   overrides the operator's default. An empty or blank `NANO_RPC_URL` counts as unset, and
   whitespace around the URL is ignored.
+  The URL must be `http` or `https` and must not contain an `@`: a URL with credentials
+  (`http://user:password@host/`), or of any other scheme (`file://`, `ftp://`, none), is
+  refused before anything is sent, as `node_unreachable` (exit 4) with a fixed detail
+  that quotes no part of the URL. Put a node's key somewhere other than the URL.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 

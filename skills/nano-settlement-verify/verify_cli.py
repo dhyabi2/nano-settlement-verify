@@ -4,6 +4,7 @@
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
+RPC_URL must be http or https with no user:password@ in it; any other URL is refused (4).
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
@@ -13,8 +14,8 @@ if seconds matter.
 import http.client
 import json
 import os
-import re
 import sys
+import urllib.parse
 
 from nano_settlement_verify import (
     TIME_SOURCE, Late, Mismatch, NotFound, UnknownTime, parse_not_after, verify,
@@ -39,30 +40,35 @@ def _take_not_after(argv):
 
 DEFAULT_RPC_URL = "https://rpc.nano.to"
 
-# `scheme://user:password@host` - the userinfo is a credential, and it must not
-# reach stdout or stderr, where a seller's logs keep it. urllib's messages quote
-# pieces of the URL back without its scheme (InvalidURL says "nonnumeric port:
-# 'pw@127.0.0.1'" for `http://user:pw@127.0.0.1/`), so the URL's own userinfo is
-# removed wherever it appears, as well as any `scheme://...@` in the text.
-_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s]*@")
+# Two refusals for the RPC URL, made before anything is sent. Their details are
+# fixed strings and never quote the URL: urllib's own messages echo pieces of it
+# back - percent-decoded, and cut wherever a `/`, `?` or `#` falls - so no
+# scrubbing of those messages can promise that a credential in the URL stays out
+# of stdout, stderr and the logs that keep them. Refusing every URL that carries
+# an `@` can.
+CREDENTIALS_REFUSED = (
+    "the RPC URL carries user credentials, which are never sent; give a URL without them"
+)
+SCHEME_REFUSED = "the RPC URL must be http or https"
 
 
-def _secrets_in(url):
-    """The userinfo of url and its colon-separated parts, longest first."""
-    authority = url.split("://", 1)[-1]
-    for end in "/?#":
-        authority = authority.split(end, 1)[0]
-    userinfo = authority.rpartition("@")[0]
-    if not userinfo:
-        return []
-    return sorted({userinfo, *userinfo.split(":")} - {""}, key=len, reverse=True)
+def _refuse_rpc_url(url):
+    """A fixed reason the CLI will not ask url, or None when it may.
 
-
-def _redact(text, url):
-    """text with url's userinfo, and any URL userinfo, replaced by `***`."""
-    for secret in _secrets_in(url):
-        text = text.replace(secret, "***")
-    return _USERINFO.sub(r"\1***@", text)
+    Any `@` is refused, wherever it falls: telling userinfo from a path apart is
+    the parse this guards against getting wrong. Only http and https are asked;
+    a `file://` URL would let whoever sets the URL hand `verify` a reply they
+    wrote themselves, and `settled: true` with it.
+    """
+    if "@" in url:
+        return CREDENTIALS_REFUSED
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        return SCHEME_REFUSED
+    if scheme.lower() not in ("http", "https"):
+        return SCHEME_REFUSED
+    return None
 
 
 def _rpc_url_from_env():
@@ -106,6 +112,10 @@ def main(argv):
     # empty or blank variable leaves the default exactly as it was, and
     # surrounding whitespace (a padded `export`) is not part of the URL.
     rpc_url = argv[4] if len(argv) == 5 else _rpc_url_from_env()
+    refused = _refuse_rpc_url(rpc_url)
+    if refused is not None:
+        print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
+        return 4
     try:
         receipt = verify(block_hash=block_hash, expect_raw=expect_raw, account=account,
                          rpc_url=rpc_url, not_after=not_after)
@@ -125,12 +135,10 @@ def main(argv):
         return 3
     except (OSError, ValueError, http.client.HTTPException) as error:
         # http.client.HTTPException covers InvalidURL, which urllib raises for
-        # a URL it cannot even connect to (`http://user:pw@host/` among them);
-        # it is neither an OSError nor a ValueError and used to escape as a
-        # traceback with exit 1 - and the password in it. A URL the node
-        # cannot be reached at is still "nothing was checked". The detail is
-        # redacted because these messages quote the URL back.
-        print(json.dumps({"verdict": "node_unreachable", "detail": _redact(str(error), rpc_url)[:200]}))
+        # a URL it cannot even connect to; it is neither an OSError nor a
+        # ValueError and used to escape as a traceback with exit 1. A URL the
+        # node cannot be reached at is still "nothing was checked".
+        print(json.dumps({"verdict": "node_unreachable", "detail": str(error)[:200]}))
         return 4
     print(receipt.to_json())
     return 0 if receipt.settled else 2
