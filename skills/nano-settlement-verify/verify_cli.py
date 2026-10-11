@@ -10,8 +10,10 @@ exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that
 The time is the node's own local_timestamp, not signed by the sender: read it on two nodes
 if seconds matter.
 """
+import http.client
 import json
 import os
+import re
 import sys
 
 from nano_settlement_verify import (
@@ -33,6 +35,39 @@ def _take_not_after(argv):
             rest.append(arg)
         i += 1
     return rest, value
+
+
+DEFAULT_RPC_URL = "https://rpc.nano.to"
+
+# `scheme://user:password@host` - the userinfo is a credential, and it must not
+# reach stdout or stderr, where a seller's logs keep it. urllib's messages quote
+# pieces of the URL back without its scheme (InvalidURL says "nonnumeric port:
+# 'pw@127.0.0.1'" for `http://user:pw@127.0.0.1/`), so the URL's own userinfo is
+# removed wherever it appears, as well as any `scheme://...@` in the text.
+_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s]*@")
+
+
+def _secrets_in(url):
+    """The userinfo of url and its colon-separated parts, longest first."""
+    authority = url.split("://", 1)[-1]
+    for end in "/?#":
+        authority = authority.split(end, 1)[0]
+    userinfo = authority.rpartition("@")[0]
+    if not userinfo:
+        return []
+    return sorted({userinfo, *userinfo.split(":")} - {""}, key=len, reverse=True)
+
+
+def _redact(text, url):
+    """text with url's userinfo, and any URL userinfo, replaced by `***`."""
+    for secret in _secrets_in(url):
+        text = text.replace(secret, "***")
+    return _USERINFO.sub(r"\1***@", text)
+
+
+def _rpc_url_from_env():
+    """$NANO_RPC_URL stripped, or the default when it is unset, empty or blank."""
+    return (os.environ.get("NANO_RPC_URL") or "").strip() or DEFAULT_RPC_URL
 
 
 def main(argv):
@@ -68,10 +103,9 @@ def main(argv):
     # endpoint wants a key and rate-limits a burst, and were rate-limited into
     # exit 4 while holding calls a buyer had already paid for. An explicit
     # RPC_URL argument is the narrower instruction and still wins; an unset or
-    # empty variable leaves the default exactly as it was.
-    rpc_url = argv[4] if len(argv) == 5 else (
-        os.environ.get("NANO_RPC_URL") or "https://rpc.nano.to"
-    )
+    # empty or blank variable leaves the default exactly as it was, and
+    # surrounding whitespace (a padded `export`) is not part of the URL.
+    rpc_url = argv[4] if len(argv) == 5 else _rpc_url_from_env()
     try:
         receipt = verify(block_hash=block_hash, expect_raw=expect_raw, account=account,
                          rpc_url=rpc_url, not_after=not_after)
@@ -89,8 +123,14 @@ def main(argv):
     except Mismatch as error:
         print(json.dumps({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}))
         return 3
-    except (OSError, ValueError) as error:
-        print(json.dumps({"verdict": "node_unreachable", "detail": str(error)[:200]}))
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        # http.client.HTTPException covers InvalidURL, which urllib raises for
+        # a URL it cannot even connect to (`http://user:pw@host/` among them);
+        # it is neither an OSError nor a ValueError and used to escape as a
+        # traceback with exit 1 - and the password in it. A URL the node
+        # cannot be reached at is still "nothing was checked". The detail is
+        # redacted because these messages quote the URL back.
+        print(json.dumps({"verdict": "node_unreachable", "detail": _redact(str(error), rpc_url)[:200]}))
         return 4
     print(receipt.to_json())
     return 0 if receipt.settled else 2

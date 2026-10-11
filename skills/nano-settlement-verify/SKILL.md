@@ -10,7 +10,7 @@ metadata:
     envVars:
       - name: NANO_RPC_URL
         required: false
-        description: Nano node RPC to ask. Defaults to https://rpc.nano.to
+        description: Nano node RPC to ask. Defaults to https://rpc.nano.to (an empty or blank value counts as unset)
 ---
 
 # nano-settlement-verify
@@ -35,7 +35,8 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 - `ACCOUNT` - the `nano_` account you expected to be paid.
 - `RPC_URL` - optional; any Nano node RPC. Defaults to `$NANO_RPC_URL`, else
   `https://rpc.nano.to`. The argument wins over the variable, so a per-call endpoint
-  overrides the operator's default.
+  overrides the operator's default. An empty or blank `NANO_RPC_URL` counts as unset, and
+  whitespace around the URL is ignored.
 - `--not-after WHEN` - optional; the order's expiry, as unix seconds or ISO-8601 with an
   offset (`2026-10-09T18:00:00Z`). Inclusive: a block seen exactly at `WHEN` is on time.
 

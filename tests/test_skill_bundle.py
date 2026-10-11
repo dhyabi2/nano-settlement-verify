@@ -274,14 +274,70 @@ def test_the_bundle_reads_every_environment_variable_it_declares():
     the manifest offers, over the one endpoint that decides whether a payment
     settled.
     """
-    source = "\n".join(
-        path.read_text() for path in sorted(SKILL.glob("*.py"))
-    )
-    unread = sorted(name for name in _declared_env_vars() if name not in source)
+    read = _env_vars_read_in_code()
+    unread = sorted(name for name in _declared_env_vars() if name not in read)
     assert unread == [], (
         "SKILL.md declares %s under envVars, which no .py file in the bundle "
         "reads; an operator setting it would be ignored" % unread
     )
+
+
+def _env_vars_read_in_code(sources=None):
+    """Names the bundle's code reads from the environment, found in its syntax tree.
+
+    A name in a docstring or a comment is not a read, so a plain substring
+    search would pass on a bundle that only mentions the variable. This counts
+    `os.environ.get("X")`, `os.getenv("X")` and `os.environ["X"]` with a
+    literal name. That the read actually reaches `verify` is the behavioural
+    tests' job below; this one only keeps the manifest and the code tied.
+    """
+    import ast
+
+    def is_environ(node):
+        return (isinstance(node, ast.Attribute) and node.attr == "environ"
+                and isinstance(node.value, ast.Name) and node.value.id == "os")
+
+    def literal(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    if sources is None:
+        sources = [path.read_text() for path in sorted(SKILL.glob("*.py"))]
+    found = set()
+    for source in sources:
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call) and node.args and isinstance(node.func, ast.Attribute):
+                func = node.func
+                if (func.attr == "get" and is_environ(func.value)) or (
+                    func.attr == "getenv" and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    name = literal(node.args[0])
+                    if name:
+                        found.add(name)
+            elif isinstance(node, ast.Subscript) and is_environ(node.value):
+                name = literal(node.slice)
+                if name:
+                    found.add(name)
+    return found
+
+
+def test_a_name_only_mentioned_in_prose_is_not_a_read():
+    """The check above must not be satisfied by a docstring or a comment.
+
+    The first version of it searched the source text for the name, and the
+    CLI's usage docstring mentions `$NANO_RPC_URL`, so it would have passed
+    with the read deleted.
+    """
+    prose = '"""Defaults to $NANO_RPC_URL."""\n# NANO_RPC_URL\nX = "NANO_RPC_URL"\n'
+    assert _env_vars_read_in_code([prose]) == set()
+    for read in (
+        'import os\nu = os.environ.get("NANO_RPC_URL") or "d"\n',
+        'import os\nu = os.getenv("NANO_RPC_URL")\n',
+        'import os\nu = os.environ["NANO_RPC_URL"]\n',
+    ):
+        assert _env_vars_read_in_code([read]) == {"NANO_RPC_URL"}, read
 
 
 # Runs the bundle as an agent does, with no RPC_URL argument, and records which
@@ -304,15 +360,22 @@ print("ASKED " + (asked[0] if asked else "<nothing>"))
 CHOSEN = "http://127.0.0.1:7076/chosen-by-the-operator"
 
 
-def _asked_endpoint(env, *extra_argv):
+def _environment(env, unset=()):
     import os
 
+    merged = {**os.environ, **env}
+    for name in unset:
+        merged.pop(name, None)
+    return merged
+
+
+def _asked_endpoint(env, *extra_argv, unset=()):
     done = subprocess.run(
         [sys.executable, "-c", _RPC_DRIVER, *extra_argv],
         cwd=SKILL,
         capture_output=True,
         text=True,
-        env={**os.environ, **env},
+        env=_environment(env, unset),
     )
     for line in done.stdout.splitlines():
         if line.startswith("ASKED "):
@@ -343,6 +406,76 @@ def test_an_explicit_rpc_url_argument_still_wins_over_the_variable():
 
 def test_the_default_endpoint_is_unchanged_when_the_variable_is_unset():
     """With nothing set and nothing passed, the bundle asks what it always asked."""
-    import os
+    assert _asked_endpoint({}, unset=("NANO_RPC_URL",)) == "https://rpc.nano.to"
 
-    assert _asked_endpoint({k: v for k, v in {"NANO_RPC_URL": ""}.items()}) == "https://rpc.nano.to"
+
+def test_an_empty_variable_counts_as_unset():
+    """`export NANO_RPC_URL=` is how a shell clears it; it must not become the URL."""
+    assert _asked_endpoint({"NANO_RPC_URL": ""}) == "https://rpc.nano.to"
+
+
+def test_a_blank_variable_counts_as_unset():
+    """A value of only whitespace is truthy, and used to be asked as the URL.
+
+    Measured before this fix: `NANO_RPC_URL="   "` was handed to urllib as the
+    endpoint, which refused it, and every verification exited 4 - a seller
+    holding paid calls over a variable that names no node at all.
+    """
+    assert _asked_endpoint({"NANO_RPC_URL": " \t \n"}) == "https://rpc.nano.to"
+
+
+def test_a_padded_variable_is_stripped():
+    """Whitespace around the URL, as a quoted `export` or a .env file leaves it, is not the URL."""
+    assert _asked_endpoint({"NANO_RPC_URL": "  %s \n" % CHOSEN}) == CHOSEN
+
+
+SECRET = "s3cr3t-do-not-print"
+USERINFO_URLS = [
+    # urllib refuses this one before connecting: InvalidURL, "nonnumeric port".
+    "http://operator:%s@127.0.0.1/" % SECRET,
+    # This one parses, and fails to connect to a port nothing listens on.
+    "http://operator:%s@127.0.0.1:9/" % SECRET,
+]
+
+
+def _run_cli(env, *extra_argv):
+    return subprocess.run(
+        [sys.executable, "verify_cli.py", HASH, ONE_XNO_RAW, ACCOUNT, *extra_argv],
+        cwd=SKILL,
+        capture_output=True,
+        text=True,
+        env=_environment(env),
+        timeout=60,
+    )
+
+
+def _assert_unreachable_without_the_secret(done):
+    assert SECRET not in done.stdout and SECRET not in done.stderr, (
+        "the URL's password reached the output:\nstdout:\n%s\nstderr:\n%s"
+        % (done.stdout, done.stderr)
+    )
+    assert done.returncode == 4, (
+        "a URL the node cannot be reached at must be exit 4, got %d\nstdout:\n%s\nstderr:\n%s"
+        % (done.returncode, done.stdout, done.stderr)
+    )
+    import json
+
+    assert json.loads(done.stdout)["verdict"] == "node_unreachable"
+
+
+def test_a_url_with_userinfo_in_the_variable_is_unreachable_and_not_echoed():
+    """`http://user:pw@host/` used to escape as a traceback, exit 1, password on stderr.
+
+    urllib raises `http.client.InvalidURL` for it - an `HTTPException`, neither
+    an `OSError` nor a `ValueError` - so it passed the CLI's handler, exited 1
+    with no row in SKILL.md's table, and printed the URL's password into
+    whatever log keeps the seller's stderr.
+    """
+    for url in USERINFO_URLS:
+        _assert_unreachable_without_the_secret(_run_cli({"NANO_RPC_URL": url}))
+
+
+def test_a_url_with_userinfo_as_the_argument_is_unreachable_and_not_echoed():
+    """The same for a per-call `RPC_URL` argument."""
+    for url in USERINFO_URLS:
+        _assert_unreachable_without_the_secret(_run_cli({}, url))
