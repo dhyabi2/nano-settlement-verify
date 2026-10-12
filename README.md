@@ -163,6 +163,7 @@ exception, so the transport failure reaches you as itself:
 | a body that is not JSON — an HTML error or maintenance page | `json.JSONDecodeError` (a `ValueError`) |
 | a body that **is** JSON but is not a node reply — a proxy's status page, a rate-limit envelope | `NotANodeReply` (also a `ValueError`) |
 | a body that is JSON but not an object — `"error"`, `["error"]`, a bare number | `NotANodeReply` too: hold and retry. It used to come out as `NotFound`, or a `TypeError` |
+| a reply whose `amount` is a JSON float — `1.9`, or an integral one like `1000.0` — or a `true`/`false` | `NotANodeReply` too: a node sends raw as an integer string, and `int()` would have read another number. A JSON integer amount is still read |
 
 A replacement `post_json`, such as a test stub, must return a plain `dict`: a mapping that
 is not one, such as `UserDict` or `MappingProxyType`, is refused as `NotANodeReply`. Real
@@ -193,6 +194,16 @@ the node's `local_timestamp`, the moment *that* node first saw the block on its 
 and another node can differ by seconds. Very old blocks report `0`; missing or `0` raises
 `UnknownTime`, never "on time". The deadline is checked against the node you chose - read
 it on two nodes if seconds matter.
+
+**What a deadline can be.** `not_after` is `None` (no deadline - pass that if you want none)
+or a number of unix seconds: an `int`, a `float`, a `Decimal`, a `Fraction`, or a numpy
+integer or `float64`. A deadline that is not a whole number is floored to whole seconds,
+exactly - `seen_at` is whole seconds, so that decides every payment as the value itself
+would, and `1790150109.9999999` is never rounded up across the second. These raise
+`ValueError` before the node is called: a string or a bool (read a string through
+`parse_not_after` first), NaN, `inf` or `-inf`, a numpy float narrower than `float64`
+(`float32`, `float16` - too coarse to hold a unix time to the second), and anything beyond
+2\*\*63 seconds either side of 1970.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -348,7 +359,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-594 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value), the error paths around them, the
+604 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

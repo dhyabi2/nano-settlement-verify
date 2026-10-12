@@ -363,7 +363,15 @@ def _deadline(not_after: object) -> int | float:
     float subclass a float, and any other real (a Decimal, a Fraction) its
     floor: seen_at is whole seconds and the check is `seen_at > not_after`, so
     the floor decides every payment exactly as the value itself would, where
-    float() could round 1790150109.9999999999 up across the second.
+    float() could round 1790150109.9999999999 up across the second. The floor
+    is taken from the exact ratio where the type has one, so a numpy.longdouble
+    1790150109.9999999 is not rounded up through float() either.
+
+    Also refused, before any conversion: a numpy float narrower than float64
+    (a float32 is 128 seconds apart near a 2026 unix time, a float16 cannot hold
+    one at all), and a deadline whose magnitude is beyond 2**63 seconds -
+    no order expires there, and flooring Decimal('1E+1000000') would spend
+    seconds of CPU or run out of memory before it answered.
     """
     if isinstance(not_after, bool) or not isinstance(not_after, (numbers.Real, Decimal)):
         raise ValueError(
@@ -371,8 +379,20 @@ def _deadline(not_after: object) -> int | float:
             f"{type(not_after).__name__} ({not_after!r}); parse_not_after() reads "
             f"a string deadline, in unix seconds or ISO-8601 with a UTC offset"
         )
+    dtype = getattr(not_after, "dtype", None)
+    if (
+        not isinstance(not_after, numbers.Integral)
+        and getattr(dtype, "kind", None) == "f"
+        and getattr(dtype, "itemsize", 8) < 8
+    ):
+        raise ValueError(
+            f"not_after is a {type(not_after).__name__} ({not_after!r}), which cannot "
+            f"hold a unix time to the second; pass an int, or a float64"
+        )
     if isinstance(not_after, numbers.Integral):
-        return int(not_after)
+        not_after = int(not_after)
+        _within_deadline_bound(not_after)
+        return not_after
     if isinstance(not_after, Decimal):
         finite = not_after.is_finite()
     else:
@@ -385,9 +405,25 @@ def _deadline(not_after: object) -> int | float:
             f"not_after must be a finite number of unix seconds, got {not_after!r}; "
             f"a NaN or infinite deadline would let a late payment through as on time"
         )
+    _within_deadline_bound(not_after)
     if isinstance(not_after, float):
         return float(not_after)
+    ratio = getattr(not_after, "as_integer_ratio", None)
+    if ratio is not None and not isinstance(not_after, Decimal):
+        numerator, denominator = ratio()
+        return int(numerator) // int(denominator)
     return math.floor(not_after)
+
+
+_DEADLINE_BOUND = 2**63
+
+
+def _within_deadline_bound(not_after: object) -> None:
+    """ValueError for a finite deadline beyond 2**63 seconds either side of 1970."""
+    if not -_DEADLINE_BOUND <= not_after <= _DEADLINE_BOUND:  # no abs(): it rounds a Decimal
+        raise ValueError(
+            f"not_after must be within 2**63 unix seconds of 1970, got {not_after!r}"
+        )
 
 
 def _raw_amount(reply: dict) -> int:

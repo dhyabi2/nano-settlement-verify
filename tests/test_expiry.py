@@ -357,3 +357,58 @@ def test_a_numpy_deadline_is_accepted_and_its_nan_refused(node):
     node(reply())
     with pytest.raises(ValueError):
         verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.float64("nan"))
+
+
+# --- a deadline floored exactly, refused when it cannot be a unix time ---------
+#
+# math.floor() of a numpy.longdouble goes through float(), which rounds
+# 1790150109.9999999 up to 1790150110, so a block seen ~100ns late settled. A
+# float32 is 128 seconds apart near a 2026 unix time and a float16 cannot hold
+# one at all. And flooring Decimal('1E+1000000') spent seconds of CPU or raised
+# MemoryError, which is not in the family a seller's handler catches.
+
+
+def test_a_longdouble_deadline_a_fraction_before_the_second_is_late(node):
+    numpy = pytest.importorskip("numpy")
+    if numpy.finfo(numpy.longdouble).nmant <= numpy.finfo(numpy.float64).nmant:
+        pytest.skip("this platform's longdouble is a float64")
+    deadline = numpy.longdouble(SEEN - 1) + numpy.longdouble("0.9999999")
+    assert float(deadline) == SEEN, "the case only bites when float() rounds it up"
+
+    calls = node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert len(calls) == 1
+
+    node(reply())
+    receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.longdouble(SEEN) + numpy.longdouble("0.5"))
+    assert receipt.settled is True
+    assert json.loads(receipt.to_json())["not_after"] == SEEN
+
+
+def test_a_numpy_float_narrower_than_float64_is_refused_before_the_node_is_asked(node):
+    numpy = pytest.importorskip("numpy")
+    for deadline in (numpy.float32(SEEN), numpy.float16(1)):
+        calls = node(reply())
+        with pytest.raises(ValueError) as caught:
+            verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+        assert type(deadline).__name__ in str(caught.value)
+        assert calls == []
+
+
+@pytest.mark.parametrize("deadline", [Decimal("1E+1000000"), Decimal("-1E+1000000"),
+                                      2**63 + 1, -(2**63) - 1, 2**200, Fraction(2**70, 3), 1e300])
+def test_a_deadline_beyond_2_63_seconds_is_refused_before_the_node_is_asked(node, deadline):
+    calls = node(reply())
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert "2**63" in str(caught.value)
+    assert calls == []
+
+
+def test_a_deadline_at_2_63_seconds_is_still_a_deadline(node):
+    node(reply())
+    assert verify(HASH, RAW, ACCOUNT, URL, not_after=2**63).settled is True
+    node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=-(2**63))
