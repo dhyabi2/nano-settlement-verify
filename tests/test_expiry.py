@@ -286,3 +286,143 @@ def test_an_int_and_a_float_deadline_are_both_still_accepted(node):
         node(reply())
         with pytest.raises(Late):
             verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+
+# --- a deadline that is a number, but not a finite int or float ---------------
+#
+# NaN compares False with everything, so `seen_at > NaN` was never true and a
+# payment seen an hour after a NaN deadline verified as on time; +inf is later
+# than every time and did the same. `json.loads` reads both from an order record
+# ("NaN", "Infinity"). And a Decimal from a database NUMERIC column or a numpy
+# number from a dataframe - deadlines that worked before #24 - was refused on
+# every call, holding every paid order.
+
+from decimal import Decimal  # noqa: E402
+from fractions import Fraction  # noqa: E402
+
+
+@pytest.mark.parametrize("deadline", [float("nan"), float("inf"), float("-inf"),
+                                      json.loads("NaN"), json.loads("Infinity"),
+                                      Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity")])
+def test_a_deadline_that_is_not_finite_is_refused_before_the_node_is_asked(node, deadline):
+    calls = node(reply())
+
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+    assert "finite" in str(caught.value)
+    assert calls == [], "no node was asked for a deadline that cannot decide a payment"
+
+
+def test_a_late_payment_never_passes_a_nan_deadline(node):
+    """The block was seen at SEEN; whatever the deadline, NaN must not settle it."""
+    node(reply())
+    settled = False
+    try:
+        settled = verify(HASH, RAW, ACCOUNT, URL, not_after=float("nan")).settled
+    except (OSError, ValueError):
+        pass
+    assert settled is False
+
+
+@pytest.mark.parametrize("kind", [Decimal, Fraction])
+def test_a_decimal_or_fraction_deadline_decides_like_its_value(node, kind):
+    node(reply())
+    receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=kind(SEEN + 60))
+    assert receipt.settled is True
+    assert json.loads(receipt.to_json())["not_after"] == SEEN + 60
+
+    node(reply())
+    assert verify(HASH, RAW, ACCOUNT, URL, not_after=kind(SEEN)).settled is True  # inclusive
+
+    # a fraction of a second before the moment it was seen is late, never rounded up
+    for deadline in (Decimal("1790150109.99999999999"), Fraction(SEEN * 10**12 - 1, 10**12)):
+        node(reply())
+        with pytest.raises(Late):
+            verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+
+def test_a_numpy_deadline_is_accepted_and_its_nan_refused(node):
+    numpy = pytest.importorskip("numpy")
+    for deadline in (numpy.int64(SEEN + 60), numpy.float64(SEEN + 60)):
+        node(reply())
+        receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+        assert receipt.settled is True
+        json.loads(receipt.to_json())  # a numpy number in the receipt would not serialise
+
+    node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.int64(SEEN - 1))
+
+    node(reply())
+    with pytest.raises(ValueError):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.float64("nan"))
+
+
+# --- a deadline floored exactly, refused when it cannot be a unix time ---------
+#
+# math.floor() of a numpy.longdouble goes through float(), which rounds
+# 1790150109.9999999 up to 1790150110, so a block seen ~100ns late settled. A
+# float32 is 128 seconds apart near a 2026 unix time and a float16 cannot hold
+# one at all. And flooring Decimal('1E+1000000') spent seconds of CPU or raised
+# MemoryError, which is not in the family a seller's handler catches.
+
+
+def test_a_longdouble_deadline_a_fraction_before_the_second_is_late(node):
+    numpy = pytest.importorskip("numpy")
+    if numpy.finfo(numpy.longdouble).nmant <= numpy.finfo(numpy.float64).nmant:
+        pytest.skip("this platform's longdouble is a float64")
+    deadline = numpy.longdouble(SEEN - 1) + numpy.longdouble("0.9999999")
+    assert float(deadline) == SEEN, "the case only bites when float() rounds it up"
+
+    calls = node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert len(calls) == 1
+
+    node(reply())
+    receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.longdouble(SEEN) + numpy.longdouble("0.5"))
+    assert receipt.settled is True
+    assert json.loads(receipt.to_json())["not_after"] == SEEN
+
+
+def test_a_numpy_float_narrower_than_float64_is_refused_before_the_node_is_asked(node):
+    numpy = pytest.importorskip("numpy")
+    for deadline in (numpy.float32(SEEN), numpy.float16(1)):
+        calls = node(reply())
+        with pytest.raises(ValueError) as caught:
+            verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+        assert type(deadline).__name__ in str(caught.value)
+        assert calls == []
+
+
+@pytest.mark.parametrize("deadline", [Decimal("1E+1000000"), Decimal("-1E+1000000"),
+                                      2**63 + 1, -(2**63) - 1, 2**200, Fraction(2**70, 3), 1e300])
+def test_a_deadline_beyond_2_63_seconds_is_refused_before_the_node_is_asked(node, deadline):
+    calls = node(reply())
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert "2**63" in str(caught.value)
+    assert calls == []
+
+
+def test_a_deadline_at_2_63_seconds_is_still_a_deadline(node):
+    node(reply())
+    assert verify(HASH, RAW, ACCOUNT, URL, not_after=2**63).settled is True
+    node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=-(2**63))
+
+
+@pytest.mark.parametrize("deadline", [10**5000, -(10**5000), Decimal("1E+1000000")],
+                         ids=["10**5000", "-10**5000", "Decimal-1E+1000000"])
+def test_a_huge_deadline_is_refused_with_a_message_that_renders(node, deadline):
+    """repr() of 10**5000 raises its own ValueError past 4300 digits; the refusal must not."""
+    calls = node(reply())
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert str(caught.value) == (
+        f"not_after must be within 2**63 unix seconds of 1970, got a "
+        f"{type(deadline).__name__} beyond that; pass None for no deadline"
+    )
+    assert calls == []
