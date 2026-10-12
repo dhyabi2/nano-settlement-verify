@@ -39,6 +39,62 @@ pip install .
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
 dependencies.
 
+The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
+`$NANO_RPC_URL` when no `RPC_URL` argument is given - so if you export that variable for
+another tool, the CLI's verifications go there too; an empty or blank value means the
+default, `https://rpc.nano.to`. The CLI asks only `http` and `https` URLs, and refuses any
+URL containing an `@` anywhere - so a URL with credentials (`http://user:password@host/`) is
+never sent, and is reported as `node_unreachable` (exit 4) with a fixed message that quotes no
+part of it. An `@` that belongs in a path or query is written `%40`
+(`http://host/?key=a%40b`, `/v1/acct%40zone/rpc`), which is sent as written; a `%40` or
+`%3A` in the host part (`http://user:pw%40host/`) is a credential and is refused like an `@`; a
+URL whose port is not a number from 0 to 65535 (`https://host:key:443/`, which the URL check
+and `http.client` would split at different colons, or `:99999`), a URL with no host
+(`http:///x`), a URL with a control character anywhere in it, a host that is not plain ASCII
+letters, digits, `-`, `.` and `_` or an IP address, and a URL that cannot be parsed at all are
+refused the same way, each with its own fixed message. The host rule is there because urllib
+percent-decodes the host before it connects, and a TLS error then names the decoded host:
+`https://localhost%2FKEY/` would have been reported as `'localhost/KEY'`. So no `%` is allowed
+in the host (except a bracketed IPv6 zone id, `[fe80::1%25eth0]`), and an international name
+is refused rather than IDNA-mapped: write it in its `xn--` form. These
+refusals are configuration errors: retrying will not fix them. Whitespace around the URL,
+as the argument or the variable, is ignored; a blank argument is refused, not replaced.
+
+When the node cannot be reached or read, the detail is chosen by the error's class alone,
+from parts of it that cannot hold the URL - the URL itself is never consulted:
+
+- an HTTP error status: `HTTP Error <code>` only (`HTTP Error 401`). The server's reason
+  phrase is dropped, because a node can repeat the URL, or one piece of it, in that phrase;
+  main showed it (`HTTP Error 401: Unauthorized`);
+- a connection, DNS or timeout failure: `[Errno N] strerror`, inside `<urlopen error ...>`
+  when urllib wrapped it - exactly main's text for connection refused
+  (`<urlopen error [Errno 111] Connection refused>`), a DNS failure
+  (`<urlopen error [Errno -2] Name or service not known>`) and a timeout (`timed out`, or
+  the ssl module's `The handshake operation timed out`, with the `_ssl.c:NNN: ` prefix
+  Python 3.12 adds);
+- a proxy that refuses the `CONNECT` tunnel: `<urlopen error Tunnel connection failed: 407>`,
+  the status code only - the proxy's reason phrase is its own text and is dropped;
+- a TLS failure: its reason code, and for a certificate its verify message
+  (`<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname
+  mismatch, certificate is not valid for 'host'.>`), which may name the host;
+- a reply that is not a node's reply, not JSON or not UTF-8: the library's or the parser's
+  own text about the reply, cut at 200 characters, as main printed it;
+- anything else - `http.client.InvalidURL` (a space in the URL), any
+  other `http.client` error, any other `ValueError`, a `TypeError` raised while the request
+  is made - by its class only:
+  `the request to the RPC URL failed (InvalidURL)`.
+
+A node you give a key to (in its path or query) can still repeat it in its reply, and the CLI
+prints what the reply says - the `got` of a mismatch, or the keys named in a "not a node's
+block_info reply" detail - as main does. Put a key only in a URL whose node you trust with it.
+
+Called in-process (importing `verify_cli` and calling `main`), the CLI holds a module-wide
+lock for each verification, network call included, because it swaps the library's
+`post_json` for the length of the call: two threads calling `main` at once take turns, so a
+slow node delays every other in-process caller. The lock is re-entrant, so a `post_json` that
+calls `main` again on the same thread does not deadlock. Running the CLI as its own process,
+the documented use, is unaffected: each process has its own lock.
+
 ## Use it
 
 ```python
@@ -292,14 +348,42 @@ pip install pytest
 python -m pytest -v
 ```
 
-369 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
+576 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, and a deadline that is not a number at all refused before the node is called, in the family a seller's own handler catches), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
 CLI and a failed endpoint in a quorum; the
 integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
-codes `verify_cli.py` actually returns are the same set in all three directions;
+codes `verify_cli.py` actually returns are the same set in all three directions, and that
+every environment variable SKILL.md declares is read by the bundle - `NANO_RPC_URL`
+selects the node that decides the payment, with an explicit `RPC_URL` argument winning
+over it, the default unchanged when neither is set or the variable is empty or blank, a
+padded value stripped, a padded `RPC_URL` argument stripped too, an empty or blank `RPC_URL` argument refused rather than replaced, and a URL with credentials (percent-encoded or carrying `/`, `?` or
+`#` in the password, user-only, `%40` or `%3A` in the host part, or any `@` at all, in the path or query too) or a scheme other
+than http/https (`file://`, `ftp://`, none) or a URL that cannot be parsed (an unclosed or
+non-address bracketed host, a fullwidth solidus in the host) or a port that is not a number up
+to 65535 or no host at all (`http:///x`) or a control character anywhere or a host urllib would
+percent-decode or IDNA-map (`%2F`, `%3F`, `%23`, `%20`, `%25`, `%3B`, `%C2%AD`, a unicode
+name) refused as `node_unreachable`
+(exit 4) before any request, with a fixed detail and no piece of the URL in stdout or stderr,
+an `@` written `%40` in a path or query asked as written, and against a loopback node a
+non-numeric port, a reply cut short of its Content-Length, a reply that is JSON but not an
+object (`"error"`, `"no error here"` and `["error"]` included, which the library's `"error" in
+reply` would otherwise read as no such block), one with a field of the wrong type, an amount of
+`1e999`, `Infinity` or `-Infinity`, one nested too deeply, and any other exception, each
+answered as `node_unreachable` (exit 4) with a fixed detail, never a traceback - while the
+detail of a failed request is chosen by the error's class alone (each class tested: an HTTP
+status without its reason phrase, `[Errno N] strerror` identical to main's text for connection
+refused, a DNS failure and a timeout, an SSL reason and verify message, the library's own
+reply text - shown in full at a path named `/api/node` - and the class name for `InvalidURL`
+and everything else), a node echoing the URL, a path segment or one value of it in a 401
+reason phrase never prints the key, a proxy refusing the tunnel with 407 or 403 prints its
+status code without its reason phrase, Python 3.12's `_ssl.c:NNN:`-prefixed timeouts keep
+their text, a `TypeError` from the transport is named as a failed request rather than a reply
+problem, an uppercase `HTTP://` is asked, a long `<urlopen error ...>` is cut at 200, a URL with a control character or both kinds of quote
+never prints it either, and two overlapping callers of the CLI in one process, or one that
+calls it again from inside `post_json`, leave the library's `post_json` as they found it;
 for `nano_terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
@@ -318,7 +402,8 @@ not-found on one node yielding to a found answer on another; and for the README 
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
-and a fixture fails any test that tries to open a socket.
+and a fixture fails any test that tries to open a socket; the skill-bundle CLI tests that
+need a real socket use a throwaway server on loopback.
 
 There is also a hand check that exercises the real `urllib` path against a throwaway HTTP
 node stub on loopback:
