@@ -220,6 +220,24 @@ def test_a_non_integer_amount_raises_value_error(node):
         verify(HASH, 10**24, ACCOUNT, URL)
 
 
+@pytest.mark.parametrize("amount, expect", [(1.9, 1), (0.5, 0), (1e24, 10**24), (True, 1), (False, 0)])
+def test_an_amount_that_is_not_raw_is_refused_not_truncated(node, amount, expect):
+    """int(1.9) is 1 and int(True) is 1: a JSON number or bool in `amount` would
+    have settled for an expectation of 1 raw on an amount nobody sent."""
+    node(block_info(amount=amount))
+
+    with pytest.raises(NotANodeReply) as caught:
+        verify(HASH, expect, ACCOUNT, URL)
+
+    assert "amount" in str(caught.value)
+
+
+def test_an_amount_sent_as_a_json_integer_is_still_read(node):
+    """A whole number is still raw; only a float or a bool is refused."""
+    node(block_info(amount=10**24))
+    assert verify(HASH, 10**24, ACCOUNT, URL).amount_raw == 10**24
+
+
 # --- raw is integer arithmetic, never float ------------------------------------
 
 

@@ -286,3 +286,74 @@ def test_an_int_and_a_float_deadline_are_both_still_accepted(node):
         node(reply())
         with pytest.raises(Late):
             verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+
+# --- a deadline that is a number, but not a finite int or float ---------------
+#
+# NaN compares False with everything, so `seen_at > NaN` was never true and a
+# payment seen an hour after a NaN deadline verified as on time; +inf is later
+# than every time and did the same. `json.loads` reads both from an order record
+# ("NaN", "Infinity"). And a Decimal from a database NUMERIC column or a numpy
+# number from a dataframe - deadlines that worked before #24 - was refused on
+# every call, holding every paid order.
+
+from decimal import Decimal  # noqa: E402
+from fractions import Fraction  # noqa: E402
+
+
+@pytest.mark.parametrize("deadline", [float("nan"), float("inf"), float("-inf"),
+                                      json.loads("NaN"), json.loads("Infinity"),
+                                      Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity")])
+def test_a_deadline_that_is_not_finite_is_refused_before_the_node_is_asked(node, deadline):
+    calls = node(reply())
+
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+    assert "finite" in str(caught.value)
+    assert calls == [], "no node was asked for a deadline that cannot decide a payment"
+
+
+def test_a_late_payment_never_passes_a_nan_deadline(node):
+    """The block was seen at SEEN; whatever the deadline, NaN must not settle it."""
+    node(reply())
+    settled = False
+    try:
+        settled = verify(HASH, RAW, ACCOUNT, URL, not_after=float("nan")).settled
+    except (OSError, ValueError):
+        pass
+    assert settled is False
+
+
+@pytest.mark.parametrize("kind", [Decimal, Fraction])
+def test_a_decimal_or_fraction_deadline_decides_like_its_value(node, kind):
+    node(reply())
+    receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=kind(SEEN + 60))
+    assert receipt.settled is True
+    assert json.loads(receipt.to_json())["not_after"] == SEEN + 60
+
+    node(reply())
+    assert verify(HASH, RAW, ACCOUNT, URL, not_after=kind(SEEN)).settled is True  # inclusive
+
+    # a fraction of a second before the moment it was seen is late, never rounded up
+    for deadline in (Decimal("1790150109.99999999999"), Fraction(SEEN * 10**12 - 1, 10**12)):
+        node(reply())
+        with pytest.raises(Late):
+            verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+
+
+def test_a_numpy_deadline_is_accepted_and_its_nan_refused(node):
+    numpy = pytest.importorskip("numpy")
+    for deadline in (numpy.int64(SEEN + 60), numpy.float64(SEEN + 60)):
+        node(reply())
+        receipt = verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+        assert receipt.settled is True
+        json.loads(receipt.to_json())  # a numpy number in the receipt would not serialise
+
+    node(reply())
+    with pytest.raises(Late):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.int64(SEEN - 1))
+
+    node(reply())
+    with pytest.raises(ValueError):
+        verify(HASH, RAW, ACCOUNT, URL, not_after=numpy.float64("nan"))

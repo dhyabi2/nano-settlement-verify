@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import numbers
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 __all__ = [
     "Receipt",
@@ -340,6 +343,75 @@ def _paid_account(reply: dict) -> str:
     )
 
 
+def _deadline(not_after: object) -> int | float:
+    """`not_after` as an int or a float verify can compare and the receipt can print.
+
+    A ValueError, in the family `parse_not_after` uses, for anything else - so a
+    seller catching `(OSError, ValueError)` around verify holds the call.
+
+    Refused: a bool, a string or any other non-number, and a number that is not
+    finite. NaN compares False with everything, so `seen_at > NaN` was never
+    true and a payment an hour late verified as on time; +inf did the same by
+    being later than every time. `json.loads` reads both from an order record
+    (`NaN`, `Infinity`), and the receipt then printed them as JSON no parser
+    must accept.
+
+    Accepted and converted: a deadline that is a number but not an int or a
+    float - a Decimal from a database NUMERIC column, a numpy.int64 or
+    numpy.float64 from a dataframe, a Fraction. Those were refused by #24 on
+    every call, holding every paid order. An integral type becomes an int, a
+    float subclass a float, and any other real (a Decimal, a Fraction) its
+    floor: seen_at is whole seconds and the check is `seen_at > not_after`, so
+    the floor decides every payment exactly as the value itself would, where
+    float() could round 1790150109.9999999999 up across the second.
+    """
+    if isinstance(not_after, bool) or not isinstance(not_after, (numbers.Real, Decimal)):
+        raise ValueError(
+            f"not_after must be unix seconds as an int or a float, got "
+            f"{type(not_after).__name__} ({not_after!r}); parse_not_after() reads "
+            f"a string deadline, in unix seconds or ISO-8601 with a UTC offset"
+        )
+    if isinstance(not_after, numbers.Integral):
+        return int(not_after)
+    if isinstance(not_after, Decimal):
+        finite = not_after.is_finite()
+    else:
+        try:
+            finite = math.isfinite(not_after)
+        except OverflowError:  # a Fraction too large for a float is still finite
+            finite = True
+    if not finite:
+        raise ValueError(
+            f"not_after must be a finite number of unix seconds, got {not_after!r}; "
+            f"a NaN or infinite deadline would let a late payment through as on time"
+        )
+    if isinstance(not_after, float):
+        return float(not_after)
+    return math.floor(not_after)
+
+
+def _raw_amount(reply: dict) -> int:
+    """The reply's `amount` as an int of raw, or NotANodeReply.
+
+    A node sends raw as a decimal string. int() of a JSON number 1.9 is 1, and
+    int() of a JSON `true` is 1, so a reply carrying either would have matched an
+    expectation of 1 raw and settled on an amount nobody sent. A float or a bool
+    is not raw; it is refused in the family a seller holds on, like any other
+    reply that is not a node's block_info answer. Everything else reaches int()
+    as before: a string that is not an integer raises ValueError, an infinite
+    float OverflowError and a list or an object TypeError, which the skill's
+    CLI already names as a number too large to read and a field of the wrong
+    type.
+    """
+    amount = _required(reply, "amount")
+    if isinstance(amount, bool) or (isinstance(amount, float) and math.isfinite(amount)):
+        raise NotANodeReply(
+            f"the reply's amount is {type(amount).__name__} ({amount!r}), not raw: "
+            f"a node sends raw as an integer string, and int() would read it as another number"
+        )
+    return int(amount)
+
+
 def verify(
     block_hash: str, expect_raw: int, account: str, rpc_url: str, not_after: int | None = None
 ) -> Receipt:
@@ -356,7 +428,7 @@ def verify(
 
     Raises TypeError when expect_raw is not an int, because raw is an integer
     and a float expectation cannot be compared to one safely, and ValueError
-    when not_after is neither None nor a number of unix seconds - both before
+    when not_after is neither None nor a finite number of unix seconds - both before
     the node is called. A string deadline goes through parse_not_after first.
 
     Raises NotANodeReply - a ValueError - when the endpoint answers with JSON
@@ -391,14 +463,8 @@ def verify(
     # A ValueError holds instead, in the family `parse_not_after` already uses
     # for a deadline it cannot read. A float is accepted: `time.time() + 300` is
     # the ordinary way to write one, and unlike raw, a time is not an amount.
-    if not_after is not None and (
-        isinstance(not_after, bool) or not isinstance(not_after, (int, float))
-    ):
-        raise ValueError(
-            f"not_after must be unix seconds as an int or a float, got "
-            f"{type(not_after).__name__} ({not_after!r}); parse_not_after() reads "
-            f"a string deadline, in unix seconds or ISO-8601 with a UTC offset"
-        )
+    if not_after is not None:
+        not_after = _deadline(not_after)
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
     # A node's block_info answer is a JSON object. Anything else is not an answer
     # about this block, and it must not become one: the test below is `in`, which
@@ -428,7 +494,7 @@ def verify(
     if _required(reply, "confirmed") != "true":
         return Receipt(settled=False, amount_raw=0, height=0, account="")
     # raw is an integer string; never parse it as a float
-    amount = int(_required(reply, "amount"))
+    amount = _raw_amount(reply)
     if amount != expect_raw:
         raise Mismatch(amount, expect_raw)
     # Only a send pays anyone. A receive or an open block sits on the account that
