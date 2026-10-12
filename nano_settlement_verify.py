@@ -419,10 +419,15 @@ _DEADLINE_BOUND = 2**63
 
 
 def _within_deadline_bound(not_after: object) -> None:
-    """ValueError for a finite deadline beyond 2**63 seconds either side of 1970."""
+    """ValueError for a finite deadline beyond 2**63 seconds either side of 1970.
+
+    The message names the type, not the value: repr() of an int past 4300 digits
+    itself raises ValueError, which would hide this one.
+    """
     if not -_DEADLINE_BOUND <= not_after <= _DEADLINE_BOUND:  # no abs(): it rounds a Decimal
         raise ValueError(
-            f"not_after must be within 2**63 unix seconds of 1970, got {not_after!r}"
+            f"not_after must be within 2**63 unix seconds of 1970, got a "
+            f"{type(not_after).__name__} beyond that; pass None for no deadline"
         )
 
 

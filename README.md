@@ -205,6 +205,16 @@ would, and `1790150109.9999999` is never rounded up across the second. These rai
 (`float32`, `float16` - too coarse to hold a unix time to the second), and anything beyond
 2\*\*63 seconds either side of 1970.
 
+**Changes from the previous release.** Code that relied on the old behaviour sees these:
+
+- A deadline beyond 2\*\*63 seconds - such as a huge "never expires" sentinel like `1e300` -
+  now raises `ValueError` instead of settling. Pass `None` for no deadline.
+- A `-inf` deadline now raises `ValueError` instead of `Late`.
+- A reply whose `amount` is a float or a bool - including an integral float like `1000.0` -
+  is now `NotANodeReply` instead of being read as raw.
+- `Receipt.not_after` and `Late.not_after` are now a plain `int` or `float`: an `IntEnum` or
+  a float subclass passed as the deadline comes back as the plain type. The JSON is unchanged.
+
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
 
@@ -359,7 +369,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-604 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+607 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

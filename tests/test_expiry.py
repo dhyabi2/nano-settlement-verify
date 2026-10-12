@@ -412,3 +412,17 @@ def test_a_deadline_at_2_63_seconds_is_still_a_deadline(node):
     node(reply())
     with pytest.raises(Late):
         verify(HASH, RAW, ACCOUNT, URL, not_after=-(2**63))
+
+
+@pytest.mark.parametrize("deadline", [10**5000, -(10**5000), Decimal("1E+1000000")],
+                         ids=["10**5000", "-10**5000", "Decimal-1E+1000000"])
+def test_a_huge_deadline_is_refused_with_a_message_that_renders(node, deadline):
+    """repr() of 10**5000 raises its own ValueError past 4300 digits; the refusal must not."""
+    calls = node(reply())
+    with pytest.raises(ValueError) as caught:
+        verify(HASH, RAW, ACCOUNT, URL, not_after=deadline)
+    assert str(caught.value) == (
+        f"not_after must be within 2**63 unix seconds of 1970, got a "
+        f"{type(deadline).__name__} beyond that; pass None for no deadline"
+    )
+    assert calls == []
