@@ -313,13 +313,19 @@ def verify_corroborated(
 def _figure_of_raw(reply: dict, field: str) -> int:
     """`reply[field]` as an int of raw, or NotANodeReply.
 
-    The same rule `nano_settlement_verify._raw_amount` applies to a block's
-    `amount`, applied here to a balance. A node sends raw as a decimal string.
+    The rule `nano_payers._int_field` applies to a history row's `amount`,
+    applied here to a balance: a string of ASCII digits, or an int that is not
+    a bool and not negative. It is stricter than
+    `nano_settlement_verify._raw_amount`, which lets an infinite float through
+    to int() and its OverflowError; here every float is refused, so that one
+    is a failed endpoint like the rest. A node sends raw as a decimal string.
     `int()` of the JSON float 1e30 is 1000000000000000019884624838656 - the
     float cannot represent 10**30, so the figure comes back 19884624838656 raw
     ABOVE the real balance, and a balance read too high is the dangerous
     direction: it says an account can cover a price it cannot. `int()` of the
     JSON `true` is 1. Neither is raw, so neither is a figure to corroborate.
+    `int()` also reads "-5", "1_000", " 7 ", "+9" and an Arabic-Indic
+    digit; a node sends none of them, so none is read.
 
     The test next to this one is named "a balance comes back as integers of raw
     not as strings" and its comment already names the 19884624838656-raw error,
@@ -335,7 +341,14 @@ def _figure_of_raw(reply: dict, field: str) -> int:
             "string, and int() would read it as another number"
             % (field, type(value).__name__, value)
         )
-    return int(value)
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise nano_settlement_verify.NotANodeReply(
+        "the reply's %s is %r, not raw: a node sends raw as a string of digits"
+        % (field, value)
+    )
 
 
 def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
@@ -388,7 +401,7 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
                     "node's account_info reply and says nothing about this balance"
                     % type(reply).__name__
                 )
-            if "error" in reply:
+            if reply.get("error") == "Account not found":
                 # An unopened account is not a failure to read; it is a balance
                 # of nothing, and two nodes can agree on that. The check has to
                 # come first: a node answering "Account not found" sends a
@@ -396,6 +409,18 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
                 # before the error would turn an unknown account into a real
                 # zero without saying so.
                 figure = (0, 0)
+            elif "error" in reply:
+                # Any other error - "Rate limit exceeded", "Invalid API key" -
+                # is an endpoint that did not answer, not an unopened account:
+                # read as (0, 0), two of them corroborated a balance of nothing
+                # for an account that may hold a fortune. `nano_claim._opened`
+                # draws the same line. An `error` key that is null or empty
+                # next to figures is refused too: a node's account_info reply
+                # carries no `error` key at all, so this one is not a node's.
+                raise nano_settlement_verify.NotANodeReply(
+                    "the endpoint answered error %r, so it said nothing about "
+                    "this balance" % (reply["error"],)
+                )
             else:
                 # Only the CONFIRMED figures, and no falling back to `balance`.
                 # A node that ignores `include_confirmed` answers with `balance`

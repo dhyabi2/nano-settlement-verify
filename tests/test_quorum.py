@@ -453,6 +453,61 @@ def test_an_account_not_found_reply_is_zero_even_though_it_carries_a_balance(mon
     assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param({"error": "Rate limit exceeded"}, id="a rate-limit object"),
+        pytest.param({"error": "Invalid API key"}, id="an API-key refusal"),
+        pytest.param({"error": "Unable to parse JSON"}, id="a node refusing the request"),
+        pytest.param({"error": None, "confirmed_balance": "5", "confirmed_receivable": "0"},
+                     id="error null alongside figures"),
+        pytest.param({"error": ""}, id="an empty error"),
+    ],
+)
+def test_an_error_other_than_account_not_found_counts_as_failed_not_as_zero(
+    monkeypatch, reply
+):
+    """Only "Account not found" is a balance of nothing; `nano_claim._opened`
+    reads it the same way. Any other `error` is an endpoint that did not answer
+    the question: two rate-limited endpoints corroborated a balance of nothing
+    for an account that may hold a fortune. An `error` key of null next to
+    figures is not a node's account_info reply either, so it is not read."""
+    nodes(monkeypatch, {A: reply, B: reply})
+    with pytest.raises(NotCorroborated) as caught:
+        balance_corroborated(PAYEE, [A, B])
+    assert "NotANodeReply" in caught.value.failures[A]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("-5", id="a negative string"),
+        pytest.param(-5, id="a negative integer"),
+        pytest.param("1_000", id="underscores"),
+        pytest.param(" 7 ", id="surrounding whitespace"),
+        pytest.param("+9", id="a plus sign"),
+        pytest.param("٣", id="an Arabic-Indic digit"),
+        pytest.param("", id="an empty string"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="a list"),
+    ],
+)
+def test_a_balance_that_is_not_a_digit_string_is_refused(monkeypatch, value):
+    """`int()` reads all of these; a node sends none of them. `nano_payers`
+    refuses them in a history row's amount, and a balance gets the same rule."""
+    reply = {"confirmed_balance": value, "confirmed_receivable": "0"}
+    nodes(monkeypatch, {A: reply, B: reply})
+    with pytest.raises(NotCorroborated) as caught:
+        balance_corroborated(PAYEE, [A, B])
+    assert "NotANodeReply" in caught.value.failures[A]
+
+
+def test_a_balance_sent_as_a_json_integer_is_still_read(monkeypatch):
+    reply = {"confirmed_balance": ONE_XNO, "confirmed_receivable": 0}
+    nodes(monkeypatch, {A: reply, B: reply})
+    assert balance_corroborated(PAYEE, [A, B]) == (ONE_XNO, 0)
+
+
 # --- one broken proxy must not override a node that read the ledger -----------
 
 
