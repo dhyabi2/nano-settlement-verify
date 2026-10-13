@@ -313,9 +313,10 @@ def verify_corroborated(
 def _figure_of_raw(reply: dict, field: str) -> int:
     """`reply[field]` as an int of raw, or NotANodeReply.
 
-    The rule `nano_payers._int_field` applies to a history row's `amount`,
-    applied here to a balance: a string of ASCII digits, or an int that is not
-    a bool and not negative. It is stricter than
+    The rule `nano_payers._int_field` aims at for a history row's `amount`,
+    made ASCII-only and applied here to a balance: a string of ASCII digits,
+    or an int that is not a bool and not negative. (`_int_field` tests
+    `isdigit()` alone, which also passes an Arabic-Indic digit; this does not.) It is stricter than
     `nano_settlement_verify._raw_amount`, which lets an infinite float through
     to int() and its OverflowError; here every float is refused, so that one
     is a failed endpoint like the rest. A node sends raw as a decimal string.
@@ -367,9 +368,25 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
     here. That is the intended outcome and the remedy is to ask again, not to
     take the larger number.
 
+    Any node error other than "Account not found" counts as a failed endpoint,
+    a figure that is not an ASCII digit string or a plain non-negative JSON
+    integer is refused, and a malformed address raises `ValueError`.
+
     Raises `Disagreement` when two endpoints report different confirmed figures,
     and `NotCorroborated` when fewer than `agree` endpoints answer.
+    Raises `ValueError`, before any endpoint is called, when `account` is not a
+    Nano address with a valid checksum.
     """
+    if not nano_settlement_verify.is_valid_account(account):
+        # Checked before the first call, and raised as the caller's own error
+        # rather than as NotCorroborated. A node answers a mistyped address
+        # with "Bad account number", which the loop below would count as a
+        # failed endpoint; NotCorroborated tells the caller to ask again, and
+        # asking again about an address that cannot exist never ends.
+        raise ValueError(
+            "account %r is not a Nano address: it needs a nano_ or xrb_ prefix "
+            "and a valid checksum" % (account,)
+        )
     endpoints = distinct_endpoints(rpc_urls, agree=agree)
     post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
     payload = {

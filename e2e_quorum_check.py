@@ -25,7 +25,7 @@ from nano_quorum import (
 )
 from nano_settlement_verify import Mismatch
 
-SELLER = "nano_3abc"
+SELLER = "nano_3pmhddz8g4gxhcqwxw68paibs89wb1o7bqgc6twyfkz1a37puf88pa9stsp8"
 PAYER = "nano_3payer"
 PAID = 10**24
 

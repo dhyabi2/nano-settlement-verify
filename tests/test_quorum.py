@@ -32,6 +32,8 @@ C = "http://127.0.0.1:7073"
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
 PAYEE = "nano_1payee"
+# balance_corroborated checks the address before any call, so it needs a real one.
+HOLDER = "nano_3pmhddz8g4gxhcqwxw68paibs89wb1o7bqgc6twyfkz1a37puf88pa9stsp8"
 ONE_XNO = 10**30
 
 
@@ -330,12 +332,12 @@ def info(balance, receivable=0):
 
 def test_two_nodes_agreeing_on_a_confirmed_balance(monkeypatch):
     nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO, 5)})
-    assert balance_corroborated(PAYEE, [A, B]) == (ONE_XNO, 5)
+    assert balance_corroborated(HOLDER, [A, B]) == (ONE_XNO, 5)
 
 
 def test_a_balance_comes_back_as_integers_of_raw_not_as_strings(monkeypatch):
     nodes(monkeypatch, {A: info(ONE_XNO), B: info(ONE_XNO)})
-    balance, receivable = balance_corroborated(PAYEE, [A, B])
+    balance, receivable = balance_corroborated(HOLDER, [A, B])
     assert isinstance(balance, int) and isinstance(receivable, int)
     assert balance == ONE_XNO  # not 1e30, which is 19884624838656 raw short
 
@@ -343,12 +345,12 @@ def test_a_balance_comes_back_as_integers_of_raw_not_as_strings(monkeypatch):
 def test_two_nodes_reporting_different_confirmed_balances_disagree(monkeypatch):
     nodes(monkeypatch, {A: info(ONE_XNO), B: info(ONE_XNO - 1)})
     with pytest.raises(Disagreement):
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
 
 
 def test_an_account_neither_node_has_seen_opened_is_a_balance_of_nothing(monkeypatch):
     nodes(monkeypatch, {A: {"error": "Account not found"}, B: {"error": "Account not found"}})
-    assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
+    assert balance_corroborated(HOLDER, [A, B]) == (0, 0)
 
 
 @pytest.mark.parametrize(
@@ -379,7 +381,7 @@ def test_a_reply_that_is_not_a_json_object_counts_as_failed_not_as_a_zero_balanc
     """
     nodes(monkeypatch, {A: reply, B: reply})
     with pytest.raises(NotCorroborated):
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
 
 
 @pytest.mark.parametrize(
@@ -406,7 +408,7 @@ def test_a_balance_that_is_a_json_number_is_refused_not_rounded(monkeypatch, val
     reply = {"confirmed_balance": value, "confirmed_receivable": "0"}
     nodes(monkeypatch, {A: reply, B: reply})
     with pytest.raises(NotCorroborated):
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
 
 
 def test_a_receivable_that_is_a_json_number_is_refused_too(monkeypatch):
@@ -414,20 +416,20 @@ def test_a_receivable_that_is_a_json_number_is_refused_too(monkeypatch):
     reply = {"confirmed_balance": str(ONE_XNO), "confirmed_receivable": 1e30}
     nodes(monkeypatch, {A: reply, B: reply})
     with pytest.raises(NotCorroborated):
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
 
 
 def test_an_error_envelope_from_a_real_node_is_still_a_balance_of_nothing(monkeypatch):
     """The guard above must not take the unopened-account branch away: a node's
     own `{"error": ...}` object is still two nodes agreeing on nothing."""
     nodes(monkeypatch, {A: {"error": "Account not found"}, B: {"error": "Account not found"}})
-    assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
+    assert balance_corroborated(HOLDER, [A, B]) == (0, 0)
 
 
 def test_a_balance_one_endpoint_short_is_not_corroborated(monkeypatch):
     nodes(monkeypatch, {A: OSError("refused"), B: info(ONE_XNO)})
     with pytest.raises(NotCorroborated):
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
 
 
 def test_the_default_agreement_is_two(monkeypatch):
@@ -442,7 +444,7 @@ def test_a_node_that_ignores_include_confirmed_has_not_answered(monkeypatch):
     """
     nodes(monkeypatch, {A: {"balance": str(ONE_XNO)}, B: info(ONE_XNO)})
     with pytest.raises(NotCorroborated) as caught:
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
     assert "KeyError" in caught.value.failures[A]
 
 
@@ -450,7 +452,7 @@ def test_an_account_not_found_reply_is_zero_even_though_it_carries_a_balance(mon
     """A real node answers `{"error": "Account not found", "balance": "0"}`."""
     not_found = {"error": "Account not found", "balance": "0"}
     nodes(monkeypatch, {A: not_found, B: not_found})
-    assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
+    assert balance_corroborated(HOLDER, [A, B]) == (0, 0)
 
 
 @pytest.mark.parametrize(
@@ -474,7 +476,7 @@ def test_an_error_other_than_account_not_found_counts_as_failed_not_as_zero(
     figures is not a node's account_info reply either, so it is not read."""
     nodes(monkeypatch, {A: reply, B: reply})
     with pytest.raises(NotCorroborated) as caught:
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
     assert "NotANodeReply" in caught.value.failures[A]
 
 
@@ -493,19 +495,54 @@ def test_an_error_other_than_account_not_found_counts_as_failed_not_as_zero(
     ],
 )
 def test_a_balance_that_is_not_a_digit_string_is_refused(monkeypatch, value):
-    """`int()` reads all of these; a node sends none of them. `nano_payers`
-    refuses them in a history row's amount, and a balance gets the same rule."""
+    """`int()` reads all of these; a node sends none of them. This is the rule
+    `nano_payers._int_field` aims at for a history row's amount, made
+    ASCII-only: `_int_field` uses `isdigit()` alone, so it would pass the
+    Arabic-Indic digit that a balance here refuses."""
     reply = {"confirmed_balance": value, "confirmed_receivable": "0"}
     nodes(monkeypatch, {A: reply, B: reply})
     with pytest.raises(NotCorroborated) as caught:
-        balance_corroborated(PAYEE, [A, B])
+        balance_corroborated(HOLDER, [A, B])
     assert "NotANodeReply" in caught.value.failures[A]
 
 
 def test_a_balance_sent_as_a_json_integer_is_still_read(monkeypatch):
     reply = {"confirmed_balance": ONE_XNO, "confirmed_receivable": 0}
     nodes(monkeypatch, {A: reply, B: reply})
-    assert balance_corroborated(PAYEE, [A, B]) == (ONE_XNO, 0)
+    assert balance_corroborated(HOLDER, [A, B]) == (ONE_XNO, 0)
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        pytest.param("nano_1payee", id="truncated"),
+        pytest.param(HOLDER[:-1] + ("9" if HOLDER[-1] != "9" else "8"), id="a bad checksum"),
+        pytest.param("bc1qexample", id="no nano prefix"),
+        pytest.param("", id="empty"),
+        pytest.param(None, id="not a string"),
+    ],
+)
+def test_a_malformed_address_is_the_callers_error_and_no_node_is_asked(
+    monkeypatch, account
+):
+    """A node answers a mistyped address with "Bad account number". Counted as
+    a failed endpoint that would be NotCorroborated, which says "ask again" -
+    forever, for an address that cannot exist. It is a ValueError instead."""
+    bad = {"error": "Bad account number"}
+    called = nodes(monkeypatch, {A: bad, B: bad})
+    with pytest.raises(ValueError, match="not a Nano address") as caught:
+        balance_corroborated(account, [A, B])
+    assert not isinstance(caught.value, NotCorroborated)
+    assert called == []
+
+
+def test_a_valid_unopened_address_still_reads_as_nothing(monkeypatch):
+    called = nodes(
+        monkeypatch,
+        {A: {"error": "Account not found"}, B: {"error": "Account not found"}},
+    )
+    assert balance_corroborated(HOLDER, [A, B]) == (0, 0)
+    assert called == [A, B]
 
 
 # --- one broken proxy must not override a node that read the ledger -----------
