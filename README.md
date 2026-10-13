@@ -214,6 +214,9 @@ would, and `1790150109.9999999` is never rounded up across the second. These rai
   is now `NotANodeReply` instead of being read as raw.
 - `Receipt.not_after` and `Late.not_after` are now a plain `int` or `float`: an `IntEnum` or
   a float subclass passed as the deadline comes back as the plain type. The JSON is unchanged.
+- In `balance_corroborated`, any node error other than `"Account not found"` now counts as a
+  failed endpoint, a figure that is not an ASCII digit string or a plain non-negative JSON
+  integer is refused, and a malformed address raises `ValueError` before any node is asked.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -369,7 +372,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-619 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+640 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -415,8 +418,10 @@ endpoint can say nothing - including, for `balance_corroborated`, which reads a 
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring
 test, so a proxy body carrying the word `error` used to corroborate a balance of
-nothing), a node's own `error` object still read as a balance of nothing, and a balance
-or receivable sent as a JSON number refused rather than put through `int()`, which
+nothing), a node's "Account not found" still read as a balance of nothing while any other
+`error` (a rate limit, a refused API key, an `error` of null) counts as failed, and a balance
+or receivable sent as a JSON number, or as a string `int()` reads but a node never sends
+("-5", "1_000", " 7 ", "+9"), refused rather than put through `int()`, which
 reads 1e30 as 19884624838656 raw above one XNO and an infinite one as an
 `OverflowError` outside the family a caller catches; for `nano_payers`, both x402 document shapes, every refusal in
 the payee table, and what the payer count will not include - an unconfirmed receive, the
