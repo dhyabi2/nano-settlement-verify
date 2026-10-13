@@ -351,6 +351,79 @@ def test_an_account_neither_node_has_seen_opened_is_a_balance_of_nothing(monkeyp
     assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param("error", id="the bare string 'error'"),
+        pytest.param("no error here", id="a status page mentioning the word error"),
+        pytest.param("rate limit error: slow down", id="a rate-limit envelope"),
+        pytest.param(["error"], id="a JSON array containing 'error'"),
+        pytest.param(7, id="a bare number"),
+        pytest.param("maintenance", id="a maintenance page"),
+    ],
+)
+def test_a_reply_that_is_not_a_json_object_counts_as_failed_not_as_a_zero_balance(
+    monkeypatch, reply
+):
+    """README.md: "An endpoint whose reply is not a JSON object (a proxy's
+    `"error"`, a bare number) is silence too: it counts as failed, not as
+    answered."
+
+    `verify` was given this refusal by #27; this function reads a reply
+    directly and was not. `"error" in reply` on a string is a SUBSTRING test,
+    so every proxy body carrying the word took the unopened-account branch and
+    counted as an endpoint reporting a confirmed balance of nothing. Two of
+    them corroborated a balance of nothing for an account that may hold a
+    fortune - the worst possible direction for a seller deciding whether a
+    buyer can pay.
+    """
+    nodes(monkeypatch, {A: reply, B: reply})
+    with pytest.raises(NotCorroborated):
+        balance_corroborated(PAYEE, [A, B])
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(1e30, id="a JSON float that cannot represent 10**30"),
+        pytest.param(True, id="the JSON true"),
+        pytest.param(float("inf"), id="an infinite JSON number"),
+        pytest.param(float("nan"), id="a NaN JSON number"),
+    ],
+)
+def test_a_balance_that_is_a_json_number_is_refused_not_rounded(monkeypatch, value):
+    """A node sends raw as a decimal string. `int(1e30)` is
+    1000000000000000019884624838656 - 19884624838656 raw ABOVE one XNO, because
+    no float represents 10**30 - and a balance read too high says an account
+    can cover a price it cannot. `int(True)` is 1.
+
+    The infinite case is also a crash: `int(float("inf"))` raises
+    OverflowError, which is NOT a ValueError and so is not in `_UNREADABLE`.
+    On main it escaped the `(OSError, ValueError)` family README.md tells a
+    caller to catch, out of a function whose whole contract is to raise
+    `NotCorroborated` or `Disagreement`.
+    """
+    reply = {"confirmed_balance": value, "confirmed_receivable": "0"}
+    nodes(monkeypatch, {A: reply, B: reply})
+    with pytest.raises(NotCorroborated):
+        balance_corroborated(PAYEE, [A, B])
+
+
+def test_a_receivable_that_is_a_json_number_is_refused_too(monkeypatch):
+    """Both figures are money; the receivable gets the same rule."""
+    reply = {"confirmed_balance": str(ONE_XNO), "confirmed_receivable": 1e30}
+    nodes(monkeypatch, {A: reply, B: reply})
+    with pytest.raises(NotCorroborated):
+        balance_corroborated(PAYEE, [A, B])
+
+
+def test_an_error_envelope_from_a_real_node_is_still_a_balance_of_nothing(monkeypatch):
+    """The guard above must not take the unopened-account branch away: a node's
+    own `{"error": ...}` object is still two nodes agreeing on nothing."""
+    nodes(monkeypatch, {A: {"error": "Account not found"}, B: {"error": "Account not found"}})
+    assert balance_corroborated(PAYEE, [A, B]) == (0, 0)
+
+
 def test_a_balance_one_endpoint_short_is_not_corroborated(monkeypatch):
     nodes(monkeypatch, {A: OSError("refused"), B: info(ONE_XNO)})
     with pytest.raises(NotCorroborated):
