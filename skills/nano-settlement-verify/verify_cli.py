@@ -4,6 +4,8 @@
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
+With neither set, a default that refuses (HTTP 403, 429, 5xx) or cannot be reached is
+followed by the built-in nodes in order; the verdict names the node asked in "rpc_url".
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
 as %40; credentials are never sent, and %40 or %3A in the host part counts as one), no
 control character, a host of ASCII letters, digits, '-', '.' and '_' or an IP address (no
@@ -53,6 +55,25 @@ def _take_not_after(argv):
 
 
 DEFAULT_RPC_URL = "https://rpc.nano.to"
+
+# Public nodes asked, in order, after DEFAULT_RPC_URL - and only when the
+# operator named no node at all (no RPC_URL argument, no NANO_RPC_URL). An agent
+# reported on 2026-10-13 that rpc.nano.to answered its host with 403 while the
+# block itself was fine; the default being down for one host should not mean
+# nothing can be checked. A node is added here only after it has been seen to
+# answer a block_info POST for a known block correctly. Checked 2026-10-13
+# 16:29Z from the sandbox this change was written in: rpc.nano.to answered;
+# nanoslo.0x.no/proxy, proxy.nanos.cc/proxy, node.somenano.com/proxy,
+# rainstorm.city/api and app.natrium.io/api could not be reached from there at
+# all (its egress proxy refused the tunnel), so none of them was checked and
+# none is listed yet.
+FALLBACK_RPC_URLS = ()
+
+# HTTP statuses after which the next built-in node is asked: the node refused
+# this host (403), rate-limited it (429) or failed itself (5xx). Any other
+# status, and every reply the node did send, ends the walk.
+_TRY_NEXT_STATUSES = frozenset({403, 429}) | frozenset(range(500, 600))
+ALL_NODES_FAILED = "every built-in node failed; set NANO_RPC_URL to a node you trust"
 
 # Three refusals for the RPC URL, made before anything is sent. Their details are
 # fixed strings and never quote the URL: urllib's own messages echo pieces of it
@@ -396,6 +417,70 @@ def _rpc_url_from_env():
     return (os.environ.get("NANO_RPC_URL") or "").strip() or DEFAULT_RPC_URL
 
 
+def _may_try_next(error):
+    """True when error says the node refused or never answered, not what it holds.
+
+    An HTTP 403, 429 or 5xx, or a connection, DNS or timeout failure. A reply
+    the node did send - a verdict, an error body, a page that is not a node
+    reply - is never a reason to ask another node, and neither is a TLS
+    failure, which is not the node being down.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in _TRY_NEXT_STATUSES
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, (ssl.SSLError, _RequestTypeError)):
+        return False
+    return isinstance(error, OSError)
+
+
+class _Route:
+    """Which node verify asks, and what the printed verdict says about it.
+
+    With a node the operator named, that node is the only one asked, and say()
+    prints exactly what main always printed: the URL may carry a key, so it is
+    never echoed. With none named, the built-in nodes are asked in order while
+    each refuses or does not answer (_may_try_next), and say() adds "rpc_url",
+    the node whose answer - or final failure - is printed, and
+    "failed_rpc_urls", the built-in nodes that failed before it and why. The
+    first node that answers decides: whatever it says is final, and no other
+    node is asked for a different answer.
+    """
+
+    def __init__(self, rpc_url, builtin):
+        self.builtin = builtin
+        self.nodes = [rpc_url]
+        if builtin:
+            self.nodes += [u for u in FALLBACK_RPC_URLS if u != rpc_url]
+        self.asked = rpc_url
+        self.failed = []
+
+    def verify(self, **arguments):
+        for index, node in enumerate(self.nodes):
+            self.asked = node
+            try:
+                return _verify_objects_only(rpc_url=node, **arguments)
+            except Exception as error:  # noqa: BLE001 - re-raised unless the next node is asked
+                if index + 1 < len(self.nodes) and _may_try_next(error):
+                    self.failed.append({"rpc_url": node, "detail": _error_detail(error)})
+                    continue
+                if self.failed and _may_try_next(error):
+                    self.failed.append({"rpc_url": node, "detail": _error_detail(error)})
+                raise
+        raise AssertionError("unreachable: the node list is never empty")
+
+    def say(self, verdict):
+        if self.builtin:
+            if len(self.failed) == len(self.nodes) > 1:
+                verdict = {"verdict": "node_unreachable", "detail": ALL_NODES_FAILED,
+                           "failed_rpc_urls": self.failed}
+            else:
+                verdict = dict(verdict, rpc_url=self.asked)
+                if self.failed:
+                    verdict["failed_rpc_urls"] = self.failed
+        print(json.dumps(verdict))
+
+
 def main(argv):
     argv, not_after_text = _take_not_after(argv)
     not_after = None
@@ -435,38 +520,45 @@ def main(argv):
     # is asked as written without the space; a blank argument stays blank and
     # is refused below, never replaced by the variable or the default.
     rpc_url = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
+    # A node the operator named - argument or variable - is the only node asked,
+    # and its URL is never printed: it may carry a key. With nothing named, the
+    # built-in nodes are asked in order while each refuses or does not answer,
+    # and the verdict names the one that answered. The first node that answers
+    # decides: a verdict from it is final, whatever it says.
+    builtin = len(argv) == 4 and not (os.environ.get("NANO_RPC_URL") or "").strip()
     refused = _refuse_rpc_url(rpc_url)
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
         return 4
+    route = _Route(rpc_url, builtin)
     try:
-        receipt = _verify_objects_only(block_hash=block_hash, expect_raw=expect_raw,
-                                       account=account, rpc_url=rpc_url, not_after=not_after)
+        receipt = route.verify(block_hash=block_hash, expect_raw=expect_raw,
+                               account=account, not_after=not_after)
     except Late as error:
-        print(json.dumps({"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
-                          "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}))
+        route.say({"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE})
         return 5
     except UnknownTime as error:
-        print(json.dumps({"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
-                          "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}))
+        route.say({"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE})
         return 6
     except NotFound:
-        print(json.dumps({"verdict": "no_such_block"}))
+        route.say({"verdict": "no_such_block"})
         return 3
     except Mismatch as error:
-        print(json.dumps({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}))
+        route.say({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)})
         return 3
     except _RequestTypeError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR}))
+        route.say({"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR})
         return 4
     except _NotAnObject:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}))
+        route.say({"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT})
         return 4
     except TypeError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}))
+        route.say({"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE})
         return 4
     except RecursionError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}))
+        route.say({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP})
         return 4
     except (OSError, ValueError, http.client.HTTPException) as error:
         # ValueError stays here: the library's NotANodeReply is one, and its
@@ -476,21 +568,21 @@ def main(argv):
         # ValueError and used to escape as a traceback with exit 1. A URL the
         # node cannot be reached at is still "nothing was checked".
         # _error_detail decides the text by the error's class alone.
-        print(json.dumps({"verdict": "node_unreachable", "detail": _error_detail(error)}))
+        route.say({"verdict": "node_unreachable", "detail": _error_detail(error)})
         return 4
     except OverflowError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}))
+        route.say({"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE})
         return 4
     except MemoryError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}))
+        route.say({"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE})
         return 4
     except Exception as error:  # noqa: BLE001 - no reply may end in a traceback
         # Whatever else a node's reply makes the library raise, nothing was
         # checked: exit 4, never a traceback with exit 1, which SKILL.md's
         # table has no row for. The detail names the class only.
-        print(json.dumps({"verdict": "node_unreachable", "detail": _reply_not_checked(error)}))
+        route.say({"verdict": "node_unreachable", "detail": _reply_not_checked(error)})
         return 4
-    print(receipt.to_json())
+    route.say(json.loads(receipt.to_json()))
     return 0 if receipt.settled else 2
 
 
