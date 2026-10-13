@@ -42,10 +42,17 @@ dependencies.
 The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
 `$NANO_RPC_URL` when no `RPC_URL` argument is given - so if you export that variable for
 another tool, the CLI's verifications go there too; an empty or blank value means the
-default, `https://rpc.nano.to`. With no node named, a default node that refuses
-(HTTP 403, 429, 5xx) or cannot be reached is followed by the CLI's built-in public nodes in
-order, and the verdict names the node that answered in `rpc_url`; a node you name is never
-replaced, and the first node that answers decides. The CLI asks only `http` and `https` URLs, and refuses any
+default, `https://rpc.nano.to`. The CLI has a fallback mechanism for when no node is named
+(a default that refuses with HTTP 403 or 5xx, or cannot be reached, would be followed by
+built-in fallback nodes in order), but its built-in list is currently empty: today a refused
+default node gives `node_unreachable` (exit 4), and that one verdict - the default node,
+nothing named, a 403, 429, 5xx or connection failure - carries an extra `hint` key saying to
+set `NANO_RPC_URL` to a node you trust. Every other output with only the default node asked is
+unchanged. If fallback nodes are ever listed, they must be nodes as trusted as the default: a
+verdict a fallback node gave, positive ones included, carries `rpc_url` (the node that
+answered) and `failed_rpc_urls`, so it can be told apart from the default's. A 429 never moves
+on to another node, a node you name is never replaced, and the first node that answers
+decides. The CLI asks only `http` and `https` URLs, and refuses any
 URL containing an `@` anywhere - so a URL with credentials (`http://user:password@host/`) is
 never sent, and is reported as `node_unreachable` (exit 4) with a fixed message that quotes no
 part of it. An `@` that belongs in a path or query is written `%40`
@@ -375,7 +382,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-645 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+649 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

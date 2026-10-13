@@ -186,10 +186,8 @@ def run_cli(body, *args):
 def test_cli_old_three_argument_form_is_unchanged():
     done = run_cli(reply(), HASH, AMOUNT, ACCOUNT)
     assert done.returncode == 0, done.stderr
-    # The one addition: with no RPC URL named, the verdict names the node asked.
     assert json.loads(done.stdout) == {
         "settled": True, "amount_raw": int(AMOUNT), "height": 42, "account": ACCOUNT,
-        "rpc_url": "https://rpc.nano.to",
     }
 
 

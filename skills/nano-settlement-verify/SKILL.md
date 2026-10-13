@@ -37,10 +37,12 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   `https://rpc.nano.to`. The argument wins over the variable, so a per-call endpoint
   overrides the operator's default. An empty or blank `NANO_RPC_URL` counts as unset, and
   whitespace around the URL is ignored.
-  With no node named at all, the verdict carries `rpc_url`, the node that answered; if the
-  default node refuses (HTTP 403, 429, 5xx) or cannot be reached, the CLI asks the next
-  built-in public node, lists the ones that failed in `failed_rpc_urls`, and never asks
-  another node once one has answered. A node you name is the only node asked.
+  With no node named at all, a default node that refuses (HTTP 403, 5xx) or cannot be
+  reached would be followed by built-in fallback nodes - but that list is currently empty,
+  so a refused or rate-limited (429) default gives `node_unreachable` (exit 4) with an extra
+  `hint` key: set `NANO_RPC_URL` to a node you trust. Any verdict a fallback node gives
+  (positive ones included) carries `rpc_url` and `failed_rpc_urls`; a verdict from the
+  default node carries neither. A node you name is the only node asked.
   The URL must be `http` or `https` and must not contain an `@` anywhere: a URL with
   credentials (`http://user:password@host/`), with an `@` in its path or query, of any
   other scheme (`file://`, `ftp://`, none), with a port that is not a number from 0 to

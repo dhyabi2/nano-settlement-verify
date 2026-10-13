@@ -3,9 +3,11 @@
 Reported 2026-10-13 by an agent that ran the documented three-argument command:
 `rpc.nano.to` answered its host with 403, the block was fine, and the CLI had
 nowhere else to look. With no RPC URL named (no argument, no NANO_RPC_URL), the
-CLI now asks the built-in nodes in order while each refuses (403, 429, 5xx) or
-never answers, and names the node that answered. A node the operator named is
-still the only node asked, and the first node that answers decides.
+CLI asks the built-in fallback nodes in order while each refuses (403, 5xx) or
+never answers, and names the node that answered. That list is empty today, so
+these tests patch two nodes in. A node the operator named is still the only
+node asked, the first node that answers decides, a 429 is not a refusal, and
+when the default node gave the answer the output is exactly main's.
 
 The CLI runs as an agent runs it, from inside the skill directory, with
 `post_json` replaced by a stub keyed by URL, so no socket is opened.
@@ -59,6 +61,7 @@ sys.exit(code)
 """ % (FIRST, SECOND)
 
 HTTP_403 = {"raise": "urllib.error.HTTPError(rpc_url, 403, 'Forbidden', {}, None)"}
+HTTP_429 = {"raise": "urllib.error.HTTPError(rpc_url, 429, 'Too Many Requests', {}, None)"}
 HTTP_503 = {"raise": "urllib.error.HTTPError(rpc_url, 503, 'Unavailable', {}, None)"}
 REFUSED = {"raise": "urllib.error.URLError(ConnectionRefusedError(111, 'Connection refused'))"}
 
@@ -102,7 +105,8 @@ def test_a_default_node_that_answers_a_mismatch_decides_and_no_other_node_is_ask
     code, verdict, asked = run({DEFAULT: settled(amount="1"), FIRST: settled(), SECOND: settled()})
     assert code == 3
     assert asked == [DEFAULT]
-    assert verdict == {"verdict": "mismatch", "expected": AMOUNT, "got": "1", "rpc_url": DEFAULT}
+    # Only the default node was asked: exactly what main printed, no rpc_url.
+    assert verdict == {"verdict": "mismatch", "expected": AMOUNT, "got": "1"}
 
 
 def test_a_default_node_that_answers_with_a_non_node_reply_is_not_skipped():
@@ -111,7 +115,8 @@ def test_a_default_node_that_answers_with_a_non_node_reply_is_not_skipped():
                                 FIRST: settled(), SECOND: settled()})
     assert code == 4
     assert asked == [DEFAULT]
-    assert verdict["verdict"] == "node_unreachable" and verdict["rpc_url"] == DEFAULT
+    assert verdict["verdict"] == "node_unreachable"
+    assert "rpc_url" not in verdict and "hint" not in verdict
 
 
 def test_when_every_built_in_node_fails_the_error_says_so_and_names_each_failure():
@@ -127,3 +132,47 @@ def test_when_every_built_in_node_fails_the_error_says_so_and_names_each_failure
             {"rpc_url": SECOND, "detail": "<urlopen error [Errno 111] Connection refused>"},
         ],
     }
+
+
+def test_a_settled_answer_from_the_default_node_is_main_output_byte_for_byte():
+    code, verdict, asked = run({DEFAULT: settled(), FIRST: settled(), SECOND: settled()})
+    assert code == 0
+    assert asked == [DEFAULT]
+    assert verdict == {"settled": True, "amount_raw": int(AMOUNT), "height": 4,
+                       "account": ACCOUNT}
+
+
+def test_a_429_from_the_default_node_does_not_walk_to_the_next_node():
+    """A rate limit is not a refusal of the host: anyone can provoke one."""
+    code, verdict, asked = run({DEFAULT: HTTP_429, FIRST: settled(), SECOND: settled()})
+    assert code == 4
+    assert asked == [DEFAULT]
+    assert verdict["detail"] == "HTTP Error 429"
+    assert set(verdict) == {"verdict", "detail", "hint"}
+    assert "NANO_RPC_URL" in verdict["hint"]
+
+
+def test_with_the_shipped_empty_list_a_refused_default_is_unreachable_with_a_hint():
+    """The real FALLBACK_RPC_URLS: nothing else is asked, and the verdict says what to do."""
+    driver = _DRIVER.replace("verify_cli.FALLBACK_RPC_URLS = ", "_unused = ")
+    for step, detail in ((HTTP_403, "HTTP Error 403"), (HTTP_503, "HTTP Error 503"),
+                         (REFUSED, "<urlopen error [Errno 111] Connection refused>")):
+        environ = {name: value for name, value in __import__("os").environ.items()
+                   if name != "NANO_RPC_URL"}
+        done = subprocess.run(
+            [sys.executable, "-c", driver, json.dumps({DEFAULT: step}), HASH, AMOUNT, ACCOUNT],
+            cwd=SKILL, capture_output=True, text=True, env=environ, timeout=60,
+        )
+        lines = done.stdout.splitlines()
+        assert done.returncode == 4, done.stdout + done.stderr
+        assert json.loads(lines[-1][len("ASKED "):]) == [DEFAULT]
+        verdict = json.loads(lines[0])
+        assert set(verdict) == {"verdict", "detail", "hint"}
+        assert verdict["verdict"] == "node_unreachable" and verdict["detail"] == detail
+        assert "NANO_RPC_URL" in verdict["hint"]
+
+
+def test_a_named_node_that_refuses_gets_no_hint():
+    code, verdict, asked = run({CHOSEN: HTTP_503}, CHOSEN)
+    assert code == 4 and asked == [CHOSEN]
+    assert verdict == {"verdict": "node_unreachable", "detail": "HTTP Error 503"}

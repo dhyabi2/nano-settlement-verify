@@ -4,8 +4,11 @@
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
-With neither set, a default that refuses (HTTP 403, 429, 5xx) or cannot be reached is
-followed by the built-in nodes in order; the verdict names the node asked in "rpc_url".
+With neither set, a default that refuses (HTTP 403, 5xx) or cannot be reached would be
+followed by the built-in fallback nodes - but that list is currently EMPTY, so today a
+refused default gives node_unreachable (4) with a "hint": set NANO_RPC_URL to a node you
+trust. Only when another node answered does the verdict carry "rpc_url" (and
+"failed_rpc_urls"); with only the default asked, the output is unchanged.
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
 as %40; credentials are never sent, and %40 or %3A in the host part counts as one), no
 control character, a host of ASCII letters, digits, '-', '.' and '_' or an IP address (no
@@ -67,13 +70,30 @@ DEFAULT_RPC_URL = "https://rpc.nano.to"
 # rainstorm.city/api and app.natrium.io/api could not be reached from there at
 # all (its egress proxy refused the tunnel), so none of them was checked and
 # none is listed yet.
+#
+# The list is EMPTY: today a refused default node ends in node_unreachable
+# (exit 4) with NODE_REFUSED_HINT, and nothing else is asked.
+#
+# Add ONLY nodes the seller trusts as much as the default. A fallback node's
+# answer can be a positive verdict (exit 0, settled), and the walk to it is
+# triggered by failures someone on the path can provoke (a dropped connection,
+# a 5xx from a box in front of the default). Such a verdict always carries
+# "rpc_url" naming the fallback node and "failed_rpc_urls", so a caller that
+# accepts only the default node's word can tell it apart from one the default
+# gave (which carries neither key).
 FALLBACK_RPC_URLS = ()
 
 # HTTP statuses after which the next built-in node is asked: the node refused
-# this host (403), rate-limited it (429) or failed itself (5xx). Any other
+# this host (403) or failed itself (5xx). A 429 is not here: a rate limit is
+# the node throttling this caller, not refusing it, and a burst anyone can
+# send must not be a lever that moves the verdict to another node. Any other
 # status, and every reply the node did send, ends the walk.
-_TRY_NEXT_STATUSES = frozenset({403, 429}) | frozenset(range(500, 600))
+_TRY_NEXT_STATUSES = frozenset({403}) | frozenset(range(500, 600))
 ALL_NODES_FAILED = "every built-in node failed; set NANO_RPC_URL to a node you trust"
+# Added as "hint" only when the default node was the one node asked (nothing
+# named, no fallback tried) and it refused, rate-limited or could not be reached.
+NODE_REFUSED_HINT = ("the default node refused or could not be reached and no fallback "
+                     "node is built in; set NANO_RPC_URL to a node you trust")
 
 # Three refusals for the RPC URL, made before anything is sent. Their details are
 # fixed strings and never quote the URL: urllib's own messages echo pieces of it
@@ -413,15 +433,15 @@ def _refuse_port(netloc):
 
 
 def _rpc_url_from_env():
-    """$NANO_RPC_URL stripped, or the default when it is unset, empty or blank."""
-    return (os.environ.get("NANO_RPC_URL") or "").strip() or DEFAULT_RPC_URL
+    """$NANO_RPC_URL stripped, or "" when it is unset, empty or blank."""
+    return (os.environ.get("NANO_RPC_URL") or "").strip()
 
 
 def _may_try_next(error):
     """True when error says the node refused or never answered, not what it holds.
 
-    An HTTP 403, 429 or 5xx, or a connection, DNS or timeout failure. A reply
-    the node did send - a verdict, an error body, a page that is not a node
+    An HTTP 403 or 5xx, or a connection, DNS or timeout failure. A 429 is not
+    one: see _TRY_NEXT_STATUSES. A reply the node did send - a verdict, an error body, a page that is not a node
     reply - is never a reason to ask another node, and neither is a TLS
     failure, which is not the node being down.
     """
@@ -440,11 +460,15 @@ class _Route:
     With a node the operator named, that node is the only one asked, and say()
     prints exactly what main always printed: the URL may carry a key, so it is
     never echoed. With none named, the built-in nodes are asked in order while
-    each refuses or does not answer (_may_try_next), and say() adds "rpc_url",
-    the node whose answer - or final failure - is printed, and
-    "failed_rpc_urls", the built-in nodes that failed before it and why. The
-    first node that answers decides: whatever it says is final, and no other
-    node is asked for a different answer.
+    each refuses or does not answer (_may_try_next). When the default node -
+    the first - gave the printed answer, say() prints exactly what main always
+    printed too, plus "hint" only on a refusal (NODE_REFUSED_HINT). Only when
+    a node failed and another was asked does say() add "rpc_url", the node
+    whose answer - or final failure - is printed, and "failed_rpc_urls", the
+    built-in nodes that failed before it and why; a positive verdict from a
+    fallback node is therefore always marked as one. The first node that
+    answers decides: whatever it says is final, and no other node is asked
+    for a different answer.
     """
 
     def __init__(self, rpc_url, builtin):
@@ -454,6 +478,7 @@ class _Route:
             self.nodes += [u for u in FALLBACK_RPC_URLS if u != rpc_url]
         self.asked = rpc_url
         self.failed = []
+        self.last_error = None
 
     def verify(self, **arguments):
         for index, node in enumerate(self.nodes):
@@ -461,24 +486,48 @@ class _Route:
             try:
                 return _verify_objects_only(rpc_url=node, **arguments)
             except Exception as error:  # noqa: BLE001 - re-raised unless the next node is asked
+                self.last_error = error
                 if index + 1 < len(self.nodes) and _may_try_next(error):
                     self.failed.append({"rpc_url": node, "detail": _error_detail(error)})
+                    if isinstance(error, urllib.error.HTTPError):
+                        try:
+                            error.close()
+                        except Exception:  # noqa: BLE001 - closing is best effort
+                            pass
                     continue
                 if self.failed and _may_try_next(error):
                     self.failed.append({"rpc_url": node, "detail": _error_detail(error)})
                 raise
         raise AssertionError("unreachable: the node list is never empty")
 
+    def _refused(self):
+        error = self.last_error
+        if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+            return True
+        return error is not None and _may_try_next(error)
+
     def say(self, verdict):
-        if self.builtin:
-            if len(self.failed) == len(self.nodes) > 1:
+        """Print verdict, a dict; returns nothing."""
+        if self.builtin and self.failed:
+            # A node failed and another was asked: name who answered.
+            if len(self.failed) == len(self.nodes):
                 verdict = {"verdict": "node_unreachable", "detail": ALL_NODES_FAILED,
                            "failed_rpc_urls": self.failed}
             else:
-                verdict = dict(verdict, rpc_url=self.asked)
-                if self.failed:
-                    verdict["failed_rpc_urls"] = self.failed
+                verdict = dict(verdict, rpc_url=self.asked, failed_rpc_urls=self.failed)
+        elif (self.builtin and verdict.get("verdict") == "node_unreachable"
+              and self._refused()):
+            # Only the default node was asked and it refused, rate-limited or
+            # was not reached: say what to do about it.
+            verdict = dict(verdict, hint=NODE_REFUSED_HINT)
         print(json.dumps(verdict))
+
+    def say_receipt(self, receipt):
+        """Print a receipt: byte for byte main's output unless a fallback answered."""
+        if self.builtin and self.failed:
+            self.say(json.loads(receipt.to_json()))
+        else:
+            print(receipt.to_json())
 
 
 def main(argv):
@@ -519,13 +568,14 @@ def main(argv):
     # The argument is stripped like the variable, so `"http://127.0.0.1:7076 "`
     # is asked as written without the space; a blank argument stays blank and
     # is refused below, never replaced by the variable or the default.
-    rpc_url = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
+    named = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
+    rpc_url = named if len(argv) == 5 else (named or DEFAULT_RPC_URL)
     # A node the operator named - argument or variable - is the only node asked,
     # and its URL is never printed: it may carry a key. With nothing named, the
     # built-in nodes are asked in order while each refuses or does not answer,
-    # and the verdict names the one that answered. The first node that answers
+    # and a verdict a fallback node gave names it. The first node that answers
     # decides: a verdict from it is final, whatever it says.
-    builtin = len(argv) == 4 and not (os.environ.get("NANO_RPC_URL") or "").strip()
+    builtin = len(argv) == 4 and not named
     refused = _refuse_rpc_url(rpc_url)
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
@@ -582,7 +632,7 @@ def main(argv):
         # table has no row for. The detail names the class only.
         route.say({"verdict": "node_unreachable", "detail": _reply_not_checked(error)})
         return 4
-    route.say(json.loads(receipt.to_json()))
+    route.say_receipt(receipt)
     return 0 if receipt.settled else 2
 
 

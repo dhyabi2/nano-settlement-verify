@@ -799,9 +799,6 @@ def _assert_unreachable(done, detail=None):
     verdict = json.loads(done.stdout)
     assert verdict["verdict"] == "node_unreachable", output
     if detail is not None:
-        # With no RPC URL named, the verdict also names the built-in node asked.
-        if verdict.get("rpc_url") == "https://rpc.nano.to":
-            del verdict["rpc_url"]
         assert verdict == {"verdict": "node_unreachable", "detail": detail}
 
 
