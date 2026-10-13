@@ -310,6 +310,34 @@ def verify_corroborated(
     )
 
 
+def _figure_of_raw(reply: dict, field: str) -> int:
+    """`reply[field]` as an int of raw, or NotANodeReply.
+
+    The same rule `nano_settlement_verify._raw_amount` applies to a block's
+    `amount`, applied here to a balance. A node sends raw as a decimal string.
+    `int()` of the JSON float 1e30 is 1000000000000000019884624838656 - the
+    float cannot represent 10**30, so the figure comes back 19884624838656 raw
+    ABOVE the real balance, and a balance read too high is the dangerous
+    direction: it says an account can cover a price it cannot. `int()` of the
+    JSON `true` is 1. Neither is raw, so neither is a figure to corroborate.
+
+    The test next to this one is named "a balance comes back as integers of raw
+    not as strings" and its comment already names the 19884624838656-raw error,
+    but it feeds the balance as a string, so this path was never exercised.
+
+    A KeyError for a missing field is raised as before and caught by the caller
+    as this endpoint not having answered.
+    """
+    value = reply[field]
+    if isinstance(value, bool) or isinstance(value, float):
+        raise nano_settlement_verify.NotANodeReply(
+            "the reply's %s is %s (%r), not raw: a node sends raw as an integer "
+            "string, and int() would read it as another number"
+            % (field, type(value).__name__, value)
+        )
+    return int(value)
+
+
 def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
     """The confirmed balance and receivable of an account, agreed by `agree` nodes.
 
@@ -342,6 +370,24 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
     for rpc_url in endpoints:
         try:
             reply = post(rpc_url, payload)
+            if not isinstance(reply, dict):
+                # The same refusal `verify` makes, for the same reason. This
+                # function reads a reply directly rather than through `verify`,
+                # so it never got the guard PR #27 added there, and
+                # `"error" in reply` on a string is a SUBSTRING test: any
+                # proxy body with the word "error" in it took the branch below
+                # and counted as an endpoint answering a confirmed balance of
+                # nothing. Two such endpoints corroborated a balance of
+                # nothing for an account that may hold a fortune. A list did
+                # the same by membership. README.md already promises the
+                # opposite: "An endpoint whose reply is not a JSON object (a
+                # proxy's `"error"`, a bare number) is silence too: it counts
+                # as failed, not as answered."
+                raise nano_settlement_verify.NotANodeReply(
+                    "the endpoint's reply is %s, not a JSON object, so it is not a "
+                    "node's account_info reply and says nothing about this balance"
+                    % type(reply).__name__
+                )
             if "error" in reply:
                 # An unopened account is not a failure to read; it is a balance
                 # of nothing, and two nodes can agree on that. The check has to
@@ -359,8 +405,8 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
                 # like agreement, so its absence is read as this endpoint not
                 # having answered: KeyError here is caught just below.
                 figure = (
-                    int(reply["confirmed_balance"]),
-                    int(reply["confirmed_receivable"]),
+                    _figure_of_raw(reply, "confirmed_balance"),
+                    _figure_of_raw(reply, "confirmed_receivable"),
                 )
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
