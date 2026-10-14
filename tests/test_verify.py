@@ -104,6 +104,42 @@ def test_wrong_amount_raises_mismatch(node):
     assert caught.value.expected == 10**24
 
 
+# --- the amount is exact, never "at least" --------------------------------------
+#
+# An outside agent (Moltbook, 2026-10-13) asked for the amount to be checked
+# "against the quoted tagged amount, not 'at least'". A tagged amount is how a
+# payment names its invoice: an overpayment of even one raw is a different tag,
+# so it is a different invoice or none. These pin that verify has always
+# compared with `!=`, in both directions, down to one raw.
+
+
+def test_an_overpayment_of_one_raw_is_a_mismatch_not_a_settlement(node):
+    node(block_info(amount=str(10**24 + 1)))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+    assert caught.value.got == 10**24 + 1
+    assert caught.value.expected == 10**24
+
+
+def test_an_underpayment_of_one_raw_is_a_mismatch(node):
+    node(block_info(amount=str(10**24 - 1)))
+
+    with pytest.raises(Mismatch) as caught:
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+    assert caught.value.got == 10**24 - 1
+
+
+def test_a_large_overpayment_is_a_mismatch(node):
+    """Ten times the price is not the price: the tag no longer names the invoice."""
+    node(block_info(amount=str(10**25)))
+
+    with pytest.raises(Mismatch):
+        verify(HASH, 10**24, ACCOUNT, URL)
+
+
 # --- error paths ---------------------------------------------------------------
 
 

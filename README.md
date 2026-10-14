@@ -242,13 +242,20 @@ Then read four fields, which are the only ones `verify` reads:
 | --- | --- |
 | `confirmed` | the string `"true"` (anything else is *not yet*, not *no*) |
 | `subtype` (state block) or `contents.type` (older block) | `send` - a receive, open, change or epoch block pays nobody |
-| `amount` | the raw amount you quoted, compared as an integer, never as a float |
+| `amount` | exactly the raw amount you quoted, compared as an integer, never as a float; one raw over is a `Mismatch` too, never "at least" |
 | `contents.link_as_account` (state) or `contents.destination` (older) | your account; `nano_` and `xrb_` spellings of the same 60 characters are one account |
 
 The hash above is the genesis account's open block. It is confirmed, but its
 `contents.type` is `open`, so it settles nothing - which is the answer `verify` gives too
 (`Mismatch`). Ask a second node you chose, not one the seller named, if one node's word
 is not enough; the next section does that in code.
+
+For a verdict an outside agent can audit field by field - block hash and confirmed,
+source not destination and not excluded, exact amount, invoice issued before the block,
+nodes read - with any missing field answered `unknown` and never `settled`, see
+[FIVE_FIELDS.md](FIVE_FIELDS.md): the same check as two `curl` calls and a local hash
+recompute, and `nano_five_fields.five_field_verdict` for callers who want it in code.
+`settled` there means work may start; it is not buyer acceptance.
 
 ## One node's word, or two?
 
@@ -372,7 +379,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-640 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+687 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -431,7 +438,14 @@ account, a non-send and a malformed hash refused, and every read that fails - a 
 receive not found within the bound - coming back as `unknown` with a nonzero exit, each
 `unknown` carrying its reconcile path (same send hash, no re-send, next check, escalation
 after the read or time limit), each not-found scoped to the nodes and instant read, and a
-not-found on one node yielding to a found answer on another; and for the README itself, that the curl body in *Check it without running our
+not-found on one node yielding to a found answer on another; for `nano_five_fields`, the
+block hash recomputed locally and matched against two real blocks pinned as the network
+returned them, each of the five fields missing in turn coming back `unknown`, nodes that
+disagree, one node, the same node twice and a failed node all `unknown`, an amount over or
+under by one raw, an invoice issued at or after the block, a source that is the destination
+or on the exclusion list all `refused`, a missing field outranking a failing one, all five
+present `settled`, and FIVE_FIELDS.md's two curl bodies pinned to what `read_nodes` sends
+with nothing piped into an interpreter; and for the README itself, that the curl body in *Check it without running our
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
