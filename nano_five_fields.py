@@ -44,10 +44,21 @@ was decided on. The verdict is:
 What is checked locally rather than taken from a node: the block's hash is
 recomputed from the contents each node returned (blake2b, state and legacy send
 blocks), so a node cannot describe a different block under the hash asked
-about. What a node still asserts and the hash does not cover: `confirmed`,
-`amount` (the node derives it from the previous block's balance) and
-`local_timestamp` (the node's own clock, unsigned - see TIME_SOURCE). Those are
-why two nodes are read, and why they must agree.
+about. The destination is read from the hashed contents too: a state block's
+`link` (converted to an account here), a legacy send's `destination`. A node's
+`link_as_account` is only its rendering of `link`; a reply whose rendering names
+another account is not a read.
+
+What a node still asserts and the hash does not cover: `confirmed`, `amount`
+(the node derives it from the previous block's balance), `local_timestamp` (the
+node's own clock, unsigned - see TIME_SOURCE), `subtype` (a state block's
+contents are the same shape for a send and a receive; the node says which), and,
+for a legacy send block only, `block_account` - the source. A legacy send's
+contents do not name its account (only its signature binds it, and no signature
+is checked here), so its source is the node's word: against a non-empty
+exclusion list that field is `missing`, never `ok`, and even with an empty list
+"source is not the destination" rests on the nodes agreeing. Those are why two
+nodes are read, and why they must agree.
 
 Stdlib only. No key, no signing, no sending. Raw amounts are integers.
 """
@@ -60,10 +71,10 @@ import re
 import nano_settlement_verify
 from nano_quorum import _endpoint_key
 from nano_settlement_verify import (
+    _ACCOUNT_ALPHABET,
     TIME_SOURCE,
     _contents,
     _operation,
-    _paid_account,
     _same_account,
     _seen_at,
     parse_not_after,
@@ -144,6 +155,24 @@ def block_hash_of(contents: object) -> str | None:
     return digest.hexdigest().upper()
 
 
+def _address_of_key(key: bytes) -> str:
+    """The nano_ address of a 32-byte public key: the inverse of public_key_from_address."""
+    check = hashlib.blake2b(key, digest_size=5).digest()[::-1]
+
+    def b32(value: int, chars: int) -> str:
+        return "".join(_ACCOUNT_ALPHABET[(value >> (5 * i)) & 31] for i in reversed(range(chars)))
+
+    return "nano_" + b32(int.from_bytes(key, "big"), 52) + b32(int.from_bytes(check, "big"), 8)
+
+
+def _hashed_destination(contents: dict) -> str | None:
+    """The account the hashed contents pay: a state block's link, a legacy send's destination."""
+    if contents.get("type") == "state":
+        return _address_of_key(bytes.fromhex(contents["link"]))
+    destination = contents.get("destination")
+    return destination if public_key_from_address(destination) is not None else None
+
+
 def read_nodes(block_hash: str, rpc_urls, fetch=None) -> list[tuple[str, object]]:
     """Ask each node for block_info; return `[(url, reply or the exception)]`.
 
@@ -182,12 +211,20 @@ def _facts(block_hash: str, reply: object) -> tuple[dict | None, str | None]:
     source = reply.get("block_account")
     if contents.get("type") == "state" and not _same_account(contents.get("account"), source):
         return None, "block_account is not the account the hashed contents name"
+    # The destination comes from what was hashed, never from the node's rendering of it.
+    destination = _hashed_destination(contents)
+    for where, rendered in (("contents", contents), ("reply", reply)):
+        for name in ("link_as_account", "destination"):
+            if name in rendered and not _same_account(rendered[name], destination):
+                return None, (f"{where} {name} {rendered[name]!r} is not the account "
+                              "the hashed contents pay")
     amount = reply.get("amount")
     return {
         "confirmed": reply.get("confirmed") == "true",
         "operation": _operation(reply),
         "source": source if isinstance(source, str) else None,
-        "destination": _paid_account(reply) or None,
+        "destination": destination,
+        "source_hashed": contents.get("type") == "state",
         "amount": int(amount) if isinstance(amount, str) and _DIGITS.fullmatch(amount) else None,
         "seen_at": _seen_at(reply),
     }, None
@@ -231,8 +268,17 @@ def five_field_verdict(
     was issued for. `payee` is the account that was to be paid. `exclude` is the
     payer's own published list of wallets a payment must not come from; pass
     `()` for an empty list - `None` is a list nobody supplied, and leaves that
-    field missing. Pure: no network, no clock.
+    field missing. Any iterable of accounts is read once, up front. `min_nodes`
+    must be an int of at least 2; anything else leaves `nodes_read` missing.
+    Pure: no network, no clock.
     """
+    if exclude is not None and not isinstance(exclude, str):
+        try:
+            exclude = tuple(exclude)
+        except TypeError:
+            exclude = None
+    min_nodes_ok = (not isinstance(min_nodes, bool) and isinstance(min_nodes, int)
+                    and min_nodes >= MIN_NODES)
     pairs = list(reads.items()) if isinstance(reads, dict) else list(reads)
     hash_ok = isinstance(block_hash, str) and bool(_HEX64.fullmatch(block_hash))
 
@@ -263,6 +309,10 @@ def five_field_verdict(
                           answers={u: [f["operation"], f["source"], f["destination"],
                                        str(f["amount"]) if f["amount"] is not None else None]
                                    for u, f in readable.items()})
+    elif not min_nodes_ok:
+        nodes_read.update(status="missing",
+                          why=f"min_nodes must be an int of at least {MIN_NODES}, "
+                              f"not {min_nodes!r}")
     elif len(readable) < min_nodes:
         nodes_read.update(status="missing",
                           why=f"{len(readable)} node(s) readable, {min_nodes} required")
@@ -293,7 +343,8 @@ def five_field_verdict(
         fields["source_not_destination_not_excluded"] = _missing("no agreeing block facts")
     else:
         source, destination = facts["source"], facts["destination"]
-        entry = {"source": source, "destination": destination, "payee": payee}
+        entry = {"source": source, "destination": destination, "payee": payee,
+                 "source_covered_by_hash": facts["source_hashed"]}
         bad_exclusions = ([] if exclude is None or isinstance(exclude, str)
                           else [e for e in exclude if public_key_from_address(e) is None])
         if exclude is None or isinstance(exclude, str):
@@ -312,6 +363,9 @@ def five_field_verdict(
             field = {"status": "fail", "why": "destination is not the payee", **entry}
         elif _same_account(source, destination):
             field = {"status": "fail", "why": "source is the destination", **entry}
+        elif exclude and not facts["source_hashed"]:
+            field = _missing("a legacy send's source is the node's word, not covered by the "
+                             "hash; it cannot be checked against an exclusion list", **entry)
         elif any(_same_account(source, e) for e in exclude):
             field = {"status": "fail", "why": "source is on the exclusion list", **entry}
         else:

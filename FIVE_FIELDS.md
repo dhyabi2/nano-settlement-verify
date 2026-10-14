@@ -60,12 +60,19 @@ Lay the two replies side by side:
 
 1. **Both** have `"confirmed": "true"`. Otherwise: `unknown` (not yet, not no).
 2. **Both** name the same `subtype` (`send`; for an older block, `contents.type` is
-   `send`), the same `block_account`, the same destination
-   (`contents.link_as_account` for a state block, `contents.destination` for an older
-   one) and the same `amount`. Any difference: `unknown`.
-3. `block_account` is not the destination, is not on your published list, and the
-   destination is the payee you quoted. `nano_` and `xrb_` spellings with the same 60
-   characters after the prefix are the same account.
+   `send`), the same `block_account`, the same destination and the same `amount`.
+   The destination is the field the hash covers: `contents.link` for a state block
+   (64 hex characters, the payee's public key), `contents.destination` for an older
+   one. Do not read it from `link_as_account`: that is the node's rendering of `link`,
+   and the hash does not cover it. Any difference: `unknown`.
+3. The destination is the payee you quoted: for a state block, `contents.link` is
+   character-for-character the payee's public key (from `account_key`, see below; upper
+   case), and if a node also shows a `link_as_account` that names any other account,
+   that reply is not a read. `block_account` is not the payee and is not on your
+   published list. `nano_` and `xrb_` spellings with the same 60 characters after the
+   prefix are the same account. For an older send block, `block_account` is the
+   node's word alone (the block's contents do not name its account), so it cannot
+   clear your published list: with a non-empty list, that field is `unknown`.
 4. `amount` is character-for-character the tagged amount you quoted, in raw. Compare
    digit strings, never floats; `amount_nano` is for reading, not for comparing.
 5. Your invoice's issue time, as unix seconds, is less than **both** nodes'
@@ -114,5 +121,9 @@ account's epoch block) and the send recipe reproduces
 pinned verbatim in `tests/test_five_fields.py`.
 
 What the hash does not cover: `confirmed`, `amount` (a node derives it from the
-previous block's balance) and `local_timestamp`. Those are node-asserted, which is why
-there are two nodes and why they must agree.
+previous block's balance), `local_timestamp`, `subtype` (a state send and a state
+receive hash the same fields; the node says which it is), `link_as_account` (the
+node's rendering of `link`; compare `link` itself), and, for an older send block,
+`block_account` - the source, which that block's contents do not name. Those are
+node-asserted, which is why there are two nodes and why they must agree, and why an
+older send's source is never checked against an exclusion list on a node's word.

@@ -425,3 +425,112 @@ def test_doc_pipes_nothing_into_an_interpreter():
     for name in FIELDS:
         assert f"`{name}`" in text
     assert "It is not buyer acceptance" in text
+
+
+# --- the destination is the hashed link, not the node's rendering of it ---------
+
+
+def test_link_as_account_naming_the_payee_cannot_redirect_a_hashed_link():
+    # The hashed block pays OTHER; the node's link_as_account claims the payee.
+    block_hash, reply = state_send(destination=OTHER)
+    reply["contents"]["link_as_account"] = PAYEE
+    assert block_hash_of(reply["contents"]) == block_hash
+    out = verdict(block_hash, two_nodes(reply))
+    assert out["verdict"] != "settled"
+    assert "not the account the hashed contents pay" in out["fields"]["nodes_read"]["failed"][NODE_A]
+
+
+def test_a_reply_level_link_as_account_is_no_destination_either():
+    block_hash, reply = state_send(destination=OTHER)
+    del reply["contents"]["link_as_account"]
+    reply["link_as_account"] = PAYEE
+    assert verdict(block_hash, two_nodes(reply))["verdict"] != "settled"
+    # With no rendering at all, the destination is read from the hashed link: OTHER.
+    del reply["link_as_account"]
+    out = verdict(block_hash, two_nodes(reply))
+    assert out["verdict"] == "refused"
+    assert out["fields"]["source_not_destination_not_excluded"]["destination"] == OTHER
+
+
+def test_a_legacy_send_destination_is_contents_destination_not_link_as_account():
+    reply = copy.deepcopy(REAL_LEGACY_SEND)
+    reply["contents"]["link_as_account"] = PAYEE
+    assert block_hash_of(reply["contents"]) == REAL_LEGACY_SEND_HASH
+    out = verdict(REAL_LEGACY_SEND_HASH, two_nodes(reply),
+                  expect_raw=int(reply["amount"]), issued_at=1575913000)
+    assert out["verdict"] != "settled"
+
+
+def test_a_state_destination_is_link_even_when_link_as_account_is_absent():
+    block_hash, reply = state_send()
+    del reply["contents"]["link_as_account"]
+    out = verdict(block_hash, two_nodes(reply))
+    assert out["verdict"] == "settled"
+    assert out["fields"]["source_not_destination_not_excluded"]["destination"] == PAYEE
+
+
+# --- an exclusion list given as an iterator is read once, before the check ------
+
+
+def test_a_generator_exclusion_list_still_excludes():
+    block_hash, reply = state_send()
+    for exclude in ((w for w in [PAYER]), iter([PAYER]), map(str.strip, [PAYER + "\n"])):
+        out = verdict(block_hash, two_nodes(reply), exclude=exclude)
+        assert out["verdict"] == "refused"
+        assert out["fields"]["source_not_destination_not_excluded"]["why"] == \
+            "source is on the exclusion list"
+
+
+def test_a_generator_with_a_bad_entry_is_still_missing():
+    block_hash, reply = state_send()
+    out = verdict(block_hash, two_nodes(reply), exclude=(w for w in ["nano_typo"]))
+    assert out["missing"] == ["source_not_destination_not_excluded"]
+
+
+# --- a legacy send's source is the node's word ----------------------------------
+
+
+def test_a_legacy_send_source_cannot_clear_a_non_empty_exclusion_list():
+    reply = copy.deepcopy(REAL_LEGACY_SEND)
+    real_source = reply["block_account"]
+    reply["block_account"] = OTHER  # the hash does not cover this; a node can say anything
+    out = verdict(REAL_LEGACY_SEND_HASH, two_nodes(reply),
+                  expect_raw=int(reply["amount"]), issued_at=1575913000,
+                  payee=reply["contents"]["destination"], exclude=[real_source])
+    assert out["verdict"] == "unknown"
+    assert out["missing"] == ["source_not_destination_not_excluded"]
+    field = out["fields"]["source_not_destination_not_excluded"]
+    assert field["source_covered_by_hash"] is False
+    assert "node's word" in field["why"]
+
+
+# --- min_nodes below two is no quorum -------------------------------------------
+
+
+def test_min_nodes_below_two_or_not_an_int_leaves_nodes_read_missing():
+    block_hash, reply = state_send()
+    for bad in (1, 0, -3, True, False, 2.0, "2", None):
+        out = verdict(block_hash, [(NODE_A, reply)], min_nodes=bad)
+        assert out["verdict"] == "unknown", bad
+        assert "nodes_read" in out["missing"], bad
+        out = verdict(block_hash, two_nodes(reply), min_nodes=bad)
+        assert out["verdict"] == "unknown", bad
+    assert verdict(block_hash, two_nodes(reply), min_nodes=2)["verdict"] == "settled"
+
+
+# --- the node-asserted fields are named where a by-eye checker reads them ---------
+
+
+def test_doc_and_docstring_name_subtype_and_legacy_block_account_as_node_asserted():
+    import nano_five_fields
+    text = DOC.read_text(encoding="utf-8")
+    tail = text[text.index("What the hash does not cover"):]
+    doc = nano_five_fields.__doc__
+    asserted = doc[doc.index("What a node still asserts"):]
+    for where in (tail, asserted):
+        assert "`subtype`" in where
+        assert "`block_account`" in where
+        assert "legacy send" in where or "older send" in where
+    steps = text[text.index("## What to compare, by eye"):text.index("## The local hash")]
+    assert "`contents.link`" in steps
+    assert "public key" in steps
