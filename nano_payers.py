@@ -769,8 +769,75 @@ def outside_payers(report: PayerReport, our_accounts) -> PayerReport:
     )
 
 
+# Hub accounts `--independent` ignores when the caller names none: two exchange
+# hot wallets that withdraw to many strangers. Funding from one of them says
+# only that two payers used the same exchange, not that one operator holds both,
+# so without this every exchange customer would collapse into one group. The
+# list is printed in the output so a reader sees which accounts were set aside.
+DEFAULT_IGNORE = (
+    "nano_1banexkcfuieufzxksfrxqf6xy8e57ry1zdtq9yn7jntzhpwu4pg4hajojmq",
+    "nano_335o96s1kje9jzwukjkqt74iatrfqz4uoue7ocxpce95eukmicpyjmj1ke81",
+)
+
+_USAGE = (
+    "usage: python3 nano_payers.py <x402-document-url | nano_account> [rpc-url ...]\n"
+    "                              [--independent[=HOPS]] [--ignore <account> ...]"
+)
+
+
+def _parse_args(argv: list[str]):
+    """(target, rpc_urls, hops or None, ignore list or None), or a usage error string."""
+    positional: list[str] = []
+    hops = None
+    ignore: list[str] | None = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--independent":
+            hops = 1
+        elif arg.startswith("--independent="):
+            text = arg.split("=", 1)[1]
+            if not text.isdigit() or int(text) < 1:
+                return f"--independent=HOPS takes a whole number of hops >= 1, got {text!r}"
+            hops = int(text)
+        elif arg == "--ignore" or arg.startswith("--ignore="):
+            if arg == "--ignore":
+                i += 1
+                if i >= len(argv):
+                    return "--ignore needs an account"
+                account = argv[i]
+            else:
+                account = arg.split("=", 1)[1]
+            if not is_valid_account(account):
+                return f"--ignore {account!r} is not an account whose checksum matches"
+            ignore = (ignore or []) + [account]
+        elif arg.startswith("--"):
+            return f"unknown option {arg}"
+        else:
+            positional.append(arg)
+        i += 1
+    if not positional:
+        return "missing the x402 document URL or nano_ account"
+    target, *rpc = positional
+    return target, rpc, hops, ignore
+
+
 def _main(argv: list[str]) -> int:
-    """`python3 nano_payers.py <x402-url> [rpc-url ...]` - audit a seller.
+    """`python3 nano_payers.py <x402-url | nano_account> [rpc-url ...] [--independent[=HOPS]]
+    [--ignore <account> ...]` - audit a seller.
+
+    The first argument is either the URL of the seller's x402 document, from
+    which the payee is read, or a bare `nano_` account. Every payee entry says
+    which in `binding`: an account read from the seller's own document is bound
+    to that seller; one typed by hand is bound to nothing, and its count says
+    nothing about any particular seller.
+
+    `--independent[=HOPS]` also groups the payers by shared funder
+    (`nano_independence.independence`, against the first rpc url, with the payee
+    as `seller`) and adds the result as `independence`: distinct payers is not
+    independent payers when several share a funder. `--ignore <account>`
+    (repeatable) names hub accounts that do not tie payers together; with none
+    given, `DEFAULT_IGNORE` is used. The list used is printed as `ignore`.
 
     Fetching lives here and not in the functions above so that they stay
     offline and testable: everything this prints was derived from the seller's
@@ -779,42 +846,74 @@ def _main(argv: list[str]) -> int:
     import sys
     import urllib.request
 
-    if not argv:
+    import nano_independence
+
+    parsed = _parse_args(argv)
+    if isinstance(parsed, str):
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print(
-            "usage: python3 nano_payers.py <x402-document-url> [rpc-url ...]",
-            file=sys.stderr,
-        )
+        if argv:
+            print(parsed, file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
         return 64
-    url, *rpc = argv
+    url, rpc, hops, ignore = parsed
     rpc = rpc or ["https://rpc.nano.to"]
-    request = urllib.request.Request(
-        url, headers={"User-Agent": nano_settlement_verify.USER_AGENT}
-    )
-    with urllib.request.urlopen(
-        request, timeout=nano_settlement_verify.RPC_TIMEOUT_S
-    ) as response:
-        doc = json.loads(response.read().decode("utf-8"))
-    try:
-        payees = payees_from_manifest(doc)
-    except ManifestRefused as error:
-        print(json.dumps({"verdict": error.reason, "detail": error.detail}))
-        return 3
+    if hops is not None and ignore is None:
+        ignore = list(DEFAULT_IGNORE)
+
+    if url.startswith(("nano_", "xrb_")) and "://" not in url:
+        if not is_valid_account(url):
+            print(f"{url!r} is not an account whose checksum matches", file=sys.stderr)
+            print(_USAGE, file=sys.stderr)
+            return 64
+        payees = (Payee(account=url, network="nano:mainnet", prices_raw=(), resources=()),)
+        binding = {"payee_from": "argument",
+                   "how": "none - account given by hand; nothing ties it to a seller"}
+    else:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": nano_settlement_verify.USER_AGENT}
+        )
+        with urllib.request.urlopen(
+            request, timeout=nano_settlement_verify.RPC_TIMEOUT_S
+        ) as response:
+            doc = json.loads(response.read().decode("utf-8"))
+        try:
+            payees = payees_from_manifest(doc)
+        except ManifestRefused as error:
+            print(json.dumps({"verdict": error.reason, "detail": error.detail}))
+            return 3
+        binding = {"payee_from": url,
+                   "how": "payTo/accepts[] read from the seller's own x402 document"}
     read_at = _utc_now()
     out = []
     for payee in payees:
+        entry = {"payee": json.loads(payee.to_json()), "binding": dict(binding)}
         try:
             report = payers(payee.account, rpc)
         except HistoryIncomplete as error:
-            out.append({"payee": json.loads(payee.to_json()), "verdict": "history_incomplete",
-                        "detail": str(error)})
+            entry.update({"verdict": "history_incomplete", "detail": str(error)})
+            out.append(entry)
             continue
         except nano_quorum.NotCorroborated as error:
-            out.append({"payee": json.loads(payee.to_json()), "verdict": "node_unreachable",
-                        "detail": str(error)})
+            entry.update({"verdict": "node_unreachable", "detail": str(error)})
+            out.append(entry)
             continue
-        out.append({"payee": json.loads(payee.to_json()), "payers": json.loads(report.to_json())})
-    print(json.dumps({"source": url, "read_at": read_at, "payees": out}, indent=1))
+        entry["payers"] = json.loads(report.to_json())
+        if hops is not None:
+            try:
+                grouped = nano_independence.independence(
+                    [payer.account for payer in report.payers], rpc[0], hops,
+                    seller=payee.account, ignore=ignore,
+                )
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                entry["independence"] = {"verdict": "node_unreachable",
+                                         "detail": f"{type(error).__name__}: {error}"}
+            else:
+                entry["independence"] = json.loads(grouped.to_json())
+        out.append(entry)
+    result = {"source": url, "read_at": read_at, "payees": out}
+    if hops is not None:
+        result["ignore"] = list(ignore)
+    print(json.dumps(result, indent=1))
     return 0
 
 

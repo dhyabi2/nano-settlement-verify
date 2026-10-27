@@ -372,7 +372,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-640 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+652 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -588,6 +588,21 @@ report = independence(payers, "https://rpc.nano.to", seller="nano_<your account>
 report.independent      # groups sharing no funder, and not funded by you
 report.funded_by_seller # your own money coming back in a circle
 ```
+
+From the command line, `--independent` runs the same grouping on the payers it has just
+counted, with the payee as `seller`:
+
+```
+python3 nano_payers.py https://seller.example/.well-known/x402 --independent
+python3 nano_payers.py nano_<account> --independent=2 --ignore nano_<hub> --ignore nano_<hub>
+```
+
+Each payee then carries `independence` (the number of groups, the groups, `funded_by_seller`,
+the per-hop `witness` and `read_at`) beside the unchanged `payers` count, and the output
+prints the `ignore` list it used - by default two known exchange hot wallets, replaced by any
+`--ignore` you pass. Each payee also carries `binding`: read from the seller's own x402
+document when you give a URL, or `"payee_from": "argument"` when you give a bare account,
+which nothing ties to any seller.
 
 It is a lower bound on common control, not proof of independence: keys funded from
 different exchange withdrawals read as separate payers. `hops` (default 1) follows the

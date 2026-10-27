@@ -853,3 +853,151 @@ def test_corroboration_witnesses_a_frontier_only_when_every_node_had_it(monkeypa
     report = payers_corroborated(PAYEE, [A, B])
     assert report.distinct_payers == 2
     assert report.witness == {"frontier": None, "block_count": None}
+
+
+# --------------------------------------------------------------------------
+# _main - the one-line CLI: where the payee came from, and how many payers are
+# independent of one another
+# --------------------------------------------------------------------------
+
+# The two exchange hot wallets --independent sets aside when no --ignore is given.
+DEFAULT_HUBS = [
+    "nano_1banexkcfuieufzxksfrxqf6xy8e57ry1zdtq9yn7jntzhpwu4pg4hajojmq",
+    "nano_335o96s1kje9jzwukjkqt74iatrfqz4uoue7ocxpce95eukmicpyjmj1ke81",
+]
+HUB = DEFAULT_HUBS[0]
+
+
+def ledger_node(funded_by):
+    """One fake node serving the payee's history (PAYER_1 and PAYER_2 paid it)
+    and, for `independence`, each payer's open block and the send that funded it.
+    `funded_by[account]` is the account whose send opened `account`."""
+
+    def answer(payload):
+        action = payload["action"]
+        if action == "account_history":
+            assert payload["account"] == PAYEE
+            return history(receive(PAYER_1, CALL_PRICE, height=2), open_block(PAYER_2, CALL_PRICE))
+        if action == "account_info":
+            account = payload["account"]
+            if account not in funded_by:
+                return {"error": "Account not found"}
+            return {"open_block": f"OPEN_{account}", "frontier": f"OPEN_{account}", "block_count": "1"}
+        if action == "block_info":
+            kind, _, account = payload["hash"].partition("_")
+            if kind == "OPEN":
+                return {"block_account": account, "contents": {"type": "state", "link": f"SEND_{account}"}}
+            return {"block_account": funded_by[account], "contents": {"type": "state"}}
+        raise AssertionError(f"unexpected action {action}")
+
+    return answer
+
+
+def run_main(argv, capsys):
+    code = nano_payers._main(argv)
+    return code, capsys.readouterr()
+
+
+def test_a_bare_account_is_audited_and_says_nothing_binds_it_to_a_seller(monkeypatch, capsys):
+    nodes(monkeypatch, {A: ledger_node({})})
+    code, out = run_main([PAYEE, A], capsys)
+    assert code == 0
+    body = json.loads(out.out)
+    (entry,) = body["payees"]
+    assert entry["payee"]["account"] == PAYEE
+    assert entry["payers"]["distinct_payers"] == 2
+    assert entry["binding"] == {
+        "payee_from": "argument",
+        "how": "none - account given by hand; nothing ties it to a seller",
+    }
+    # Without --independent nothing new is added beyond the binding.
+    assert "independence" not in entry and "ignore" not in body
+
+
+def test_a_bare_account_whose_checksum_fails_is_a_usage_error(monkeypatch, capsys):
+    called = nodes(monkeypatch, {})
+    code, out = run_main([PAYEE_BROKEN, A], capsys)
+    assert code == 64 and called == [] and out.out == ""
+
+
+def test_a_url_payee_is_bound_to_the_sellers_own_document(monkeypatch, capsys):
+    url = "https://seller.example/.well-known/x402"
+    catalogue = json.loads(json.dumps(CATALOGUE))
+    for resource in catalogue["resources"]:
+        for entry in resource["accepts"]:
+            entry["payTo"] = PAYEE
+
+    class Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(catalogue).encode("utf-8")
+
+    def fetch(request, timeout=None):
+        assert request.full_url == url
+        return Reply()
+
+    monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", fetch)
+    nodes(monkeypatch, {A: ledger_node({})})
+    code, out = run_main([url, A], capsys)
+    assert code == 0
+    body = json.loads(out.out)
+    assert body["source"] == url
+    for entry in body["payees"]:
+        assert entry["binding"] == {
+            "payee_from": url,
+            "how": "payTo/accepts[] read from the seller's own x402 document",
+        }
+        assert entry["payers"]["distinct_payers"] == 2
+
+
+def test_independent_groups_two_payers_that_share_a_funder(monkeypatch, capsys):
+    nodes(monkeypatch, {A: ledger_node({PAYER_1: FUNDER, PAYER_2: FUNDER})})
+    code, out = run_main([PAYEE, A, "--independent"], capsys)
+    assert code == 0
+    body = json.loads(out.out)
+    (entry,) = body["payees"]
+    assert entry["payers"]["distinct_payers"] == 2      # the old key, unchanged
+    grouping = entry["independence"]
+    assert grouping["independent"] == 1
+    assert grouping["groups"] == [sorted([PAYER_1, PAYER_2])]
+    assert grouping["hops"] == 1
+    assert grouping["funded_by_seller"] == []
+    assert grouping["read_at"] and set(grouping["witness"]) == {PAYER_1, PAYER_2}
+
+
+def test_a_hub_in_the_default_ignore_list_does_not_tie_two_payers(monkeypatch, capsys):
+    nodes(monkeypatch, {A: ledger_node({PAYER_1: HUB, PAYER_2: HUB})})
+    code, out = run_main([PAYEE, A, "--independent"], capsys)
+    body = json.loads(out.out)
+    assert body["ignore"] == DEFAULT_HUBS
+    assert body["payees"][0]["independence"]["independent"] == 2
+
+
+def test_an_explicit_ignore_replaces_the_default_and_is_printed(monkeypatch, capsys):
+    nodes(monkeypatch, {A: ledger_node({PAYER_1: FUNDER, PAYER_2: FUNDER})})
+    code, out = run_main([PAYEE, A, "--independent=2", "--ignore", FUNDER], capsys)
+    body = json.loads(out.out)
+    assert body["ignore"] == [FUNDER]
+    grouping = body["payees"][0]["independence"]
+    assert grouping["hops"] == 2 and grouping["independent"] == 2
+
+
+def test_a_payer_funded_by_the_payee_is_reported_not_counted(monkeypatch, capsys):
+    nodes(monkeypatch, {A: ledger_node({PAYER_1: PAYEE, PAYER_2: FUNDER})})
+    code, out = run_main([PAYEE, A, "--independent"], capsys)
+    grouping = json.loads(out.out)["payees"][0]["independence"]
+    assert grouping["funded_by_seller"] == [PAYER_1]
+    assert grouping["independent"] == 1
+
+
+@pytest.mark.parametrize("bad", [["--independent=0"], ["--independent=x"], ["--ignore", "nano_x"],
+                                 ["--ignore"], ["--bogus"]])
+def test_bad_options_are_a_usage_error_before_any_node_is_asked(monkeypatch, capsys, bad):
+    called = nodes(monkeypatch, {})
+    code, out = run_main([PAYEE, A, *bad], capsys)
+    assert code == 64 and called == []
