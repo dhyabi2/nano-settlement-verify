@@ -96,12 +96,16 @@ _UNREADABLE = (OSError, ValueError, KeyError, TypeError)
 class ManifestRefused(Exception):
     """An x402 document that does not say where to pay, or says it unpayably.
 
-    Carries `reason` (a stable code) and `detail`.
+    Carries `reason` (a stable code) and `detail`. A `no_nano_payee` refusal
+    also carries `other_rails`: the entries on other ledgers it skipped, in the
+    shape `other_rails_from_manifest` returns, so a document that only takes
+    USDC says what was not counted rather than just that nothing was.
     """
 
-    def __init__(self, reason: str, detail: str):
+    def __init__(self, reason: str, detail: str, other_rails: tuple = ()):
         self.reason = reason
         self.detail = detail
+        self.other_rails = tuple(other_rails)
         super().__init__(f"{reason}: {detail}")
 
 
@@ -294,6 +298,66 @@ def _price_raw(entry: dict, where: str = "") -> int | None:
     return None
 
 
+OTHER_RAIL_WHY = (
+    "nano_payers reads the Nano ledger only; this entry's payments are on "
+    "another ledger and are not counted here"
+)
+
+
+def _resource_pairs(doc: object) -> list:
+    """`(resource, accepts)` for each resource the document advertises, either shape."""
+    if not isinstance(doc, dict):
+        raise ManifestRefused(
+            "not_an_x402_document",
+            f"expected a JSON object, got {type(doc).__name__}",
+        )
+    resources = doc.get("resources")
+    if isinstance(resources, list):
+        return [
+            (resource, resource.get("accepts"))
+            for resource in resources
+            if isinstance(resource, dict)
+        ]
+    if "accepts" in doc:
+        return [(doc, doc.get("accepts"))]
+    raise ManifestRefused(
+        "not_an_x402_document",
+        "no `resources` array and no `accepts` array, so this document "
+        f"advertises nothing payable; keys present: {sorted(doc)}",
+    )
+
+
+def _resource_name(resource: dict) -> str:
+    return resource.get("url") or resource.get("resource") or resource.get("name") or ""
+
+
+def other_rails_from_manifest(doc: object) -> tuple[dict, ...]:
+    """The `accepts[]` entries on other rails, which `payees_from_manifest` skips.
+
+    One dict per entry, in document order: `network`, `asset`, `pay_to` and
+    `resource` as the document wrote them (None where absent), `counted: False`
+    and `why`. Offline like `payees_from_manifest`; it reads nothing else about
+    those entries and claims nothing about them beyond that they were not counted.
+    """
+    rails = []
+    for resource, accepts in _resource_pairs(doc):
+        if not isinstance(accepts, list):
+            continue
+        name = _resource_name(resource)
+        for entry in accepts:
+            if not isinstance(entry, dict) or _is_nano_network(_network_of(entry)):
+                continue
+            rails.append({
+                "network": entry.get("network"),
+                "asset": entry.get("asset"),
+                "pay_to": entry.get("payTo"),
+                "resource": str(name) if name else None,
+                "counted": False,
+                "why": OTHER_RAIL_WHY,
+            })
+    return tuple(rails)
+
+
 def payees_from_manifest(doc: object) -> tuple[Payee, ...]:
     """The mainnet Nano accounts this x402 document says to pay.
 
@@ -308,8 +372,8 @@ def payees_from_manifest(doc: object) -> tuple[Payee, ...]:
     - a single **challenge** (`accepts: [...]`), which is what one resource
       answers a 402 with.
 
-    Entries on other rails are skipped in silence - a seller taking USDC beside
-    XNO is doing nothing wrong. A Nano entry that cannot be paid is a different
+    Entries on other rails are skipped - a seller taking USDC beside XNO is doing
+    nothing wrong - and `other_rails_from_manifest` names them. A Nano entry that cannot be paid is a different
     matter and is refused:
 
     - `payee_checksum`: a `payTo` that fails its own blake2b checksum. XNO sent
@@ -323,26 +387,7 @@ def payees_from_manifest(doc: object) -> tuple[Payee, ...]:
     and `xrb_` forms of one account are one payee, and counting them twice would
     double a seller's apparent reach.
     """
-    if not isinstance(doc, dict):
-        raise ManifestRefused(
-            "not_an_x402_document",
-            f"expected a JSON object, got {type(doc).__name__}",
-        )
-    resources = doc.get("resources")
-    if isinstance(resources, list):
-        pairs = [
-            (resource, resource.get("accepts"))
-            for resource in resources
-            if isinstance(resource, dict)
-        ]
-    elif "accepts" in doc:
-        pairs = [(doc, doc.get("accepts"))]
-    else:
-        raise ManifestRefused(
-            "not_an_x402_document",
-            "no `resources` array and no `accepts` array, so this document "
-            f"advertises nothing payable; keys present: {sorted(doc)}",
-        )
+    pairs = _resource_pairs(doc)
 
     # Keyed by public key so that two spellings of one account collapse.
     found: dict[bytes, dict] = {}
@@ -350,7 +395,7 @@ def payees_from_manifest(doc: object) -> tuple[Payee, ...]:
     for resource, accepts in pairs:
         if not isinstance(accepts, list):
             continue
-        name = resource.get("url") or resource.get("resource") or resource.get("name") or ""
+        name = _resource_name(resource)
         for entry in accepts:
             if not isinstance(entry, dict):
                 continue
@@ -392,6 +437,7 @@ def payees_from_manifest(doc: object) -> tuple[Payee, ...]:
             "no_nano_payee",
             "this document advertises no Nano mainnet entry"
             + (f" ({nano_entries} Nano entry/entries were read and none held a payee)" if nano_entries else ""),
+            other_rails_from_manifest(doc),
         )
     return tuple(
         Payee(
@@ -798,7 +844,10 @@ def _main(argv: list[str]) -> int:
     try:
         payees = payees_from_manifest(doc)
     except ManifestRefused as error:
-        print(json.dumps({"verdict": error.reason, "detail": error.detail}))
+        refusal = {"verdict": error.reason, "detail": error.detail}
+        if error.other_rails:
+            refusal["other_rails"] = list(error.other_rails)
+        print(json.dumps(refusal))
         return 3
     read_at = _utc_now()
     out = []
@@ -814,7 +863,12 @@ def _main(argv: list[str]) -> int:
                         "detail": str(error)})
             continue
         out.append({"payee": json.loads(payee.to_json()), "payers": json.loads(report.to_json())})
-    print(json.dumps({"source": url, "read_at": read_at, "payees": out}, indent=1))
+    result = {"source": url, "read_at": read_at, "payees": out}
+    # Only when there are any, so a Nano-only document prints what it always did.
+    other_rails = other_rails_from_manifest(doc)
+    if other_rails:
+        result["other_rails"] = list(other_rails)
+    print(json.dumps(result, indent=1))
     return 0
 
 
