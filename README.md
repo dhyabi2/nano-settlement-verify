@@ -372,7 +372,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-640 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+644 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -516,6 +516,9 @@ paid is refused and named: `payee_checksum` (an address XNO would vanish into),
 `network_unspecified` (a bare `nano`, which names the family and not the network, and
 Nano's test networks share the `nano_` prefix), `not_mainnet`, `amount_not_raw` (a price
 written `1e26` or `0.0001`, or as a JSON number, which cannot carry 30 digits exactly).
+Skipped entries are not dropped silently: the CLI's output, including a `no_nano_payee`
+refusal for a USDC-only document, lists them under `other_rails` (network, asset, `pay_to`,
+resource) with `counted: false`, because this tool reads the Nano ledger only.
 
 What the count will **not** include, each because including it overstates what a seller has
 been paid:
