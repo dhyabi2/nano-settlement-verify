@@ -70,6 +70,8 @@ def nodes(monkeypatch):
         return asked
 
     monkeypatch.delenv("NANO_RPC_URL", raising=False)
+    for name in ("http_proxy", "HTTP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
     return install
 
 
@@ -280,6 +282,27 @@ def test_the_same_node_written_two_ways_is_a_duplicate(nodes, capsys):
     asked = nodes({})
 
     code, out, _ = run(capsys, "https://rpc.example,HTTPS://RPC.EXAMPLE/")
+
+    assert (code, asked) == (4, [])
+    assert json.loads(out)["detail"] == verify_cli.DUPLICATE_REFUSED
+
+
+def test_a_loopback_http_entry_is_refused_when_a_proxy_would_carry_it(nodes, capsys, monkeypatch):
+    asked = nodes({})
+    monkeypatch.setenv("http_proxy", "http://proxy.example:3128")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    code, out, _ = run(capsys, FIRST + "," + SECOND)
+
+    assert (code, asked) == (4, [])
+    assert json.loads(out)["detail"] == verify_cli.PLAIN_HTTP_IN_LIST_REFUSED
+
+
+def test_the_default_port_written_out_is_a_duplicate(nodes, capsys):
+    asked = nodes({})
+
+    code, out, _ = run(capsys, "https://a.example,https://a.example:443")
 
     assert (code, asked) == (4, [])
     assert json.loads(out)["detail"] == verify_cli.DUPLICATE_REFUSED

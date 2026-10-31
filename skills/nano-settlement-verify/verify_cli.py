@@ -35,6 +35,7 @@ import sys
 import threading
 import urllib.error
 import urllib.parse
+import urllib.request
 
 import nano_settlement_verify as _library
 from nano_settlement_verify import (
@@ -507,7 +508,12 @@ def _refuse_rpc_urls(rpc_urls):
     if len(rpc_urls) > 1:
         for url in rpc_urls:
             parts = urllib.parse.urlsplit(url)
-            if parts.scheme.lower() != "https" and (parts.hostname or "") not in _LOOPBACK_HOSTS:
+            if parts.scheme.lower() == "https":
+                continue
+            host = parts.hostname or ""
+            # http to this machine is safe only while no proxy carries it off it.
+            if host not in _LOOPBACK_HOSTS or (urllib.request.getproxies().get("http")
+                                               and not urllib.request.proxy_bypass(host)):
                 return PLAIN_HTTP_IN_LIST_REFUSED
     if len({_same_node_key(url) for url in rpc_urls}) != len(rpc_urls):
         return DUPLICATE_REFUSED
@@ -517,7 +523,11 @@ def _refuse_rpc_urls(rpc_urls):
 def _same_node_key(url):
     """url with scheme and host lower-cased and a trailing / dropped."""
     parts = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+    netloc = parts.netloc.lower()
+    default_port = {"https": ":443", "http": ":80"}.get(parts.scheme.lower())
+    if default_port and netloc.endswith(default_port):
+        netloc = netloc[:-len(default_port)]
+    return urllib.parse.urlunsplit((parts.scheme.lower(), netloc,
                                     parts.path.rstrip("/"), parts.query, parts.fragment))
 
 

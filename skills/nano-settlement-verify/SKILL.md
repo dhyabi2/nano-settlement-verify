@@ -43,7 +43,9 @@ python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
   In a list every entry must be `https`, except a node on this machine (`localhost`,
   `127.0.0.1`, `::1`), and a TLS failure stops the list: no other node is asked. A comma
   inside one URL (`?keys=a,b`) is not a list; the URL is split only when every piece starts
-  with a scheme.
+  with a scheme. A single URL whose query holds `,https://...` or ends in a comma reads as a
+  list: write that comma as `%2C`. An http entry for this machine is refused while an
+  `http_proxy` would carry it off the machine (set `no_proxy=localhost,127.0.0.1,::1`).
   The URL must be `http` or `https` and must not contain an `@` anywhere: a URL with
   credentials (`http://user:password@host/`), with an `@` in its path or query, of any
   other scheme (`file://`, `ftp://`, none), with a port that is not a number from 0 to
