@@ -853,3 +853,81 @@ def test_corroboration_witnesses_a_frontier_only_when_every_node_had_it(monkeypa
     report = payers_corroborated(PAYEE, [A, B])
     assert report.distinct_payers == 2
     assert report.witness == {"frontier": None, "block_count": None}
+
+
+# --------------------------------------------------------------------------
+# other_rails - what the recount did not count, named rather than dropped
+# --------------------------------------------------------------------------
+
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+USDC_PAYEE = "0x1111111111111111111111111111111111111111"
+NOT_COUNTED = (
+    "nano_payers reads the Nano ledger only; this entry's payments are on "
+    "another ledger and are not counted here"
+)
+
+
+def usdc_entry():
+    return {"scheme": "exact", "network": "eip155:8453", "asset": BASE_USDC,
+            "payTo": USDC_PAYEE, "amount": "1000"}
+
+
+def run_main(monkeypatch, capsys, doc, *rpc):
+    """Run the CLI on `doc` as if it had been fetched, and return (code, parsed output)."""
+
+    class Body:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(doc).encode("utf-8")
+
+    # The same urllib.request module _main imports; no_sockets refuses it otherwise.
+    monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", lambda *a, **k: Body())
+    code = nano_payers._main(["https://seller.example/.well-known/x402", *rpc])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_a_usdc_entry_beside_ours_is_named_as_not_counted(monkeypatch, capsys):
+    doc = {"resources": [{"url": "https://seller.example/thing", "accepts": [
+        usdc_entry(),
+        {"network": "nano:mainnet", "payTo": PAYEE, "amount": str(CALL_PRICE)},
+    ]}]}
+    nodes(monkeypatch, {A: history(open_block(PAYER_1, CALL_PRICE))})
+    code, out = run_main(monkeypatch, capsys, doc, A)
+    assert code == 0
+    assert out["payees"][0]["payers"]["distinct_payers"] == 1
+    assert out["other_rails"] == [{
+        "network": "eip155:8453", "asset": BASE_USDC, "pay_to": USDC_PAYEE,
+        "resource": "https://seller.example/thing", "counted": False, "why": NOT_COUNTED,
+    }]
+
+
+def test_a_usdc_only_document_says_what_it_did_not_count(monkeypatch, capsys):
+    doc = {"x402Version": 2, "accepts": [usdc_entry()]}
+    nodes(monkeypatch, {})
+    code, out = run_main(monkeypatch, capsys, doc)
+    assert code == 3
+    assert out["verdict"] == "no_nano_payee"
+    assert out["detail"] == "this document advertises no Nano mainnet entry"
+    assert out["other_rails"] == [{
+        "network": "eip155:8453", "asset": BASE_USDC, "pay_to": USDC_PAYEE,
+        "resource": None, "counted": False, "why": NOT_COUNTED,
+    }]
+
+
+def test_a_refusal_carries_the_rails_it_skipped():
+    with pytest.raises(ManifestRefused) as caught:
+        payees_from_manifest({"accepts": [usdc_entry()]})
+    assert caught.value.reason == "no_nano_payee"
+    assert [rail["network"] for rail in caught.value.other_rails] == ["eip155:8453"]
+
+
+def test_a_nano_only_document_prints_no_other_rails_key(monkeypatch, capsys):
+    nodes(monkeypatch, {A: history(open_block(PAYER_1, CALL_PRICE))})
+    code, out = run_main(monkeypatch, capsys, CATALOGUE, A)
+    assert code == 0
+    assert set(out) == {"source", "read_at", "payees"}
