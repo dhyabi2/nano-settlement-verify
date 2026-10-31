@@ -60,6 +60,14 @@ is refused rather than IDNA-mapped: write it in its `xn--` form. These
 refusals are configuration errors: retrying will not fix them. Whitespace around the URL,
 as the argument or the variable, is ignored; a blank argument is refused, not replaced.
 
+To give the CLI a fallback node, list it after the first, comma-separated, in the argument or
+in `$NANO_RPC_URL`: `python3 verify_cli.py BLOCK EXPECT_RAW ACCOUNT "https://rpc.nano.to,https://<your second node>"`.
+The next node is asked only when the one before could not be reached or read (exit 4); any
+answer from a node - settled, not yet, mismatch, no such block - is final and is not retried.
+Every URL is checked before any is asked, a URL listed twice or an empty entry is refused (exit 4),
+and with more than one URL the verdict names the node that answered as `"rpc_index"` (0-based).
+Failover is not agreement: to need two nodes to agree, use `nano_quorum` ([One node's word, or two?](#one-nodes-word-or-two)).
+
 When the node cannot be reached or read, the detail is chosen by the error's class alone,
 from parts of it that cannot hold the URL - the URL itself is never consulted:
 
@@ -372,7 +380,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-644 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+674 tests: for `verify`, the four acceptance cases, the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

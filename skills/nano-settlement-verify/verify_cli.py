@@ -4,6 +4,12 @@
 usage: python3 verify_cli.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]
 WHEN is unix seconds or ISO-8601 with an offset (2026-10-09T18:00:00Z); inclusive.
 RPC_URL defaults to $NANO_RPC_URL, else https://rpc.nano.to; the argument wins over both.
+RPC_URL may be a comma-separated list ("https://rpc.nano.to,https://node2.example"): the
+nodes are asked in order, and the next one only when a node could not be reached or read
+(the exit 4 case); any answer from a node is final. Every URL in the list is checked by
+the rules below before anything is sent, a URL listed twice or an empty entry is refused
+(4), and with more than one URL the verdict carries "rpc_index", the 0-based position of
+the node that answered. Agreement of two nodes is nano_quorum's job, not this failover's.
 RPC_URL must be http or https with no '@' anywhere in it (write an '@' in a path or query
 as %40; credentials are never sent, and %40 or %3A in the host part counts as one), no
 control character, a host of ASCII letters, digits, '-', '.' and '_' or an IP address (no
@@ -29,6 +35,7 @@ import sys
 import threading
 import urllib.error
 import urllib.parse
+import urllib.request
 
 import nano_settlement_verify as _library
 from nano_settlement_verify import (
@@ -97,6 +104,20 @@ REPLY_TOO_LARGE = "the node's reply was too large to read"
 # encoded string without null bytes" for a NUL in a tunnelled host) is not about
 # the reply: it is reported as a failed request.
 REQUEST_TYPE_ERROR = "the request to the RPC URL failed (TypeError)"
+# A comma-separated RPC_URL is a fallback list. Its two refusals of its own are
+# fixed strings too: a URL named twice would only be asked twice, and an empty
+# entry (`a,,b`, a trailing comma) is a typo, not a node.
+DUPLICATE_REFUSED = "the RPC URL list names the same URL twice"
+PLAIN_HTTP_IN_LIST_REFUSED = ("a RPC URL list may name http only for a node on this machine;"
+                              " every other entry must be https")
+# In a list, every node is reached over https (or is on this machine), so a
+# reply - even one that cannot be read, such as a rate-limit message - came
+# from the node the operator named, and the next named node may be asked.
+# A TLS failure is the one exception: it is what someone on the path can
+# cause, and it is never a reason to ask anyone else.
+_STARTS_WITH_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+EMPTY_ENTRY_REFUSED = "the RPC URL list has an empty entry"
 
 
 def _reply_not_checked(error):
@@ -435,39 +456,115 @@ def main(argv):
     # is asked as written without the space; a blank argument stays blank and
     # is refused below, never replaced by the variable or the default.
     rpc_url = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
-    refused = _refuse_rpc_url(rpc_url)
+    # A comma makes it a fallback list. Without one, the list is the one URL as
+    # before, and everything below prints exactly what it printed before.
+    # A comma inside one URL (a query such as `?keys=a,b`) is not a list: it is
+    # split only when every piece starts with a scheme (`https://`, ...).
+    rpc_urls = [rpc_url]
+    if "," in rpc_url:
+        parts = [part.strip() for part in rpc_url.split(",")]
+        if all(_STARTS_WITH_SCHEME.match(part) or not part for part in parts):
+            rpc_urls = parts
+    refused = _refuse_rpc_urls(rpc_urls)
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
         return 4
+    failures = []
+    for index, url in enumerate(rpc_urls):
+        code, out, may_try_next = _ask_one(block_hash=block_hash, expect_raw=expect_raw,
+                                           account=account, rpc_url=url, not_after=not_after)
+        if code == 4 and not may_try_next:
+            # TLS failed: nothing was checked, and no other node is asked.
+            failures.append("node %d of %d: %s" % (index + 1, len(rpc_urls), out["detail"]))
+            break
+        if code != 4:
+            # The node answered: settled, not yet, mismatch, no such block, late
+            # or unknown time. That answer is final; the next node is not asked
+            # for a second opinion it could overrule it with.
+            break
+        failures.append("node %d of %d: %s" % (index + 1, len(rpc_urls), out["detail"]))
+    if len(rpc_urls) > 1:
+        if code == 4:
+            out = {"verdict": "node_unreachable", "detail": "; ".join(failures)}
+        else:
+            out = dict(json.loads(out.to_json()) if isinstance(out, _library.Receipt) else out,
+                       rpc_index=index)
+    print(out.to_json() if isinstance(out, _library.Receipt) else json.dumps(out))
+    return code
+
+
+def _refuse_rpc_urls(rpc_urls):
+    """A fixed reason the CLI will not ask this list, or None when it may.
+
+    Every URL is checked before any is asked, so a bad last entry is caught
+    before the first node hears anything.
+    """
+    for url in rpc_urls:
+        if len(rpc_urls) > 1 and not url:
+            return EMPTY_ENTRY_REFUSED
+        refused = _refuse_rpc_url(url)
+        if refused is not None:
+            return refused
+    if len(rpc_urls) > 1:
+        for url in rpc_urls:
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme.lower() == "https":
+                continue
+            host = parts.hostname or ""
+            # http to this machine is safe only while no proxy can carry it off
+            # it. Whether no_proxy exempts a host is urllib's parse to get right
+            # (an IPv6 host with a port reads differently), so with any http
+            # proxy set no http entry is taken at all.
+            if host not in _LOOPBACK_HOSTS or urllib.request.getproxies().get("http"):
+                return PLAIN_HTTP_IN_LIST_REFUSED
+    if len({_same_node_key(url) for url in rpc_urls}) != len(rpc_urls):
+        return DUPLICATE_REFUSED
+    return None
+
+
+def _same_node_key(url):
+    """url with scheme and host lower-cased and a trailing / dropped."""
+    parts = urllib.parse.urlsplit(url)
+    netloc = parts.netloc.lower()
+    default_port = {"https": ":443", "http": ":80"}.get(parts.scheme.lower())
+    if default_port and netloc.endswith(default_port):
+        netloc = netloc[:-len(default_port)]
+    return urllib.parse.urlunsplit((parts.scheme.lower(), netloc,
+                                    parts.path.rstrip("/"), parts.query, parts.fragment))
+
+
+def _may_try_next(error):
+    """False for a TLS failure: the next node is not asked. True otherwise."""
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+        error = error.reason
+    return not isinstance(error, ssl.SSLError)
+
+
+def _ask_one(**arguments):
+    """(exit code, verdict, may_try_next) from one node: a Receipt for 0 and 2, else a dict.
+
+    Exit 4 means this node could not be reached or read; nothing was checked.
+    """
     try:
-        receipt = _verify_objects_only(block_hash=block_hash, expect_raw=expect_raw,
-                                       account=account, rpc_url=rpc_url, not_after=not_after)
+        receipt = _verify_objects_only(**arguments)
     except Late as error:
-        print(json.dumps({"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
-                          "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}))
-        return 5
+        return 5, {"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
     except UnknownTime as error:
-        print(json.dumps({"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
-                          "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}))
-        return 6
+        return 6, {"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
     except NotFound:
-        print(json.dumps({"verdict": "no_such_block"}))
-        return 3
+        return 3, {"verdict": "no_such_block"}, False
     except Mismatch as error:
-        print(json.dumps({"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}))
-        return 3
+        return 3, {"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}, False
     except _RequestTypeError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR}, False
     except _NotAnObject:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}, True
     except TypeError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}, True
     except RecursionError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}, True
     except (OSError, ValueError, http.client.HTTPException) as error:
         # ValueError stays here: the library's NotANodeReply is one, and its
         # text - built from the node's reply - is printed as main printed it.
@@ -476,22 +573,17 @@ def main(argv):
         # ValueError and used to escape as a traceback with exit 1. A URL the
         # node cannot be reached at is still "nothing was checked".
         # _error_detail decides the text by the error's class alone.
-        print(json.dumps({"verdict": "node_unreachable", "detail": _error_detail(error)}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": _error_detail(error)}, _may_try_next(error)
     except OverflowError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}, True
     except MemoryError:
-        print(json.dumps({"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}))
-        return 4
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}, True
     except Exception as error:  # noqa: BLE001 - no reply may end in a traceback
         # Whatever else a node's reply makes the library raise, nothing was
         # checked: exit 4, never a traceback with exit 1, which SKILL.md's
         # table has no row for. The detail names the class only.
-        print(json.dumps({"verdict": "node_unreachable", "detail": _reply_not_checked(error)}))
-        return 4
-    print(receipt.to_json())
-    return 0 if receipt.settled else 2
+        return 4, {"verdict": "node_unreachable", "detail": _reply_not_checked(error)}, True
+    return 0 if receipt.settled else 2, receipt, False
 
 
 if __name__ == "__main__":

@@ -240,8 +240,9 @@ def test_a_plain_integer_amount_is_untouched_by_the_guard():
 # test failure instead of something somebody has to notice.
 
 _EXIT_TABLE_ROW = re.compile(r"^\|\s*(\d+)\s*\|")
-#: `return 0` / `return 64` in the CLI's own control flow.
-_CLI_RETURN = re.compile(r"^\s*return\s+(\d+)\s*$", re.MULTILINE)
+#: `return 0` / `return 64` in the CLI's own control flow, and `return 4, {...}`
+#: from the one-node ask, whose code main returns as it got it.
+_CLI_RETURN = re.compile(r"^\s*return\s+(\d+)\s*(?:,.*)?$", re.MULTILINE)
 #: `exit 0 settled, 2 not confirmed yet, ...` in the usage docstring.
 _DOCSTRING_CODE = re.compile(r"\b(\d+)\s+(?:settled|not confirmed|mismatch|node unreachable|late|unknown_time|usage)")
 
