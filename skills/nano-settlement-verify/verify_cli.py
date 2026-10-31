@@ -107,6 +107,15 @@ REQUEST_TYPE_ERROR = "the request to the RPC URL failed (TypeError)"
 # fixed strings too: a URL named twice would only be asked twice, and an empty
 # entry (`a,,b`, a trailing comma) is a typo, not a node.
 DUPLICATE_REFUSED = "the RPC URL list names the same URL twice"
+PLAIN_HTTP_IN_LIST_REFUSED = ("a RPC URL list may name http only for a node on this machine;"
+                              " every other entry must be https")
+# In a list, every node is reached over https (or is on this machine), so a
+# reply - even one that cannot be read, such as a rate-limit message - came
+# from the node the operator named, and the next named node may be asked.
+# A TLS failure is the one exception: it is what someone on the path can
+# cause, and it is never a reason to ask anyone else.
+_STARTS_WITH_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 EMPTY_ENTRY_REFUSED = "the RPC URL list has an empty entry"
 
 
@@ -448,15 +457,25 @@ def main(argv):
     rpc_url = argv[4].strip() if len(argv) == 5 else _rpc_url_from_env()
     # A comma makes it a fallback list. Without one, the list is the one URL as
     # before, and everything below prints exactly what it printed before.
-    rpc_urls = [part.strip() for part in rpc_url.split(",")] if "," in rpc_url else [rpc_url]
+    # A comma inside one URL (a query such as `?keys=a,b`) is not a list: it is
+    # split only when every piece starts with a scheme (`https://`, ...).
+    rpc_urls = [rpc_url]
+    if "," in rpc_url:
+        parts = [part.strip() for part in rpc_url.split(",")]
+        if all(_STARTS_WITH_SCHEME.match(part) or not part for part in parts):
+            rpc_urls = parts
     refused = _refuse_rpc_urls(rpc_urls)
     if refused is not None:
         print(json.dumps({"verdict": "node_unreachable", "detail": refused}))
         return 4
     failures = []
     for index, url in enumerate(rpc_urls):
-        code, out = _ask_one(block_hash=block_hash, expect_raw=expect_raw,
-                             account=account, rpc_url=url, not_after=not_after)
+        code, out, may_try_next = _ask_one(block_hash=block_hash, expect_raw=expect_raw,
+                                           account=account, rpc_url=url, not_after=not_after)
+        if code == 4 and not may_try_next:
+            # TLS failed: nothing was checked, and no other node is asked.
+            failures.append("node %d of %d: %s" % (index + 1, len(rpc_urls), out["detail"]))
+            break
         if code != 4:
             # The node answered: settled, not yet, mismatch, no such block, late
             # or unknown time. That answer is final; the next node is not asked
@@ -485,13 +504,32 @@ def _refuse_rpc_urls(rpc_urls):
         refused = _refuse_rpc_url(url)
         if refused is not None:
             return refused
-    if len(set(rpc_urls)) != len(rpc_urls):
+    if len(rpc_urls) > 1:
+        for url in rpc_urls:
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme.lower() != "https" and (parts.hostname or "") not in _LOOPBACK_HOSTS:
+                return PLAIN_HTTP_IN_LIST_REFUSED
+    if len({_same_node_key(url) for url in rpc_urls}) != len(rpc_urls):
         return DUPLICATE_REFUSED
     return None
 
 
+def _same_node_key(url):
+    """url with scheme and host lower-cased and a trailing / dropped."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                                    parts.path.rstrip("/"), parts.query, parts.fragment))
+
+
+def _may_try_next(error):
+    """False for a TLS failure: the next node is not asked. True otherwise."""
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+        error = error.reason
+    return not isinstance(error, ssl.SSLError)
+
+
 def _ask_one(**arguments):
-    """(exit code, verdict) from one node: a Receipt for 0 and 2, else a dict.
+    """(exit code, verdict, may_try_next) from one node: a Receipt for 0 and 2, else a dict.
 
     Exit 4 means this node could not be reached or read; nothing was checked.
     """
@@ -499,22 +537,22 @@ def _ask_one(**arguments):
         receipt = _verify_objects_only(**arguments)
     except Late as error:
         return 5, {"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
-                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
     except UnknownTime as error:
         return 6, {"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
-                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}
+                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
     except NotFound:
-        return 3, {"verdict": "no_such_block"}
+        return 3, {"verdict": "no_such_block"}, False
     except Mismatch as error:
-        return 3, {"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}
+        return 3, {"verdict": "mismatch", "expected": str(error.expected), "got": str(error.got)}, False
     except _RequestTypeError:
-        return 4, {"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR}
+        return 4, {"verdict": "node_unreachable", "detail": REQUEST_TYPE_ERROR}, False
     except _NotAnObject:
-        return 4, {"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_NOT_AN_OBJECT}, True
     except TypeError:
-        return 4, {"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_WRONG_TYPE}, True
     except RecursionError:
-        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_DEEP}, True
     except (OSError, ValueError, http.client.HTTPException) as error:
         # ValueError stays here: the library's NotANodeReply is one, and its
         # text - built from the node's reply - is printed as main printed it.
@@ -523,17 +561,17 @@ def _ask_one(**arguments):
         # ValueError and used to escape as a traceback with exit 1. A URL the
         # node cannot be reached at is still "nothing was checked".
         # _error_detail decides the text by the error's class alone.
-        return 4, {"verdict": "node_unreachable", "detail": _error_detail(error)}
+        return 4, {"verdict": "node_unreachable", "detail": _error_detail(error)}, _may_try_next(error)
     except OverflowError:
-        return 4, {"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_NUMBER_TOO_LARGE}, True
     except MemoryError:
-        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}
+        return 4, {"verdict": "node_unreachable", "detail": REPLY_TOO_LARGE}, True
     except Exception as error:  # noqa: BLE001 - no reply may end in a traceback
         # Whatever else a node's reply makes the library raise, nothing was
         # checked: exit 4, never a traceback with exit 1, which SKILL.md's
         # table has no row for. The detail names the class only.
-        return 4, {"verdict": "node_unreachable", "detail": _reply_not_checked(error)}
-    return 0 if receipt.settled else 2, receipt
+        return 4, {"verdict": "node_unreachable", "detail": _reply_not_checked(error)}, True
+    return 0 if receipt.settled else 2, receipt, False
 
 
 if __name__ == "__main__":

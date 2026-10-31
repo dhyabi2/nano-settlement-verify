@@ -227,3 +227,59 @@ def test_a_single_mismatch_prints_exactly_as_before(nodes, capsys):
     assert code == 3
     assert out == json.dumps({"verdict": "mismatch", "expected": str(RAW),
                               "got": str(RAW - 1)}) + "\n"
+
+
+# --- no downgrade: a list is https (or this machine), and TLS failure stops ----
+
+
+@pytest.mark.parametrize("rpc", [
+    "https://rpc.nano.to,http://plain.example",
+    "http://plain.example,https://rpc.nano.to",
+    "http://10.0.0.5:7076," + SECOND,
+])
+def test_a_list_refuses_plain_http_to_another_machine(nodes, capsys, rpc):
+    asked = nodes({})
+
+    code, out, _ = run(capsys, rpc)
+
+    assert (code, asked) == (4, [])
+    assert json.loads(out)["detail"] == verify_cli.PLAIN_HTTP_IN_LIST_REFUSED
+
+
+def test_a_single_plain_http_url_is_still_asked_as_before(nodes, capsys):
+    asked = nodes({"http://plain.example": block_info()})
+
+    code, _, _ = run(capsys, "http://plain.example")
+
+    assert (code, asked) == (0, ["http://plain.example"])
+
+
+def test_a_tls_failure_is_not_a_reason_to_ask_the_next_node(nodes, capsys):
+    import ssl
+    tls = urllib.error.URLError(ssl.SSLError(1, "certificate verify failed"))
+    other = "https://node-three.example"
+    asked = nodes({SECOND: tls, other: AssertionError("must not be asked")})
+
+    code, out, _ = run(capsys, SECOND + "," + other)
+
+    assert (code, asked) == (4, [SECOND])
+    assert json.loads(out)["verdict"] == "node_unreachable"
+
+
+def test_a_comma_inside_one_url_is_not_a_list(nodes, capsys):
+    url = "https://rpc.example/api?keys=a,b"
+    asked = nodes({url: block_info()})
+
+    code, out, _ = run(capsys, url)
+
+    assert (code, asked) == (0, [url])
+    assert "rpc_index" not in json.loads(out)
+
+
+def test_the_same_node_written_two_ways_is_a_duplicate(nodes, capsys):
+    asked = nodes({})
+
+    code, out, _ = run(capsys, "https://rpc.example,HTTPS://RPC.EXAMPLE/")
+
+    assert (code, asked) == (4, [])
+    assert json.loads(out)["detail"] == verify_cli.DUPLICATE_REFUSED
