@@ -147,7 +147,7 @@ def block_hash_of(contents: object) -> str | None:
             parts = (bytes.fromhex(previous), destination, bytes.fromhex(balance))
         else:
             return None
-    except OverflowError:  # a state balance beyond 128 bits is no balance
+    except (OverflowError, ValueError):  # a balance beyond 128 bits (or past int()'s digit limit) is no balance
         return None
     digest = hashlib.blake2b(digest_size=32)
     for part in parts:
@@ -219,13 +219,17 @@ def _facts(block_hash: str, reply: object) -> tuple[dict | None, str | None]:
                 return None, (f"{where} {name} {rendered[name]!r} is not the account "
                               "the hashed contents pay")
     amount = reply.get("amount")
+    if isinstance(amount, str) and _DIGITS.fullmatch(amount) and len(amount.lstrip("0")) > 39:
+        return None, "amount is beyond 128 bits; no raw amount"
     return {
         "confirmed": reply.get("confirmed") == "true",
         "operation": _operation(reply),
         "source": source if isinstance(source, str) else None,
         "destination": destination,
         "source_hashed": contents.get("type") == "state",
-        "amount": int(amount) if isinstance(amount, str) and _DIGITS.fullmatch(amount) else None,
+        # 2**128 has 39 digits; a longer string is no raw amount (and int() refuses past 4300 digits)
+        "amount": (int(amount) if isinstance(amount, str) and _DIGITS.fullmatch(amount)
+                   and len(amount.lstrip("0")) <= 39 else None),
         "seen_at": _seen_at(reply),
     }, None
 
@@ -289,7 +293,10 @@ def five_field_verdict(
         if not hash_ok:
             failed[str(url)] = "no valid block hash to check the reply against"
             continue
-        facts, why = _facts(block_hash, reply)
+        try:
+            facts, why = _facts(block_hash, reply)
+        except _UNREADABLE as error:  # one hostile reply fails that node, never the verdict
+            facts, why = None, f"unreadable reply: {type(error).__name__}"
         if facts is None:
             failed[str(url)] = why
             continue
@@ -300,7 +307,10 @@ def five_field_verdict(
         seen_keys.add(key)
         readable[str(url)] = facts
 
-    stories = {(f["operation"], f["source"], f["destination"], f["amount"])
+    def _key(account):  # nano_ and xrb_ spell one account: compare the public key
+        return public_key_from_address(account) or account
+
+    stories = {(f["operation"], _key(f["source"]), _key(f["destination"]), f["amount"])
                for f in readable.values()}
     disagree = len(stories) > 1
     nodes_read = {"read": list(readable), "failed": failed, "required": min_nodes}
@@ -356,6 +366,9 @@ def five_field_verdict(
             field = _missing("payee is not a valid Nano account", **entry)
         elif public_key_from_address(source) is None or public_key_from_address(destination) is None:
             field = _missing("source or destination unreadable", **entry)
+        elif not facts["operation"]:
+            field = _missing("the node named no operation (no subtype); not read as a send "
+                             "or as a refusal", **entry)
         elif facts["operation"] != "send":
             field = {"status": "fail", "why": f"block is a {facts['operation'] or 'unnamed'} "
                      "block, not a send", **entry}

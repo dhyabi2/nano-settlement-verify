@@ -534,3 +534,57 @@ def test_doc_and_docstring_name_subtype_and_legacy_block_account_as_node_asserte
     steps = text[text.index("## What to compare, by eye"):text.index("## The local hash")]
     assert "`contents.link`" in steps
     assert "public key" in steps
+
+
+# --- review of 240df7e: a hostile reply fails its node, never the verdict --------
+
+NODE_C = "https://third-node.example"
+
+
+def test_an_amount_past_python_digit_limit_fails_that_node_not_the_verdict():
+    block_hash, reply = state_send()
+    hostile = copy.deepcopy(reply)
+    hostile["amount"] = "1" * 5000
+    out = verdict(block_hash, two_nodes(reply) + [(NODE_C, hostile)])
+    assert out["verdict"] == "settled"
+    assert NODE_C in out["fields"]["nodes_read"]["failed"]
+
+
+def test_an_amount_beyond_128_bits_fails_that_node():
+    block_hash, reply = state_send()
+    hostile = copy.deepcopy(reply)
+    hostile["amount"] = str(2**128 * 10)
+    out = verdict(block_hash, two_nodes(reply) + [(NODE_C, hostile)])
+    assert out["verdict"] == "settled"
+    assert "128 bits" in out["fields"]["nodes_read"]["failed"][NODE_C]
+
+
+def test_a_leading_zero_amount_still_settles():
+    block_hash, reply = state_send()
+    padded = copy.deepcopy(reply)
+    padded["amount"] = "0" * 50 + str(PRICE)
+    assert verdict(block_hash, two_nodes(padded))["verdict"] == "settled"
+
+
+def test_a_state_balance_past_python_digit_limit_does_not_raise():
+    _, reply = state_send()
+    contents = dict(reply["contents"], balance="9" * 4500)
+    assert block_hash_of(contents) is None
+
+
+def test_a_reply_that_names_no_operation_is_unknown_not_refused():
+    block_hash, reply = state_send()
+    unnamed = copy.deepcopy(reply)
+    del unnamed["subtype"]
+    out = verdict(block_hash, two_nodes(unnamed))
+    assert out["verdict"] == "unknown"
+    assert out["fields"]["source_not_destination_not_excluded"]["status"] == "missing"
+
+
+def test_nano_and_xrb_spellings_of_one_account_agree():
+    block_hash, reply = state_send()
+    respelled = copy.deepcopy(reply)
+    respelled["block_account"] = "xrb_" + PAYER[len("nano_"):]
+    out = verdict(block_hash, two_nodes(reply, respelled))
+    assert "disagree" not in out["fields"]["nodes_read"].get("why", "")
+    assert out["fields"]["nodes_read"]["status"] == "ok"
