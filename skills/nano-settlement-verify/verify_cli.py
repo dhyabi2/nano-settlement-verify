@@ -511,9 +511,11 @@ def _refuse_rpc_urls(rpc_urls):
             if parts.scheme.lower() == "https":
                 continue
             host = parts.hostname or ""
-            # http to this machine is safe only while no proxy carries it off it.
-            if host not in _LOOPBACK_HOSTS or (urllib.request.getproxies().get("http")
-                                               and not urllib.request.proxy_bypass(host)):
+            # http to this machine is safe only while no proxy can carry it off
+            # it. Whether no_proxy exempts a host is urllib's parse to get right
+            # (an IPv6 host with a port reads differently), so with any http
+            # proxy set no http entry is taken at all.
+            if host not in _LOOPBACK_HOSTS or urllib.request.getproxies().get("http"):
                 return PLAIN_HTTP_IN_LIST_REFUSED
     if len({_same_node_key(url) for url in rpc_urls}) != len(rpc_urls):
         return DUPLICATE_REFUSED

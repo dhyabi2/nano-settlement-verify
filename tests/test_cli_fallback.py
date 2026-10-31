@@ -306,3 +306,14 @@ def test_the_default_port_written_out_is_a_duplicate(nodes, capsys):
 
     assert (code, asked) == (4, [])
     assert json.loads(out)["detail"] == verify_cli.DUPLICATE_REFUSED
+
+
+def test_no_proxy_does_not_let_a_loopback_http_entry_through(nodes, capsys, monkeypatch):
+    asked = nodes({})
+    monkeypatch.setenv("http_proxy", "http://proxy.example:3128")
+    monkeypatch.setenv("no_proxy", "::1,localhost,127.0.0.1")
+
+    code, out, _ = run(capsys, "http://[::1]:7076," + SECOND)
+
+    assert (code, asked) == (4, [])
+    assert json.loads(out)["detail"] == verify_cli.PLAIN_HTTP_IN_LIST_REFUSED
