@@ -103,3 +103,10 @@ amount per order so a block can match only one order.
 ## Source
 
 One file, Python standard library only: https://github.com/dhyabi2/nano-settlement-verify (MIT).
+
+## Keep the refusal in the path: probe_gate.py
+
+`python3 probe_gate.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL]` runs the same check twice: first with a
+recipient the block was not sent to, which must come back `mismatch` (exit 3), then with the real one. It
+prints `PROBE-REFUSED`, the real verdict and `APPROVE` (exit 0) only when both hold; a probe that was not
+refused exits 7 and approves nothing, so a check that stopped refusing cannot pass a spend.
