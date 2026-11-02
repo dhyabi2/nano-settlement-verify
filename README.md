@@ -81,6 +81,12 @@ An operator who will not let the agent hold a key: see [OPERATORS.md](https://gi
 pip install .
 ```
 
+Or straight from the tagged release, no clone and no PyPI (`v1.0.0`; `import nano_settlement_verify`):
+
+```
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.0.0"
+```
+
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
 dependencies.
 
