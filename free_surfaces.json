@@ -1,0 +1,14 @@
+[
+  {"name": "rpc.nano.to", "url": "https://rpc.nano.to", "actions": ["block_info", "blocks_info"], "auth": "none",
+   "quota_as_published": "none published in the reply; a 4,746-of-5,000 counter was seen on node.somenano.com/proxy only",
+   "cost_usd": 0.0, "measured_at": "2026-11-02", "measured_from": "dhyabi2 laptop (macOS), curl with a User-Agent and Content-Type: application/json"},
+  {"name": "node.somenano.com/proxy", "url": "https://node.somenano.com/proxy", "actions": ["block_info"], "auth": "none",
+   "quota_as_published": "error replies carry requestsLimit 5000 and a reset time",
+   "cost_usd": 0.0, "measured_at": "2026-11-02", "measured_from": "dhyabi2 laptop (macOS), curl"},
+  {"name": "nanoslo.0x.no/proxy", "url": "https://nanoslo.0x.no/proxy", "actions": ["block_info"], "auth": "none",
+   "quota_as_published": "not published",
+   "cost_usd": 0.0, "measured_at": "2026-11-02", "measured_from": "dhyabi2 laptop (macOS), curl"},
+  {"name": "rainstorm.city/api", "url": "https://rainstorm.city/api", "actions": ["block_info"], "auth": "none",
+   "quota_as_published": "not published",
+   "cost_usd": 0.0, "measured_at": "2026-11-02", "measured_from": "dhyabi2 laptop (macOS), curl"}
+]
