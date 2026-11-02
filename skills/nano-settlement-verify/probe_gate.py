@@ -8,8 +8,9 @@ swallows the exit code, a check that no longer compares the payee, a node that a
 "confirmed" for anything) and nobody notices, because a working payment looks the same
 either way. This keeps the refusal in the path: before the real check it runs verify_cli.py
 on the SAME block and amount with a recipient the block was not sent to, and it approves
-only when that probe came back `mismatch` (exit 3) AND the real check came back settled
-(exit 0). It is a thin wrapper: every rule of verify_cli.py (node URL checks, exit codes,
+only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
+probe account - AND the real check came back settled (exit 0). Any other exit 3 on the
+probe (no_such_block, a wrong amount, invalid_amount) is not a refusal of the payee. It is a thin wrapper: every rule of verify_cli.py (node URL checks, exit codes,
 error text, --not-after) applies to both calls unchanged.
 
 Both calls are answered by ONE node. With an RPC_URL list (or a list in $NANO_RPC_URL) the
@@ -25,10 +26,12 @@ of independent nodes is nano_quorum's job.
 
 prints  PROBE-REFUSED, then the real check's JSON verdict, then APPROVE
 exit 0  approved
-     2  the block is not confirmed yet (on the probe or the real check); nothing approved
-     7  the probe was NOT refused, or the two calls could not be pinned to one node:
-        the check is not doing its job, nothing is approved
+     2  the block is not confirmed yet (on the probe or the real check), or the probe's node
+        has no such block; nothing approved
+     7  the probe was NOT refused on the payee, or the two calls could not be pinned to one
+        node: the check is not doing its job, nothing is approved
      4  the node could not be read (nothing was checked)
+    64  usage error (from this script or from verify_cli.py on the probe)
      other  the real check's own exit code (3 mismatch, 5 late, ...); nothing approved
 """
 import json
@@ -92,18 +95,47 @@ def _rpc_index(out):
     return index if type(index) is int else None
 
 
+def _payee_refusal(out, probe):
+    """What the probe's exit-3 verdict refused on: "payee" only for a mismatch whose
+    expected account is the probe account, "no_such_block", or None for anything else."""
+    try:
+        verdict = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    if verdict.get("verdict") == "no_such_block":
+        return "no_such_block"
+    expected = verdict.get("expected")
+    if (verdict.get("verdict") == "mismatch" and isinstance(expected, str)
+            and expected.startswith(_PREFIXES) and _account_body(expected) == _account_body(probe)):
+        return "payee"
+    return None
+
+
 def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     """Return (exit_code, lines_to_print)."""
     tail = ["--not-after", not_after] if not_after is not None else []
     nodes = _rpc_list(rpc)
     extra = [rpc] if rpc is not None else []
-    code, out = run([block, expect_raw, probe_account(account)] + extra + tail)
+    probe = probe_account(account)
+    code, out = run([block, expect_raw, probe] + extra + tail)
     if code == 4:
         return 4, [out.strip(), "PROBE-UNREAD (node unreachable; nothing was checked)"]
     if code == 2:
         return 2, [out.strip(), "PROBE-PENDING (block not confirmed yet; nothing approved)"]
+    if code == 64:
+        return 64, [out.strip(), "PROBE-USAGE-ERROR (exit 64): nothing approved"]
     if code != 3:
         return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
+    refusal = _payee_refusal(out, probe)
+    if refusal == "no_such_block":
+        return 2, [out.strip(), "PROBE-BLOCK-NOT-FOUND (not on this node yet; nothing approved)"]
+    if refusal != "payee":
+        # Exit 3 for any other reason (a wrong amount or operation, an amount that is
+        # not raw, unreadable JSON) says nothing about whether the payee is compared.
+        return EXIT_PROBE_PASSED, [out.strip(),
+                                   "PROBE-NOT-REFUSED-ON-PAYEE (exit 3, not a payee mismatch): nothing approved"]
     if nodes is not None and len(nodes) > 1:
         # Pin the real check to the node that refused the probe, passed explicitly
         # so neither the rest of the list nor $NANO_RPC_URL can answer it instead.

@@ -20,8 +20,15 @@ def fake(codes):
 
     def run(args):
         calls.append(args)
-        return codes[len(calls) - 1], '{"n": %d}' % len(calls)
+        code = codes[len(calls) - 1]
+        if code == 3:
+            return code, mismatch(args[2])
+        return code, '{"n": %d}' % len(calls)
     return run, calls
+
+
+def mismatch(expected, got=PAYEE, **extra):
+    return json.dumps(dict({"verdict": "mismatch", "expected": expected, "got": got}, **extra))
 
 
 def test_refused_probe_then_settled_approves():
@@ -81,7 +88,8 @@ def failover_nodes(nodes):
         for index, url in enumerate(urls):
             code = nodes[url](positional[2], len(calls))
             if code != 4:
-                verdict = {"settled": code == 0}
+                verdict = ({"verdict": "mismatch", "expected": positional[2], "got": PAYEE}
+                           if code == 3 else {"settled": code == 0})
                 if len(urls) > 1:
                     verdict["rpc_index"] = index
                 return code, json.dumps(verdict)
@@ -124,7 +132,7 @@ def test_real_check_answered_from_a_list_approves_nothing():
 
     def run(args):
         calls.append(args)
-        return (3, '{"rpc_index": 1}') if len(calls) == 1 else (0, '{"settled": true, "rpc_index": 0}')
+        return (3, mismatch(args[2], rpc_index=1)) if len(calls) == 1 else (0, '{"settled": true, "rpc_index": 0}')
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
     assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
 
@@ -173,3 +181,75 @@ def test_main_takes_not_after_with_rpc_url(monkeypatch):
     monkeypatch.setattr(probe_gate, "gate", gate)
     assert probe_gate.main([BLOCK, RAW, PAYEE, "https://rpc.nano.to", "--not-after", "1700000000"]) == 0
     assert seen == {"args": (BLOCK, RAW, PAYEE, "https://rpc.nano.to"), "not_after": "1700000000"}
+
+
+def scripted(probe_reply):
+    """Probe answers (3, probe_reply(probe_account)); the real check would say settled."""
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if len(calls) == 1:
+            return probe_reply(args[2])
+        return 0, '{"settled": true}'
+    return run, calls
+
+
+def test_probe_not_found_is_not_a_refusal_and_exits_2():
+    # A check that no longer compares the payee: the probe hits "Block not found"
+    # (exit 3) and the real check says settled for a send to someone else.
+    run, calls = scripted(lambda probe: (3, '{"verdict": "no_such_block"}'))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 2 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines and len(calls) == 1
+
+
+def test_probe_invalid_amount_is_not_a_refusal():
+    run, calls = scripted(lambda probe: (3, '{"verdict": "invalid_amount", "expect_raw": "x"}'))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_amount_mismatch_is_not_a_payee_refusal():
+    run, calls = scripted(lambda probe: (3, mismatch(RAW, got="1")))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_payee_mismatch_naming_another_account_is_not_a_refusal():
+    run, calls = scripted(lambda probe: (3, mismatch(PAYEE, got=probe)))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_exit_3_without_json_is_not_a_refusal():
+    for out in ("", "not json", "[]", '{"verdict": "mismatch"}', '{"verdict": "mismatch", "expected": 5}'):
+        run, calls = scripted(lambda probe: (3, out))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_payee_mismatch_in_xrb_spelling_is_a_refusal():
+    run, calls = scripted(lambda probe: (3, mismatch("xrb_" + probe[len("nano_"):])))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 0 and lines[0] == "PROBE-REFUSED" and lines[-1] == "APPROVE"
+
+
+def test_probe_usage_error_passes_through_as_64():
+    run, calls = scripted(lambda probe: (64, '{"verdict": "invalid_not_after", "not_after": "x"}'))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="x")
+    assert code == 64 and "APPROVE" not in lines and len(calls) == 1
+    assert not any("PROBE-NOT-REFUSED" in line for line in lines)
+
+
+def test_real_cli_usage_error_on_probe_exits_64():
+    # End to end through verify_cli.py: a bad --not-after is a usage error before any node is asked.
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "https://127.0.0.1:9", not_after="not-a-time")
+    assert code == 64 and "APPROVE" not in lines
+
+
+def test_skill_source_line_names_every_file_it_ships():
+    text = (SKILL / "SKILL.md").read_text()
+    source = text.split("## Source", 1)[1].split("##", 1)[0]
+    assert "One file" not in source
+    for name in ("nano_settlement_verify.py", "verify_cli.py", "probe_gate.py"):
+        assert name in source and (SKILL / name).exists()
