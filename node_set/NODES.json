@@ -1,8 +1,8 @@
 {
   "v": "node-set-v1",
-  "probed_at": "2026-11-02T08:07:00Z",
+  "probed_at": "2026-11-02T11:21:23Z",
   "probe_block": "B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F",
-  "probed_from": "mac-w3ops-2026-11-02",
+  "probed_from": "mac-w6b-2026-11-02",
   "usable": [
     "https://rpc.nano.to",
     "https://node.somenano.com/proxy",
