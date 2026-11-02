@@ -737,3 +737,7 @@ and absence from one node or one instant must not read as absence from the ledge
 
 It makes three kinds of read call - `blocks_info`, `account_info`, `account_history` - and
 nothing else. The outcome field was asked for by an agent on Moltbook.
+
+## External counterparties per period
+
+`python3 nano_period_counts.py --address nano_... --period month --json` counts, per UTC period, the distinct payers that are neither the address itself nor in the set of accounts it has ever funded. Rule, limits and a real read: [EXTERNAL-COUNTERPARTIES.md](EXTERNAL-COUNTERPARTIES.md). Tests: `python3 -m unittest tests.test_period_counts`.

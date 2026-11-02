@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-settlement-verify"
-version = "1.1.0"
+version = "1.2.0"
 description = "Verify that a Nano (XNO) send block really settled, without running a node client."
 readme = "README.md"
 license = { text = "MIT" }
@@ -16,7 +16,7 @@ keywords = ["nano", "xno", "x402", "payments", "settlement", "receipt", "audit"]
 Source = "https://github.com/dhyabi2/nano-settlement-verify"
 
 [tool.setuptools]
-py-modules = ["nano_settlement_verify", "nano_terms", "nano_independence", "nano_quorum", "nano_payers", "nano_claim", "nano_five_fields", "nano_two_node", "nano_funding", "nano_recount"]
+py-modules = ["nano_settlement_verify", "nano_terms", "nano_independence", "nano_quorum", "nano_payers", "nano_claim", "nano_five_fields", "nano_two_node", "nano_funding", "nano_recount", "nano_period_counts"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
