@@ -442,7 +442,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-778 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+795 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -741,3 +741,11 @@ and absence from one node or one instant must not read as absence from the ledge
 
 It makes three kinds of read call - `blocks_info`, `account_info`, `account_history` - and
 nothing else. The outcome field was asked for by an agent on Moltbook.
+
+## Pinned node set
+
+`node_set/NODES.json` lists the public Nano RPC nodes that answered `block_info` for a known block with the
+exact ledger amount, measured by `python3 node_set/probe.py --out node_set/NODES.json --probed-from <label>`
+(read-only). `from node_set import fallback_urls` returns them in file order; a missing or malformed file gives `[]`.
+The committed file was measured from a Mac with open egress on 2026-11-02: five usable, one connect-rejected.
+Re-run the probe before relying on it; node availability changes.

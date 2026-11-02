@@ -1,0 +1,22 @@
+{
+  "v": "node-set-v1",
+  "probed_at": "2026-11-02T08:07:00Z",
+  "probe_block": "B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F",
+  "probed_from": "mac-w3ops-2026-11-02",
+  "usable": [
+    "https://rpc.nano.to",
+    "https://node.somenano.com/proxy",
+    "https://rainstorm.city/api",
+    "https://nanoslo.0x.no/proxy",
+    "https://www.bitrequest.app:8020"
+  ],
+  "unusable": [
+    {
+      "url": "https://proxy.nanos.cc/proxy",
+      "why": "connect_rejected",
+      "http": null
+    }
+  ],
+  "usable_count": 5,
+  "two_node_check_possible": true
+}
