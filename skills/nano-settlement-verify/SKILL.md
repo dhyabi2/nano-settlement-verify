@@ -103,3 +103,19 @@ amount per order so a block can match only one order.
 ## Source
 
 One file, Python standard library only: https://github.com/dhyabi2/nano-settlement-verify (MIT).
+
+## Keep the refusal in the path: probe_gate.py
+
+`python3 probe_gate.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]` runs the same check twice:
+first with a recipient the block was not sent to, which must come back `mismatch` (exit 3), then with the real
+one. It prints `PROBE-REFUSED`, the real verdict and `APPROVE` (exit 0) only when both hold; a probe that was not
+refused exits 7 and approves nothing, so a check that stopped comparing the payee cannot pass a spend. An
+unconfirmed block exits 2 (wait and ask again), an unreadable node 4. `--not-after WHEN` is the order's expiry,
+passed to both calls exactly as verify_cli.py takes it (5 late, 6 unknown time).
+
+Both calls are answered by one node: with an RPC_URL list (or one in `NANO_RPC_URL`) the probe may fail over, and
+the real check then goes only to the node that refused the probe; if that cannot be pinned, it exits 7.
+
+It does not prove the node is honest. Only the recipient is varied, so a node that answers the true amount and
+payee for this block (a stub written for this payment, or a reply about another block that paid the same amount to
+the same payee) passes both calls. For that, ask independent nodes and require agreement (`nano_quorum`).
