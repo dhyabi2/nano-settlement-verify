@@ -758,3 +758,7 @@ exact ledger amount, measured by `python3 node_set/probe.py --out node_set/NODES
 (read-only). `from node_set import fallback_urls` returns them in file order; a missing or malformed file gives `[]`.
 The committed file was measured from a Mac with open egress on 2026-11-02: five usable, one connect-rejected.
 Re-run the probe before relying on it; node availability changes.
+
+## External counterparties per period
+
+`python3 nano_period_counts.py --address nano_... --period month --json` counts, per UTC period, the distinct payers that are neither the address itself nor in the set of accounts it has ever funded. Rule, limits and a real read: [EXTERNAL-COUNTERPARTIES.md](EXTERNAL-COUNTERPARTIES.md). Tests: `python3 -m unittest tests.test_period_counts`.
