@@ -81,10 +81,10 @@ An operator who will not let the agent hold a key: see [OPERATORS.md](https://gi
 pip install .
 ```
 
-Or straight from the tagged release, no clone and no PyPI (`v1.0.0`; `import nano_settlement_verify`):
+Or straight from the tagged release, no clone and no PyPI (`v1.1.0`; `import nano_settlement_verify`):
 
 ```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.0.0"
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.1.0"
 ```
 
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
@@ -438,7 +438,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-727 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+776 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -528,6 +528,12 @@ block on the live ledger.
 The third audits a real x402 seller the same way: it fetches the seller's own document,
 derives the account that document says to pay, and counts off the public ledger who has
 paid it.
+
+## Three more checks a stranger can reproduce
+
+- **Two nodes, five fields:** [TWO-NODE-CHECK.md](TWO-NODE-CHECK.md) is the check as two curl calls and a table; `python3 nano_two_node.py --block HASH --amount-raw RAW --invoice-id ID --invoice-issued-at T --payee ACCT --json` is the same thing in one command (exit 0 settled, 2 unknown, 4 refused). `settled` is not buyer acceptance.
+- **Who funded the payer:** [FUNDING-PROVENANCE.md](FUNDING-PROVENANCE.md); `python3 nano_funding.py --block HASH --json` returns `unsubsidised`, `sponsor_funded`, `dispenser_funded`, `self_funded` or `unknown`, with the receive that decides it. Payment time is the payer's send block.
+- **Recount an address on either rail:** `python3 nano_recount.py --address nano_... --json`, or `--address 0x... --from-block N` for USDC on Base. Distinct payers and payments, no clustering; a truncated read refuses (exit 3) instead of printing a smaller number.
 
 ## Scope
 
