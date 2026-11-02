@@ -113,6 +113,7 @@ as the argument or the variable, is ignored; a blank argument is refused, not re
 
 To give the CLI a fallback node, list it after the first, comma-separated, in the argument or
 in `$NANO_RPC_URL`: `python3 verify_cli.py BLOCK EXPECT_RAW ACCOUNT "https://rpc.nano.to,https://<your second node>"`.
+No node and no budget? `FREE-VERIFY.md`: three verdicts (`settled`, `unknown`, `mismatch`, never "unpaid"), one command, $0.
 Three public nodes that answered `block_info` for the same block identically on 2026-11-02 (read-only probe, no key):
 `https://node.somenano.com/proxy`, `https://nanoslo.0x.no/proxy`, `https://rainstorm.city/api`; so a ready list is
 `"https://rpc.nano.to,https://node.somenano.com/proxy,https://nanoslo.0x.no/proxy"` (see `FALLBACK-NODES.md`;
@@ -122,6 +123,10 @@ answer from a node - settled, not yet, mismatch, no such block - is final and is
 Every URL is checked before any is asked, a URL listed twice or an empty entry is refused (exit 4),
 and with more than one URL the verdict names the node that answered as `"rpc_index"` (0-based).
 Failover is not agreement: to need two nodes to agree, use `nano_quorum` ([One node's word, or two?](#one-nodes-word-or-two)).
+
+**Two-node usage from the pinned list.** `node_set/NODES.json` is the measured list (5 usable, 1 unusable on 2026-11-02; re-measure with `node_set/probe.py`). Build the CLI argument from it, first two usable nodes, and run (checked on 2026-11-02, exit 0, `"settled": true`, `"rpc_index": 0`):
+`python3 skills/nano-settlement-verify/verify_cli.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 "$(python3 -c 'from node_set import fallback_urls;print(",".join(fallback_urls()[:2]))')"`
+That is failover (the second node is asked only if the first cannot be reached). For both nodes to agree before you ship, use `nano_two_node.py` or `nano_quorum`. Some listed RPCs may sit in front of the same node, so two URLs are not proof of two operators.
 
 When the node cannot be reached or read, the detail is chosen by the error's class alone,
 from parts of it that cannot hold the URL - the URL itself is never consulted:
@@ -442,7 +447,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-802 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+856 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -532,6 +537,10 @@ block on the live ledger.
 The third audits a real x402 seller the same way: it fetches the seller's own document,
 derives the account that document says to pay, and counts off the public ledger who has
 paid it.
+
+## Link check before you send
+
+`python3 -m links.public_check --url URL [URL ...]` fetches each link with no credentials and says `send`, `strip` or `refuse` for a message. A non-200 (or an auth wall, or a timeout) is never public; a 200 only proves it from here.
 
 ## Three more checks a stranger can reproduce
 
@@ -741,3 +750,11 @@ and absence from one node or one instant must not read as absence from the ledge
 
 It makes three kinds of read call - `blocks_info`, `account_info`, `account_history` - and
 nothing else. The outcome field was asked for by an agent on Moltbook.
+
+## Pinned node set
+
+`node_set/NODES.json` lists the public Nano RPC nodes that answered `block_info` for a known block with the
+exact ledger amount, measured by `python3 node_set/probe.py --out node_set/NODES.json --probed-from <label>`
+(read-only). `from node_set import fallback_urls` returns them in file order; a missing or malformed file gives `[]`.
+The committed file was measured from a Mac with open egress on 2026-11-02: five usable, one connect-rejected.
+Re-run the probe before relying on it; node availability changes.

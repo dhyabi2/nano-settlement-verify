@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recount a Nano address</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;color:#1a1a1a;background:#fff}
+input{width:100%;padding:.5rem;font:inherit;box-sizing:border-box}button{margin:.5rem 0;padding:.5rem 1rem;font:inherit}
+pre{background:#f4f4f4;padding:1rem;overflow:auto}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}pre{background:#222}}</style></head><body>
+<h1>Recount a Nano address</h1>
+<p>Paste a seller's receiving address. This page asks a public Nano node for the account's own history (no key, no login) and counts
+distinct sending accounts and confirmed payments. A history it cannot read to the open block is refused, never shown as a smaller number.</p>
+<input id="a" placeholder="nano_..." autocomplete="off"><br><button id="go">Count</button> <label>node <input id="n" value="https://rpc.nano.to" style="width:60%"></label>
+<pre id="out">Nothing asked yet.</pre>
+<p>Same rule as <code>nano_recount.py</code> in nano-settlement-verify. Nano only: a USDC-on-Base seller needs an RPC log filter over the token contract (<code>python3 nano_recount.py --address 0x... --from-block N</code>). A count does not prove the address belongs to the seller, nor that the payers are independent of each other: see FUNDING-PROVENANCE.md.</p>
+<script>
+// Pure counting logic shared by recount.html and its test. No network here: the caller passes rpc(body)->Promise<json>.
+// Rule (same as nano_recount.py): count confirmed RECEIVE blocks of the address, grouped by sending account; a receive
+// from the address itself is a self-send, not a payer. A history that does not reach height 1 is refused, never shrunk.
+async function recount(address, rpc, maxPages = 40) {
+  if (!/^(nano|xrb)_[13][13-9a-km-uw-z]{59}$/.test(address)) throw new Error("not a nano_ address");
+  let head = null, pages = 0, reachedOpen = false;
+  const payers = new Map();
+  let payments = 0, selfSends = 0, unconfirmed = 0, total = 0n;
+  while (pages < maxPages) {
+    const body = { action: "account_history", account: address, count: "500", raw: "true" };
+    if (head) body.head = head;
+    const r = await rpc(body);
+    if (r.error) throw new Error("node: " + r.error);
+    const h = r.history;
+    if (!Array.isArray(h)) { if (pages === 0 && !h) { reachedOpen = true; } break; }
+    pages++;
+    for (const b of h) {
+      if (b.height === "1" || b.height === 1) reachedOpen = true;
+      if (b.type !== "receive") continue;
+      if (String(b.confirmed) !== "true") { unconfirmed++; continue; }
+      if (b.account === address) { selfSends++; continue; }
+      payments++; total += BigInt(b.amount);
+      const p = payers.get(b.account) || { account: b.account, payments: 0, raw: 0n };
+      p.payments++; p.raw += BigInt(b.amount); payers.set(b.account, p);
+    }
+    if (reachedOpen || !r.previous) break;
+    head = r.previous;
+  }
+  if (!reachedOpen) return { complete: false, reason: "range_incomplete: did not reach the open block; no number printed" };
+  return { complete: true, address, distinct_payers: payers.size, payments, self_sends: selfSends, unconfirmed,
+           total_raw: total.toString(), payers: [...payers.values()].map(p => ({ account: p.account, payments: p.payments, raw: p.raw.toString() })) };
+}
+if (typeof module !== "undefined") module.exports = { recount };
+
+document.getElementById("go").onclick = async () => {
+  const out = document.getElementById("out"), node = document.getElementById("n").value.trim();
+  out.textContent = "asking " + node + " ...";
+  try {
+    const r = await recount(document.getElementById("a").value.trim(), async (b) => (await fetch(node, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) })).json());
+    out.textContent = JSON.stringify(r, null, 2) + "\n\nasked: " + node + " at " + new Date().toISOString();
+  } catch (e) { out.textContent = "refused: " + e.message; }
+};
+</script></body></html>
