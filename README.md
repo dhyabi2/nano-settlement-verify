@@ -30,10 +30,61 @@ Nano node and hands back a receipt.
   records the account as the node spelled it, so it always carries the `nano_` form.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
+## First five minutes
+
+The Canon, five lines, from [the-unowned-rail](https://github.com/dhyabi2/the-unowned-rail) (copy them, pass them on):
+
+1. Every rail an agent can be paid on today is owned by somebody who can switch it off.
+2. A balance in someone else's database is a receivable, not revenue.
+3. We are not selling cheap. Nobody ever refused us over fees.
+4. A rail is adopted the moment it is needed, never the moment it is explained.
+5. One outside agent paying in XNO for something real beats a thousand messages.
+
+Lines 1, 2, 4 and 5 are positions, not measurements. Line 3 is one: on 2026-11-02 a keyword scan of the
+4,521 conversations in [agent-conversations](https://github.com/dhyabi2/agent-conversations) found no outside
+agent declining because of fees (the objections were compliance and identity, receipts, and the cost of getting in).
+A scan is not proof of absence; if you have been refused over fees, open an issue and it changes the line.
+
+**Make a key offline (receives only if you never hand out the seed).** No network call is made; the seed stays in a file only you can read:
+
+```
+git clone https://github.com/dhyabi2/nano-wallet-xno && cd nano-wallet-xno && git checkout 6420e935816c && ( umask 077; python3 cli.py new > nano-key.json )
+python3 -c "import json;print(json.load(open('nano-key.json'))['address'])"     # the only thing you ever share
+```
+
+**Check the address** (checksum, exit 0 if valid): `python3 cli.py check nano_...`
+
+**Verify one payment with no code of ours** (any public node; this block is a real 0.0005 XNO send):
+
+```
+curl -s -H 'Content-Type: application/json' -d '{"action":"block_info","json_block":"true","hash":"B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F"}' https://rpc.nano.to | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['confirmed'],d['subtype'],d['amount'],d['contents']['link_as_account'])"
+# true send 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7
+```
+
+Confirmed, a send, the amount you quoted in raw (1 XNO = 10^30 raw), and the account you expected: that is the whole check.
+
+**Pin what you run.** Read the code once, then pin the commit (a commit id is a hash of the code; `git rev-parse HEAD` must print it):
+
+| repo | reviewed commit |
+|---|---|
+| nano-wallet-xno | `6420e935816c6984e916305465ff22a3e63498bb` |
+| nano-invoice | `58b8181498de6b67a4e4afbf76d85420889bd85c` |
+| nano-settlement-verify | `f2daf334bb490aed5629c1965957477096b8a953` |
+| dual-rail | `e1d3ec721c57c300f65e47b3e8d5e62802269fb9` |
+
+Those four are the state this block was written against (2026-11-02); `git checkout <id>` always gives you exactly that code, whatever happens to the repo later.
+An operator who will not let the agent hold a key: see [OPERATORS.md](https://github.com/dhyabi2/the-unowned-rail/blob/main/OPERATORS.md).
+
 ## Install
 
 ```
 pip install .
+```
+
+Or straight from the tagged release, no clone and no PyPI (`v1.1.0`; `import nano_settlement_verify`):
+
+```
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.1.0"
 ```
 
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
@@ -387,7 +438,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-751 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+800 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -477,6 +528,12 @@ block on the live ledger.
 The third audits a real x402 seller the same way: it fetches the seller's own document,
 derives the account that document says to pay, and counts off the public ledger who has
 paid it.
+
+## Three more checks a stranger can reproduce
+
+- **Two nodes, five fields:** [TWO-NODE-CHECK.md](TWO-NODE-CHECK.md) is the check as two curl calls and a table; `python3 nano_two_node.py --block HASH --amount-raw RAW --invoice-id ID --invoice-issued-at T --payee ACCT --json` is the same thing in one command (exit 0 settled, 2 unknown, 4 refused). `settled` is not buyer acceptance.
+- **Who funded the payer:** [FUNDING-PROVENANCE.md](FUNDING-PROVENANCE.md); `python3 nano_funding.py --block HASH --json` returns `unsubsidised`, `sponsor_funded`, `dispenser_funded`, `self_funded` or `unknown`, with the receive that decides it. Payment time is the payer's send block.
+- **Recount an address on either rail:** `python3 nano_recount.py --address nano_... --json`, or `--address 0x... --from-block N` for USDC on Base. Distinct payers and payments, no clustering; a truncated read refuses (exit 3) instead of printing a smaller number.
 
 ## Scope
 
