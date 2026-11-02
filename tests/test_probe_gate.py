@@ -210,9 +210,66 @@ def test_probe_invalid_amount_is_not_a_refusal():
 
 
 def test_probe_amount_mismatch_is_not_a_payee_refusal():
+    # The probe stopped on the amount; a real check that then says settled disagrees
+    # with it on the same node: nothing approved, exit 7.
     run, calls = scripted(lambda probe: (3, mismatch(RAW, got="1")))
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    assert "PROBE-REFUSED" not in lines and calls[1][2] == PAYEE
+
+
+def underpaid(got_amount=str(int(RAW) - 1), operation_mismatch=False):
+    """A node for a send of too little to the right payee: verify stops on the amount
+    (or the operation) before the payee, on the probe and on the real check alike."""
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if operation_mismatch:
+            return 3, mismatch("send", got="receive")
+        return 3, mismatch(str(int(args[1])), got=got_amount)
+    return run, calls
+
+
+def test_honest_underpayment_to_the_right_payee_exits_3_not_7():
+    run, calls = underpaid()
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 3 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines
+    assert len(calls) == 2 and calls[0][2] != PAYEE and calls[1][2] == PAYEE
+
+
+def test_overpayment_and_not_a_send_exit_3_too():
+    for run, calls in (underpaid(got_amount=str(int(RAW) + 1)), underpaid(operation_mismatch=True)):
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == 3 and "APPROVE" not in lines and len(calls) == 2
+
+
+def test_underpayment_real_check_is_pinned_to_the_probe_node():
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return 3, mismatch(RAW, got="1", rpc_index=1)
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
+    assert code == 3 and calls[1][3] == HONEST and "APPROVE" not in lines
+
+
+def test_underpayment_probe_on_a_list_without_rpc_index_approves_nothing():
+    run, calls = underpaid()
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
     assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_amount_probe_then_real_check_with_another_mismatch_is_7():
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if len(calls) == 1:
+            return 3, mismatch(RAW, got="1")
+        return 3, mismatch(PAYEE, got=probe_gate.PROBE_ACCOUNTS[0])
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
 
 
 def test_probe_payee_mismatch_naming_another_account_is_not_a_refusal():
@@ -253,3 +310,33 @@ def test_skill_source_line_names_every_file_it_ships():
     assert "One file" not in source
     for name in ("nano_settlement_verify.py", "verify_cli.py", "probe_gate.py"):
         assert name in source and (SKILL / name).exists()
+
+
+def test_underpayment_through_the_real_verify_cli_exits_3(monkeypatch, capsys):
+    # End to end through verify_cli.main and the real verify: a confirmed send of one raw
+    # too little to the right payee. The probe stops on the amount, the real check too.
+    vspec = importlib.util.spec_from_file_location("verify_cli_probe_gate_e2e", SKILL / "verify_cli.py")
+    verify_cli = importlib.util.module_from_spec(vspec)
+    vspec.loader.exec_module(verify_cli)
+    reply = {
+        "block_account": "nano_3payer", "amount": str(int(RAW) - 1), "confirmed": "true",
+        "height": "42", "subtype": "send",
+        "contents": {"type": "state", "account": "nano_3payer", "link_as_account": PAYEE},
+    }
+    monkeypatch.setattr(verify_cli._library, "post_json", lambda url, payload: reply)
+    monkeypatch.delenv("NANO_RPC_URL", raising=False)
+
+    def run(args):
+        code = verify_cli.main(["verify_cli.py"] + list(args))
+        return code, capsys.readouterr().out
+
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run)
+    assert code == 3 and "APPROVE" not in lines
+    # Controls on the same node: paid in full to the payee approves; paid in full to
+    # someone else is refused by the real check (exit 3).
+    reply["amount"] = RAW
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run)
+    assert code == 0 and lines[0] == "PROBE-REFUSED" and lines[-1] == "APPROVE"
+    reply["contents"]["link_as_account"] = probe_gate.PROBE_ACCOUNTS[1]
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run)
+    assert code == 3 and "APPROVE" not in lines

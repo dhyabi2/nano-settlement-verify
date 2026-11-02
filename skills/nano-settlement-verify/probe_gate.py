@@ -10,7 +10,10 @@ either way. This keeps the refusal in the path: before the real check it runs ve
 on the SAME block and amount with a recipient the block was not sent to, and it approves
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
 probe account - AND the real check came back settled (exit 0). Any other exit 3 on the
-probe (no_such_block, a wrong amount, invalid_amount) is not a refusal of the payee. It is a thin wrapper: every rule of verify_cli.py (node URL checks, exit codes,
+probe (no_such_block, invalid_amount) is not a refusal of the payee. A probe refused on a
+field checked before the payee - the amount (an honest underpayment to the right payee) or
+the operation (not a send) - never reached the payee; the real check is then run on the same
+node and, if it refuses with the same mismatch, the gate exits 3 like any mismatch. It is a thin wrapper: every rule of verify_cli.py (node URL checks, exit codes,
 error text, --not-after) applies to both calls unchanged.
 
 Both calls are answered by ONE node. With an RPC_URL list (or a list in $NANO_RPC_URL) the
@@ -28,8 +31,11 @@ prints  PROBE-REFUSED, then the real check's JSON verdict, then APPROVE
 exit 0  approved
      2  the block is not confirmed yet (on the probe or the real check), or the probe's node
         has no such block; nothing approved
+     3  mismatch: wrong amount (too much or too little) or not a send, the same on the
+        probe and the real check; nothing approved
      7  the probe was NOT refused on the payee, or the two calls could not be pinned to one
-        node: the check is not doing its job, nothing is approved
+        node, or the real check disagreed with the probe: the check is not doing its job,
+        nothing is approved
      4  the node could not be read (nothing was checked)
     64  usage error (from this script or from verify_cli.py on the probe)
      other  the real check's own exit code (3 mismatch, 5 late, ...); nothing approved
@@ -113,6 +119,40 @@ def _payee_refusal(out, probe):
     return None
 
 
+def _earlier_mismatch(out, expect_raw):
+    """The probe's exit-3 verdict as (expected, got) when it is a mismatch on a field
+    verify checks BEFORE the payee - the amount (expected is EXPECT_RAW) or the
+    operation (expected is "send") - else None. Such a probe never reached the payee
+    comparison, so it neither passed nor refused it."""
+    try:
+        verdict = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(verdict, dict) or verdict.get("verdict") != "mismatch":
+        return None
+    expected, got = verdict.get("expected"), verdict.get("got")
+    if not isinstance(expected, str) or not isinstance(got, str):
+        return None
+    try:
+        amount = str(int(expect_raw))
+    except ValueError:
+        return None
+    if expected in (amount, "send") and got != expected:
+        return expected, got
+    return None
+
+
+def _pinned(nodes, out):
+    """The RPC_URL arguments for the real check, pinned to the node that answered the
+    probe; None when a list's probe carried no usable rpc_index."""
+    if nodes is not None and len(nodes) > 1:
+        index = _rpc_index(out)
+        if index is None or not 0 <= index < len(nodes):
+            return None
+        return [nodes[index]]
+    return nodes if nodes is not None else []
+
+
 def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     """Return (exit_code, lines_to_print)."""
     tail = ["--not-after", not_after] if not_after is not None else []
@@ -131,23 +171,34 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     refusal = _payee_refusal(out, probe)
     if refusal == "no_such_block":
         return 2, [out.strip(), "PROBE-BLOCK-NOT-FOUND (not on this node yet; nothing approved)"]
+    earlier = _earlier_mismatch(out, expect_raw) if refusal != "payee" else None
+    if earlier is not None:
+        # The block is refused before its payee is read: wrong amount (an honest
+        # underpayment to the right payee) or not a send. That is the real check's
+        # mismatch, exit 3, not a broken check - but only when the real check, on the
+        # same node, refuses with the same mismatch. Anything else approves nothing.
+        pinned = _pinned(nodes, out)
+        if pinned is None:
+            return EXIT_PROBE_PASSED, [out.strip(),
+                                       "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
+        probe_out = out.strip()
+        code, out = run([block, expect_raw, account] + pinned + tail)
+        lines = [probe_out, "PROBE-MISMATCH-BEFORE-PAYEE (expected %r, got %r)" % earlier, out.strip()]
+        if code == 3 and _earlier_mismatch(out, expect_raw) == earlier:
+            return 3, lines + ["MISMATCH: nothing approved"]
+        return EXIT_PROBE_PASSED, lines + [
+            "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
     if refusal != "payee":
         # Exit 3 for any other reason (a wrong amount or operation, an amount that is
         # not raw, unreadable JSON) says nothing about whether the payee is compared.
         return EXIT_PROBE_PASSED, [out.strip(),
                                    "PROBE-NOT-REFUSED-ON-PAYEE (exit 3, not a payee mismatch): nothing approved"]
-    if nodes is not None and len(nodes) > 1:
-        # Pin the real check to the node that refused the probe, passed explicitly
-        # so neither the rest of the list nor $NANO_RPC_URL can answer it instead.
-        index = _rpc_index(out)
-        if index is None or not 0 <= index < len(nodes):
-            return EXIT_PROBE_PASSED, [out.strip(),
-                                       "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
-        pinned = [nodes[index]]
-    elif nodes is not None:
-        pinned = nodes
-    else:
-        pinned = []
+    # Pin the real check to the node that refused the probe, passed explicitly
+    # so neither the rest of the list nor $NANO_RPC_URL can answer it instead.
+    pinned = _pinned(nodes, out)
+    if pinned is None:
+        return EXIT_PROBE_PASSED, [out.strip(),
+                                   "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
     lines = ["PROBE-REFUSED"]
     code, out = run([block, expect_raw, account] + pinned + tail)
     lines.append(out.strip())
