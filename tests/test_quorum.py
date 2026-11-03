@@ -170,6 +170,36 @@ def test_two_nodes_that_confirm_different_heights_for_one_hash_disagree(monkeypa
     assert set(caught.value.answers) == {A, B}
 
 
+def test_a_disagreement_keeps_both_nodes_observations_not_just_the_refusal(monkeypatch):
+    """A dispute record needs what each node said, in full, and nothing served."""
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    error = caught.value
+    assert error.observations[A].height == 7 and error.observations[B].height == 9
+    assert error.observations[A].settled and error.observations[B].settled
+    assert error.observations[A].amount_raw == ONE_XNO
+    assert error.observations[A].account == PAYEE
+    record = json.loads(json.dumps(error.record()))
+    assert record["verdict"] == "disagreement"
+    assert record["served"] is None
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B]
+    assert [o["payload"]["height"] for o in record["observations"]] == [7, 9]
+    assert record["observations"][0]["payload"]["amount_raw"] == ONE_XNO
+    assert record["observations"][0]["answer"] == error.answers[A]
+
+
+def test_a_disagreement_message_and_answers_are_unchanged(monkeypatch):
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    b9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, B: b9}
+    assert str(caught.value) == f"endpoints disagree: {A}: {a7}; {B}: {b9}"
+    assert Disagreement({A: "x"}).observations == {}
+
+
 def test_a_disagreement_is_not_resolved_by_a_third_vote(monkeypatch):
     """Two against one is still two nodes that cannot both be right."""
     nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9), C: send_block(height=9)})
@@ -346,6 +376,16 @@ def test_two_nodes_reporting_different_confirmed_balances_disagree(monkeypatch):
     nodes(monkeypatch, {A: info(ONE_XNO), B: info(ONE_XNO - 1)})
     with pytest.raises(Disagreement):
         balance_corroborated(HOLDER, [A, B])
+
+
+def test_a_balance_disagreement_keeps_both_figures(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B])
+    assert caught.value.observations == {A: (ONE_XNO, 5), B: (ONE_XNO - 1, 5)}
+    record = json.loads(json.dumps(caught.value.record()))
+    assert record["served"] is None
+    assert [o["payload"] for o in record["observations"]] == [[ONE_XNO, 5], [ONE_XNO - 1, 5]]
 
 
 def test_an_account_neither_node_has_seen_opened_is_a_balance_of_nothing(monkeypatch):

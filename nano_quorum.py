@@ -29,7 +29,7 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -77,12 +77,52 @@ class Disagreement(Exception):
     both confirmed it report the same amount, height and payee. Different
     answers mean one endpoint is broken or lying. Which one is not knowable from
     here, so nothing is served.
+
+    Both sides are kept, not just the refusal. `answers` maps each endpoint to
+    its answer as text (as it always has, and as the message prints it).
+    `observations` maps each endpoint to the whole thing it returned - the
+    `Receipt` a `Corroboration` would have carried, the `(balance_raw,
+    receivable_raw)` figure, the payer report - so a dispute record can show
+    what each node actually said. `record()` is that as a JSON-ready dict.
     """
 
-    def __init__(self, answers: dict) -> None:
+    def __init__(self, answers: dict, observations: dict | None = None) -> None:
         detail = "; ".join(f"{url}: {answer}" for url, answer in answers.items())
         super().__init__(f"endpoints disagree: {detail}")
         self.answers = dict(answers)
+        self.observations = dict(observations or {})
+
+    def record(self) -> dict:
+        """Both observations as a JSON-serialisable dict, for a dispute log.
+
+        `served` is always None: on a disagreement nothing is served.
+        """
+        urls = list(self.answers) + [u for u in self.observations if u not in self.answers]
+        return {
+            "verdict": "disagreement",
+            "observations": [
+                {
+                    "rpc_url": url,
+                    "answer": _jsonable(self.answers.get(url)),
+                    "payload": _jsonable(self.observations.get(url)),
+                }
+                for url in urls
+            ],
+            "served": None,
+        }
+
+
+def _jsonable(value):
+    """`value` as plain JSON types: a receipt or report by its own `to_json`."""
+    if hasattr(value, "to_json"):
+        return json.loads(value.to_json())
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -280,7 +320,11 @@ def verify_corroborated(
         if settled_by and answer not in settled_by:
             other = next(iter(settled_by))
             raise Disagreement(
-                {settled_by[other][0]: str(other), rpc_url: str(answer)}
+                {settled_by[other][0]: str(other), rpc_url: str(answer)},
+                observations={
+                    settled_by[other][0]: settled_receipt[other],
+                    rpc_url: payload,
+                },
             )
         settled_by.setdefault(answer, []).append(rpc_url)
         settled_receipt[answer] = payload
@@ -455,7 +499,10 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
             continue
         if figures and figure not in figures:
             other = next(iter(figures))
-            raise Disagreement({figures[other][0]: str(other), rpc_url: str(figure)})
+            raise Disagreement(
+                {figures[other][0]: str(other), rpc_url: str(figure)},
+                observations={figures[other][0]: other, rpc_url: figure},
+            )
         figures.setdefault(figure, []).append(rpc_url)
         if len(figures[figure]) >= agree:
             return figure

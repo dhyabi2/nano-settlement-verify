@@ -747,7 +747,8 @@ def payers_corroborated(
                 {
                     _where(report): sorted(payer.account for payer in report.payers)
                     for report in (first, other)
-                }
+                },
+                observations={_where(report): report for report in (first, other)},
             )
     return PayerReport(
         account=first.account,

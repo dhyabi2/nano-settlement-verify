@@ -517,6 +517,20 @@ def test_a_node_reporting_a_different_payer_set_is_a_disagreement(monkeypatch):
     assert any(PAYER_1 in answer for answer in caught.value.answers.values())
 
 
+def test_a_payer_disagreement_keeps_both_reports(monkeypatch):
+    nodes(monkeypatch, {
+        A: history(receive(PAYER_1, CALL_PRICE, height=2), open_block(PAYER_2, CALL_PRICE)),
+        B: history(open_block(PAYER_2, CALL_PRICE)),
+    })
+    with pytest.raises(nano_quorum.Disagreement) as caught:
+        payers_corroborated(PAYEE, [A, B])
+    observed = caught.value.observations
+    assert observed[A].distinct_payers == 2 and observed[B].distinct_payers == 1
+    record = json.loads(json.dumps(caught.value.record()))
+    assert record["served"] is None
+    assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 1]
+
+
 def test_the_same_endpoint_written_twice_is_one_witness(monkeypatch):
     nodes(monkeypatch, {A: history(open_block(PAYER_1, CALL_PRICE))})
     with pytest.raises(ValueError, match="distinct endpoint"):
