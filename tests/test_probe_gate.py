@@ -42,7 +42,10 @@ def test_probe_that_passes_approves_nothing():
     # A check that says yes to anything: the probe settles and so does the real check.
     run, calls = fake([0, 0])
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
-    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) <= 2
+    # The settled probe is followed by exactly one real check (the payee), which settles
+    # too and so does not explain the probe: nothing approved.
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 2
+    assert calls[1][2] == PAYEE and lines[-1] == "REAL-CHECK-DOES-NOT-EXPLAIN-PROBE (exit 0)"
 
 
 def test_unreadable_node_on_probe_is_not_a_refusal():
@@ -159,7 +162,7 @@ def test_xrb_spelling_of_a_probe_account_still_gets_the_other_one():
     xrb_burn = "xrb_" + burn[len("nano_"):]
     probe = probe_gate.probe_account(xrb_burn)
     assert probe == probe_gate.PROBE_ACCOUNTS[1]
-    run, calls = fake([3, 0])
+    run, calls = probe_then(lambda probe: mismatch(probe, got=xrb_burn))
     code, _ = probe_gate.gate(BLOCK, RAW, xrb_burn, run=run)
     assert code == 0 and calls[0][2] == probe_gate.PROBE_ACCOUNTS[1]
 
@@ -430,3 +433,76 @@ def test_burn_address_payment_through_the_real_verify_cli_exits_3(monkeypatch, c
     # The burn address checking its own payment is refused by nothing: approved.
     code, lines = probe_gate.gate(BLOCK, RAW, burn, "http://127.0.0.1:7076", run=run)
     assert code == 0 and lines[-1] == "APPROVE"
+
+
+THIRD = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+
+
+def probe_then(probe_reply, real=(0, '{"settled": true}')):
+    """Probe answers (3, probe_reply(probe_account)); the real check answers `real`."""
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if len(calls) == 1:
+            return 3, probe_reply(args[2])
+        return real(args) if callable(real) else real
+    return run, calls
+
+
+def test_probe_mismatch_reporting_the_probe_account_as_recipient_is_not_a_refusal():
+    # A contradictory verdict: "expected the probe account, got the probe account".
+    run, calls = probe_then(lambda probe: mismatch(probe, got=probe))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    assert "PROBE-REFUSED" not in lines and len(calls) == 1
+
+
+def test_probe_mismatch_in_another_spelling_of_the_probe_account_is_not_a_refusal():
+    run, calls = probe_then(lambda probe: mismatch(probe, got="xrb_" + probe[len("nano_"):]))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_mismatch_without_a_reported_recipient_is_not_a_refusal():
+    for got in (None, "", 5, "not-an-account"):
+        run, calls = probe_then(lambda probe: json.dumps(
+            {"verdict": "mismatch", "expected": probe, "got": got}))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+    run, calls = probe_then(lambda probe: json.dumps({"verdict": "mismatch", "expected": probe}))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_probe_naming_a_third_recipient_then_settled_real_check_approves_nothing():
+    # The probe says the block pays THIRD, the real check says it pays PAYEE: inverted.
+    run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    assert "PROBE-REFUSED" not in lines and len(calls) == 2 and calls[1][2] == PAYEE
+
+
+def test_probe_naming_a_third_recipient_confirmed_by_the_real_check_is_wrong_recipient():
+    run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD),
+                            real=lambda args: (3, mismatch(args[2], got=THIRD)))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 3 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines
+    assert lines[-1] == "WRONG-RECIPIENT: nothing approved" and len(calls) == 2
+
+
+def test_probe_and_real_check_naming_different_third_recipients_is_7():
+    run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD),
+                            real=lambda args: (3, mismatch(args[2], got=probe_gate.PROBE_ACCOUNTS[1])))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+
+
+def test_probe_naming_a_third_recipient_pins_the_real_check():
+    run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD, rpc_index=1),
+                            real=lambda args: (3, mismatch(args[2], got=THIRD)))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
+    assert code == 3 and calls[1][3] == HONEST and "APPROVE" not in lines
+    run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1

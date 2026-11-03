@@ -9,7 +9,11 @@ swallows the exit code, a check that no longer compares the payee, a node that a
 either way. This keeps the refusal in the path: before the real check it runs verify_cli.py
 on the SAME block and amount with a recipient the block was not sent to, and it approves
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
-probe account - AND the real check came back settled (exit 0). Any other exit 3 on the
+probe account and its "got" is ACCOUNT - AND the real check came back settled (exit 0). A
+payee mismatch that names any other recipient is not a passing probe: one that names the
+probe account itself (or no account) contradicts itself and exits 7; one that names a third
+account is a payment to that account only if the real check, on the same node, refuses it as
+paid to that same account (exit 3), and exits 7 otherwise. Any other exit 3 on the
 probe is not a refusal of the payee: no_such_block exits 3 like verify_cli.py ("do not
 serve"; asking again does not create the block), invalid_amount exits 7. A probe refused on a
 field checked before the payee - the amount (an honest underpayment to the right payee) or
@@ -109,9 +113,12 @@ def _rpc_index(out):
     return index if type(index) is int else None
 
 
-def _payee_refusal(out, probe):
+def _payee_refusal(out, probe, account):
     """What the probe's exit-3 verdict refused on: "payee" only for a mismatch whose
-    expected account is the probe account, "no_such_block", or None for anything else."""
+    expected account is the probe account and whose reported recipient (`got`) is ACCOUNT,
+    "elsewhere" for one whose `got` is a third account (neither the probe nor ACCOUNT),
+    "no_such_block", or None for anything else (a `got` equal to the probe account, or
+    not an account at all, contradicts the mismatch)."""
     try:
         verdict = json.loads(out)
     except ValueError:
@@ -120,10 +127,14 @@ def _payee_refusal(out, probe):
         return None
     if verdict.get("verdict") == "no_such_block":
         return "no_such_block"
-    expected = verdict.get("expected")
+    expected, got = verdict.get("expected"), verdict.get("got")
     if (verdict.get("verdict") == "mismatch" and isinstance(expected, str)
             and expected.startswith(_PREFIXES) and _account_body(expected) == _account_body(probe)):
-        return "payee"
+        if not isinstance(got, str) or not got.startswith(_PREFIXES):
+            return None
+        if _account_body(got) == _account_body(expected):
+            return None
+        return "payee" if _account_body(got) == _account_body(account) else "elsewhere"
     return None
 
 
@@ -209,7 +220,7 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail)
     if code != 3:
         return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
-    refusal = _payee_refusal(out, probe)
+    refusal = _payee_refusal(out, probe, account)
     if refusal == "no_such_block":
         # verify_cli.py's own exit 3, "do not serve": a made-up or wrong hash stays
         # missing, so a caller that retries on 2 must not be told to wait for it.
@@ -231,6 +242,24 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
             return 3, lines + ["MISMATCH: nothing approved"]
         return EXIT_PROBE_PASSED, lines + [
             "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
+    if refusal == "elsewhere":
+        # The probe names a third account as the recipient: not a passing probe. It is a
+        # wrong-recipient payment (exit 3) only if the real check, on the same node, says
+        # the block pays that same account; it can never approve.
+        pinned = _pinned(nodes, out)
+        if pinned is None:
+            return EXIT_PROBE_PASSED, [out.strip(),
+                                       "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
+        got = json.loads(out)["got"]
+        probe_out = out.strip()
+        code, out = run([block, expect_raw, account] + pinned + tail)
+        lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, out.strip()]
+        if code == 3 and _paid_to(out, account, got):
+            return 3, lines + ["WRONG-RECIPIENT: nothing approved"]
+        if code in (0, 3):
+            return EXIT_PROBE_PASSED, lines + [
+                "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
+        return code, lines
     if refusal != "payee":
         # Exit 3 for any other reason (a wrong amount or operation, an amount that is
         # not raw, unreadable JSON) says nothing about whether the payee is compared.
