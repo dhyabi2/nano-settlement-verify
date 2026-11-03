@@ -29,6 +29,7 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, is_dataclass
 
 import nano_settlement_verify
@@ -112,17 +113,65 @@ class Disagreement(Exception):
         }
 
 
-def _jsonable(value):
-    """`value` as plain JSON types: a receipt or report by its own `to_json`."""
-    if hasattr(value, "to_json"):
-        return json.loads(value.to_json())
-    if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_jsonable(item) for item in value]
-    return value
+def _jsonable(value, _active=None):
+    """`value` as plain JSON types: a receipt or report by its own `to_json`.
+
+    Always JSON-serialisable, strictly (`allow_nan=False`): a type with no JSON
+    form - bytes, a Decimal, an object of some caller's - becomes its `repr`
+    string rather than reaching `json.dumps` and raising there, in the middle of
+    writing a dispute log. So do NaN and infinity, which are not JSON, and a
+    container that contains itself. Ints are kept as ints of any size: an
+    amount of raw stays exact.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value) if math.isfinite(value) else repr(value)
+    if isinstance(value, str):
+        return str(value)
+    active = set() if _active is None else _active
+    if id(value) in active:
+        return "<cycle %s>" % type(value).__name__
+    active.add(id(value))
+    try:
+        if hasattr(value, "to_json"):
+            try:
+                return _jsonable(json.loads(value.to_json()), active)
+            except Exception:
+                return _repr(value)
+        if is_dataclass(value) and not isinstance(value, type):
+            try:
+                return _jsonable(asdict(value), active)
+            except Exception:
+                return _repr(value)
+        if isinstance(value, dict):
+            return {_key(key): _jsonable(item, active) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = [_jsonable(item, active) for item in value]
+            if isinstance(value, (set, frozenset)):
+                # A set has no order of its own; give the record one.
+                items.sort(key=lambda item: json.dumps(item, sort_keys=True))
+            return items
+        return _repr(value)
+    finally:
+        active.discard(id(value))
+
+
+def _key(key) -> str:
+    """A dict key as text, never raising."""
+    if isinstance(key, str):
+        return str(key)
+    return _repr(key) if not isinstance(key, (int, float, bool, type(None))) else str(key)
+
+
+def _repr(value) -> str:
+    """`repr(value)`, or a placeholder when even that raises."""
+    try:
+        return str(repr(value))
+    except Exception:
+        return "<unrepresentable %s>" % type(value).__name__
 
 
 @dataclass(frozen=True)
@@ -299,7 +348,11 @@ def verify_corroborated(
     failures: dict[str, str] = {}
     answered: list[str] = []
     settled_by: dict[tuple, list[str]] = {}
-    settled_receipt: dict[tuple, Receipt] = {}
+    # Every endpoint that reported the send settled, in the order asked, with
+    # its own answer and its own receipt. Kept per endpoint, not per answer:
+    # keyed by answer, a later agreeing node's receipt overwrote an earlier
+    # one's, and a Disagreement attributed it to the wrong endpoint.
+    settled: list[tuple[str, tuple, Receipt]] = []
 
     for rpc_url in endpoints:
         try:
@@ -318,19 +371,20 @@ def verify_corroborated(
         if answer[0] != "settled":
             continue
         if settled_by and answer not in settled_by:
-            other = next(iter(settled_by))
+            # Every settled endpoint so far is kept, each with what it itself
+            # said, then the one that contradicts them.
+            witnesses = settled + [(rpc_url, answer, payload)]
             raise Disagreement(
-                {settled_by[other][0]: str(other), rpc_url: str(answer)},
-                observations={
-                    settled_by[other][0]: settled_receipt[other],
-                    rpc_url: payload,
-                },
+                {url: str(said) for url, said, _ in witnesses},
+                observations={url: receipt for url, _, receipt in witnesses},
             )
         settled_by.setdefault(answer, []).append(rpc_url)
-        settled_receipt[answer] = payload
+        settled.append((rpc_url, answer, payload))
         if len(settled_by[answer]) >= agree:
             return Corroboration(
-                receipt=settled_receipt[answer],
+                # The receipt of the endpoint that completed the quorum, as
+                # before; every agreeing receipt asserts the same facts.
+                receipt=payload,
                 agreed=tuple(settled_by[answer]),
                 answered=tuple(answered),
                 failed=tuple(failures),
@@ -441,6 +495,7 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
     }
     failures: dict[str, str] = {}
     figures: dict[tuple, list[str]] = {}
+    reported: list[tuple[str, tuple]] = []  # every endpoint's figure, in order asked
     for rpc_url in endpoints:
         try:
             reply = post(rpc_url, payload)
@@ -498,12 +553,13 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
             failures[rpc_url] = f"{type(error).__name__}: {error}"
             continue
         if figures and figure not in figures:
-            other = next(iter(figures))
+            witnesses = reported + [(rpc_url, figure)]
             raise Disagreement(
-                {figures[other][0]: str(other), rpc_url: str(figure)},
-                observations={figures[other][0]: other, rpc_url: figure},
+                {url: str(said) for url, said in witnesses},
+                observations={url: said for url, said in witnesses},
             )
         figures.setdefault(figure, []).append(rpc_url)
+        reported.append((rpc_url, figure))
         if len(figures[figure]) >= agree:
             return figure
     raise NotCorroborated(

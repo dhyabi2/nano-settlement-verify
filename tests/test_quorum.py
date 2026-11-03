@@ -200,6 +200,81 @@ def test_a_disagreement_message_and_answers_are_unchanged(monkeypatch):
     assert Disagreement({A: "x"}).observations == {}
 
 
+def test_a_disagreement_after_two_agreeing_nodes_keeps_every_node_with_its_own_receipt(
+    monkeypatch,
+):
+    """With agree=3, A and B agree and C contradicts: all three are on record.
+
+    Each receipt is told apart by `seen_at`, which is not part of the answer
+    compared, so the record shows whose receipt is attributed to whom.
+    """
+    heights = {A: 7, B: 7, C: 9}
+
+    def verify(block_hash, expect_raw, account, rpc_url):
+        return nano_settlement_verify.Receipt(
+            settled=True,
+            amount_raw=expect_raw,
+            height=heights[rpc_url],
+            account=account,
+            seen_at={A: 1, B: 2, C: 3}[rpc_url],
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+    error = caught.value
+    assert list(error.observations) == [A, B, C]
+    assert {url: r.seen_at for url, r in error.observations.items()} == {A: 1, B: 2, C: 3}
+    assert list(error.answers) == [A, B, C]
+    assert error.answers[A] == error.answers[B] != error.answers[C]
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B, C]
+    assert [o["payload"]["height"] for o in record["observations"]] == [7, 7, 9]
+    assert all(o["answer"] is not None for o in record["observations"])
+    assert record["served"] is None
+
+
+def test_a_balance_disagreement_after_two_agreeing_nodes_keeps_every_node(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO, 5), C: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B, C], agree=3)
+    assert caught.value.observations == {A: (ONE_XNO, 5), B: (ONE_XNO, 5), C: (ONE_XNO - 1, 5)}
+
+
+def test_a_disagreement_record_is_always_json_even_for_types_json_does_not_know():
+    """record() feeds a dispute log; it must never raise in json.dumps."""
+
+    class Opaque:
+        def __repr__(self):
+            return "Opaque()"
+
+    class BadRepr:
+        def __repr__(self):
+            raise RuntimeError("no")
+
+    from decimal import Decimal
+
+    error = Disagreement(
+        {A: "x", B: "y"},
+        observations={
+            A: {"blob": b"\x00\xff", "d": Decimal("1.5"), "o": Opaque(), 3: BadRepr()},
+            B: (float("nan"), float("inf"), {Opaque()}, 10**60, None, True),
+        },
+    )
+    text = json.dumps(error.record(), allow_nan=False)
+    record = json.loads(text)
+    a, b = (o["payload"] for o in record["observations"])
+    assert a["blob"] == repr(b"\x00\xff")
+    assert a["d"] == "Decimal('1.5')"
+    assert a["o"] == "Opaque()"
+    assert a["3"] == "<unrepresentable BadRepr>"
+    assert b == ["nan", "inf", ["Opaque()"], 10**60, None, True]
+    assert isinstance(b[3], int)
+    looped = []
+    looped.append(looped)
+    json.dumps(Disagreement({A: "x"}, observations={A: looped}).record(), allow_nan=False)
+
+
 def test_a_disagreement_is_not_resolved_by_a_third_vote(monkeypatch):
     """Two against one is still two nodes that cannot both be right."""
     nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9), C: send_block(height=9)})
