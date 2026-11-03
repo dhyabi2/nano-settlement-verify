@@ -10,11 +10,18 @@ either way. This keeps the refusal in the path: before the real check it runs ve
 on the SAME block and amount with a recipient the block was not sent to, and it approves
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
 probe account - AND the real check came back settled (exit 0). Any other exit 3 on the
-probe (no_such_block, invalid_amount) is not a refusal of the payee. A probe refused on a
+probe is not a refusal of the payee: no_such_block exits 3 like verify_cli.py ("do not
+serve"; asking again does not create the block), invalid_amount exits 7. A probe refused on a
 field checked before the payee - the amount (an honest underpayment to the right payee) or
 the operation (not a send) - never reached the payee; the real check is then run on the same
 node and, if it refuses with the same mismatch, the gate exits 3 like any mismatch. It is a thin wrapper: every rule of verify_cli.py (node URL checks, exit codes,
 error text, --not-after) applies to both calls unchanged.
+
+A probe that came back settled is a probe that was not refused, with one honest cause: the
+block really pays the probe account (a payment sent to the burn address, checked for a
+seller). The real check is then run on the same node; if it refuses the block as a payee
+mismatch naming the probe account as the recipient, that is a wrong-recipient payment and
+the gate exits 3. Nothing in that path can approve: any other answer exits 7.
 
 Both calls are answered by ONE node. With an RPC_URL list (or a list in $NANO_RPC_URL) the
 probe may fail over as verify_cli.py does; the real check is then sent only to the node that
@@ -29,10 +36,11 @@ of independent nodes is nano_quorum's job.
 
 prints  PROBE-REFUSED, then the real check's JSON verdict, then APPROVE
 exit 0  approved
-     2  the block is not confirmed yet (on the probe or the real check), or the probe's node
-        has no such block; nothing approved
-     3  mismatch: wrong amount (too much or too little) or not a send, the same on the
-        probe and the real check; nothing approved
+     2  the block is not confirmed yet (on the probe or the real check); nothing approved
+     3  refused: wrong amount (too much or too little) or not a send, the same on the
+        probe and the real check; a payment to the wrong recipient (also when it was sent
+        to the probe account itself); or the probe's node has no such block. Terminal: do
+        not serve, asking again gives the same answer; nothing approved
      7  the probe was NOT refused on the payee, or the two calls could not be pinned to one
         node, or the real check disagreed with the probe: the check is not doing its job,
         nothing is approved
@@ -153,6 +161,37 @@ def _pinned(nodes, out):
     return nodes if nodes is not None else []
 
 
+def _paid_to(out, account, probe):
+    """True when a real-check exit-3 verdict is a payee mismatch that expected ACCOUNT and
+    got the probe account: the block pays the probe account, not the payee."""
+    try:
+        verdict = json.loads(out)
+    except ValueError:
+        return False
+    if not isinstance(verdict, dict) or verdict.get("verdict") != "mismatch":
+        return False
+    expected, got = verdict.get("expected"), verdict.get("got")
+    return (isinstance(expected, str) and isinstance(got, str)
+            and expected.startswith(_PREFIXES) and got.startswith(_PREFIXES)
+            and _account_body(expected) == _account_body(account)
+            and _account_body(got) == _account_body(probe))
+
+
+def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail):
+    """The probe came back settled (exit 0). Exit 3 only when the real check, on the
+    same node, refuses the block as paid to the probe account; never approve."""
+    not_refused = [out.strip(), "PROBE-NOT-REFUSED (exit 0): nothing approved"]
+    pinned = _pinned(nodes, out)
+    if pinned is None:
+        return EXIT_PROBE_PASSED, not_refused
+    code, real = run([block, expect_raw, account] + pinned + tail)
+    if code == 3 and _paid_to(real, account, probe):
+        return 3, [out.strip(), "PROBE-SETTLED (the block pays the probe account)", real.strip(),
+                   "WRONG-RECIPIENT: nothing approved"]
+    return EXIT_PROBE_PASSED, not_refused + [real.strip(),
+                                             "REAL-CHECK-DOES-NOT-EXPLAIN-PROBE (exit %d)" % code]
+
+
 def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     """Return (exit_code, lines_to_print)."""
     tail = ["--not-after", not_after] if not_after is not None else []
@@ -166,11 +205,15 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         return 2, [out.strip(), "PROBE-PENDING (block not confirmed yet; nothing approved)"]
     if code == 64:
         return 64, [out.strip(), "PROBE-USAGE-ERROR (exit 64): nothing approved"]
+    if code == 0:
+        return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail)
     if code != 3:
         return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
     refusal = _payee_refusal(out, probe)
     if refusal == "no_such_block":
-        return 2, [out.strip(), "PROBE-BLOCK-NOT-FOUND (not on this node yet; nothing approved)"]
+        # verify_cli.py's own exit 3, "do not serve": a made-up or wrong hash stays
+        # missing, so a caller that retries on 2 must not be told to wait for it.
+        return 3, [out.strip(), "PROBE-BLOCK-NOT-FOUND (no such block on this node; nothing approved)"]
     earlier = _earlier_mismatch(out, expect_raw) if refusal != "payee" else None
     if earlier is not None:
         # The block is refused before its payee is read: wrong amount (an honest

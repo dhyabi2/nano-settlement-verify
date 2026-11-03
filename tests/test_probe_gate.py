@@ -39,9 +39,10 @@ def test_refused_probe_then_settled_approves():
 
 
 def test_probe_that_passes_approves_nothing():
+    # A check that says yes to anything: the probe settles and so does the real check.
     run, calls = fake([0, 0])
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
-    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) <= 2
 
 
 def test_unreadable_node_on_probe_is_not_a_refusal():
@@ -195,12 +196,75 @@ def scripted(probe_reply):
     return run, calls
 
 
-def test_probe_not_found_is_not_a_refusal_and_exits_2():
-    # A check that no longer compares the payee: the probe hits "Block not found"
-    # (exit 3) and the real check says settled for a send to someone else.
+def test_probe_not_found_is_terminal_exit_3_not_wait():
+    # A made-up hash: the probe hits "Block not found" (verify_cli.py exit 3, "do not
+    # serve"). Exit 2 would tell a retrying caller to poll that hash forever; it is 3,
+    # and the real check (which would say settled here) is never asked.
     run, calls = scripted(lambda probe: (3, '{"verdict": "no_such_block"}'))
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
-    assert code == 2 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines and len(calls) == 1
+    assert code == 3 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines and len(calls) == 1
+
+
+def paid_to(recipient):
+    """A node for a confirmed send of RAW to RECIPIENT, answering like verify_cli.py."""
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if probe_gate._account_body(args[2]) == probe_gate._account_body(recipient):
+            return 0, '{"settled": true}'
+        return 3, mismatch(args[2], got=recipient)
+    return run, calls
+
+
+def test_payment_sent_to_the_burn_address_checked_for_a_seller_exits_3_not_7():
+    burn = probe_gate.PROBE_ACCOUNTS[0]
+    run, calls = paid_to(burn)
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 3 and "APPROVE" not in lines and "PROBE-REFUSED" not in lines
+    assert lines[-1] == "WRONG-RECIPIENT: nothing approved"
+    assert calls[0][2] == burn and calls[1][2] == PAYEE and len(calls) == 2
+
+
+def test_payment_to_the_second_probe_account_checked_for_the_burn_address_exits_3():
+    burn, other = probe_gate.PROBE_ACCOUNTS
+    run, calls = paid_to(other)
+    code, lines = probe_gate.gate(BLOCK, RAW, burn, run=run)
+    assert code == 3 and "APPROVE" not in lines and calls[0][2] == other
+
+
+def test_settled_probe_then_mismatch_naming_another_recipient_is_7():
+    # The node says the block pays the probe account, then that it pays someone else:
+    # the two answers contradict each other, so it is not a wrong-recipient refusal.
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if len(calls) == 1:
+            return 0, '{"settled": true}'
+        return 3, mismatch(args[2], got="nano_3someoneelse")
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+
+
+def test_settled_probe_on_a_list_without_rpc_index_asks_nothing_more():
+    run, calls = paid_to(probe_gate.PROBE_ACCOUNTS[0])
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def test_settled_probe_real_check_is_pinned_to_the_probe_node():
+    burn = probe_gate.PROBE_ACCOUNTS[0]
+    nodes = {
+        YES: lambda account, n: 4 if n == 1 else 0,
+        HONEST: lambda account, n: 0 if account == burn else 3,
+    }
+    run, calls = failover_nodes(nodes)
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
+    # failover_nodes reports got=PAYEE on a mismatch, so it does not explain the probe: 7,
+    # and the real check went only to the node that answered the probe.
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    assert calls[1][3] == HONEST
 
 
 def test_probe_invalid_amount_is_not_a_refusal():
@@ -340,3 +404,29 @@ def test_underpayment_through_the_real_verify_cli_exits_3(monkeypatch, capsys):
     reply["contents"]["link_as_account"] = probe_gate.PROBE_ACCOUNTS[1]
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run)
     assert code == 3 and "APPROVE" not in lines
+
+
+def test_burn_address_payment_through_the_real_verify_cli_exits_3(monkeypatch, capsys):
+    # End to end: a confirmed send of the full amount to the burn address, checked for
+    # a seller. The probe (the burn address) settles; the real check refuses the payee.
+    vspec = importlib.util.spec_from_file_location("verify_cli_probe_gate_burn", SKILL / "verify_cli.py")
+    verify_cli = importlib.util.module_from_spec(vspec)
+    vspec.loader.exec_module(verify_cli)
+    burn = probe_gate.PROBE_ACCOUNTS[0]
+    reply = {
+        "block_account": "nano_3payer", "amount": RAW, "confirmed": "true",
+        "height": "42", "subtype": "send",
+        "contents": {"type": "state", "account": "nano_3payer", "link_as_account": burn},
+    }
+    monkeypatch.setattr(verify_cli._library, "post_json", lambda url, payload: reply)
+    monkeypatch.delenv("NANO_RPC_URL", raising=False)
+
+    def run(args):
+        code = verify_cli.main(["verify_cli.py"] + list(args))
+        return code, capsys.readouterr().out
+
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run)
+    assert code == 3 and "APPROVE" not in lines and lines[-1] == "WRONG-RECIPIENT: nothing approved"
+    # The burn address checking its own payment is refused by nothing: approved.
+    code, lines = probe_gate.gate(BLOCK, RAW, burn, "http://127.0.0.1:7076", run=run)
+    assert code == 0 and lines[-1] == "APPROVE"
