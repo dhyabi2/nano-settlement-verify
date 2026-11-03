@@ -38,9 +38,16 @@ that paid the same amount to the same payee) passes the probe and the check alik
 the check still refuses a wrong payee on this node, not that the node is honest; agreement
 of independent nodes is nano_quorum's job.
 
+The same holds when the probe pays the probe account but fails only on time: with
+--not-after, a late (5) or untimed (6) probe whose verdict names the probe account as its
+"account" is checked the same way, and exits 3 when the real check refuses it as paid to
+the probe account; a 5 or 6 that names any other account, or none, exits 7.
+
 prints  PROBE-REFUSED, then the real check's JSON verdict, then APPROVE
 exit 0  approved
-     2  the block is not confirmed yet (on the probe or the real check); nothing approved
+     2  the block is not confirmed yet (on the probe or the real check): only when
+        verify_cli.py printed its not-confirmed receipt ("settled": false). Any other exit
+        2 (Python could not open verify_cli.py, say) exits 7; nothing approved
      3  refused: wrong amount (too much or too little) or not a send, the same on the
         probe and the real check; a payment to the wrong recipient (also when it was sent
         to the probe account itself); or the probe's node has no such block. Terminal: do
@@ -102,6 +109,32 @@ def _rpc_list(rpc):
         if all(_STARTS_WITH_SCHEME.match(part) or not part for part in parts):
             return parts
     return [rpc]
+
+
+def _verdict(out):
+    """The parsed JSON object verify_cli.py printed, or None."""
+    try:
+        verdict = json.loads(out)
+    except ValueError:
+        return None
+    return verdict if isinstance(verdict, dict) else None
+
+
+def _not_yet(out):
+    """True only for verify_cli.py's exit-2 receipt: a block not confirmed yet."""
+    verdict = _verdict(out)
+    return verdict is not None and "verdict" not in verdict and verdict.get("settled") is False
+
+
+def _pays_probe_late(out, probe):
+    """True when a probe's exit-5/6 verdict (late, unknown_time) names the probe account
+    as the block's recipient: the payee matched the probe; only the time failed."""
+    verdict = _verdict(out)
+    if verdict is None or verdict.get("verdict") not in ("late", "unknown_time"):
+        return False
+    account = verdict.get("account")
+    return (isinstance(account, str) and account.startswith(_PREFIXES)
+            and _account_body(account) == _account_body(probe))
 
 
 def _rpc_index(out):
@@ -188,16 +221,19 @@ def _paid_to(out, account, probe):
             and _account_body(got) == _account_body(probe))
 
 
-def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail):
-    """The probe came back settled (exit 0). Exit 3 only when the real check, on the
-    same node, refuses the block as paid to the probe account; never approve."""
-    not_refused = [out.strip(), "PROBE-NOT-REFUSED (exit 0): nothing approved"]
+def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, probe_code=0):
+    """The probe matched the payee: settled (exit 0), or late/untimed (5/6) naming the
+    probe account. Exit 3 only when the real check, on the same node, refuses the block
+    as paid to the probe account; never approve."""
+    not_refused = [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % probe_code]
     pinned = _pinned(nodes, out)
     if pinned is None:
         return EXIT_PROBE_PASSED, not_refused
     code, real = run([block, expect_raw, account] + pinned + tail)
     if code == 3 and _paid_to(real, account, probe):
-        return 3, [out.strip(), "PROBE-SETTLED (the block pays the probe account)", real.strip(),
+        state = ("PROBE-SETTLED" if probe_code == 0
+                 else "PROBE-PAYEE-MATCHED-BUT-NOT-ON-TIME (exit %d)" % probe_code)
+        return 3, [out.strip(), state + " (the block pays the probe account)", real.strip(),
                    "WRONG-RECIPIENT: nothing approved"]
     return EXIT_PROBE_PASSED, not_refused + [real.strip(),
                                              "REAL-CHECK-DOES-NOT-EXPLAIN-PROBE (exit %d)" % code]
@@ -213,11 +249,16 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     if code == 4:
         return 4, [out.strip(), "PROBE-UNREAD (node unreachable; nothing was checked)"]
     if code == 2:
+        if not _not_yet(out):
+            return EXIT_PROBE_PASSED, [
+                out.strip(), "PROBE-EXIT-2-WITHOUT-RECEIPT (not a not-confirmed verdict): nothing approved"]
         return 2, [out.strip(), "PROBE-PENDING (block not confirmed yet; nothing approved)"]
     if code == 64:
         return 64, [out.strip(), "PROBE-USAGE-ERROR (exit 64): nothing approved"]
-    if code == 0:
-        return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail)
+    if code == 0 or (code in (5, 6) and _pays_probe_late(out, probe)):
+        # Settled, or late/untimed with the probe account as recipient: either way the
+        # probe matched the payee, so only a payment to the probe account explains it.
+        return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, code)
     if code != 3:
         return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
     refusal = _payee_refusal(out, probe, account)
@@ -256,7 +297,7 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, out.strip()]
         if code == 3 and _paid_to(out, account, got):
             return 3, lines + ["WRONG-RECIPIENT: nothing approved"]
-        if code in (0, 3):
+        if code in (0, 3) or (code == 2 and not _not_yet(out)):
             return EXIT_PROBE_PASSED, lines + [
                 "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
         return code, lines
@@ -277,6 +318,9 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     if code == 0 and _rpc_index(out) is not None:
         # A single pinned URL never carries rpc_index; one that does was not pinned.
         return EXIT_PROBE_PASSED, lines + ["REAL-CHECK-NOT-PINNED: nothing approved"]
+    if code == 2 and not _not_yet(out):
+        return EXIT_PROBE_PASSED, lines + [
+            "REAL-CHECK-EXIT-2-WITHOUT-RECEIPT (not a not-confirmed verdict): nothing approved"]
     if code == 0:
         lines.append("APPROVE")
     return code, lines

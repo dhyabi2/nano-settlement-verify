@@ -13,6 +13,8 @@ spec.loader.exec_module(probe_gate)
 BLOCK = "B" * 64
 RAW = "500000000000000000000000000"
 PAYEE = "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7"
+# What verify_cli.py prints with exit 2: the receipt of a block that is not confirmed yet.
+NOT_YET = '{"settled": false, "amount_raw": 0, "height": 0, "account": ""}'
 
 
 def fake(codes):
@@ -23,6 +25,8 @@ def fake(codes):
         code = codes[len(calls) - 1]
         if code == 3:
             return code, mismatch(args[2])
+        if code == 2:
+            return code, NOT_YET
         return code, '{"n": %d}' % len(calls)
     return run, calls
 
@@ -506,3 +510,80 @@ def test_probe_naming_a_third_recipient_pins_the_real_check():
     run, calls = probe_then(lambda probe: mismatch(probe, got=THIRD))
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
     assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and len(calls) == 1
+
+
+def _real_cli(monkeypatch, capsys, reply, name):
+    """A run() through verify_cli.main and the real verify, answered by REPLY."""
+    vspec = importlib.util.spec_from_file_location(name, SKILL / "verify_cli.py")
+    verify_cli = importlib.util.module_from_spec(vspec)
+    vspec.loader.exec_module(verify_cli)
+    monkeypatch.setattr(verify_cli._library, "post_json", lambda url, payload: reply)
+    monkeypatch.delenv("NANO_RPC_URL", raising=False)
+
+    def run(args):
+        code = verify_cli.main(["verify_cli.py"] + list(args))
+        return code, capsys.readouterr().out
+    return run
+
+
+def test_late_or_untimed_burn_address_payment_through_the_real_verify_cli_exits_3(monkeypatch, capsys):
+    # A payment to the burn address checked for a seller, with --not-after: the probe (the
+    # burn address) matches on amount and payee and then fails on time - late (5) or no
+    # timestamp (6). It still pays the probe account, so it is a wrong recipient (3), not 7.
+    burn = probe_gate.PROBE_ACCOUNTS[0]
+    reply = {
+        "block_account": "nano_3payer", "amount": RAW, "confirmed": "true",
+        "height": "42", "subtype": "send", "local_timestamp": "1790000000",
+        "contents": {"type": "state", "account": "nano_3payer", "link_as_account": burn},
+    }
+    run = _real_cli(monkeypatch, capsys, reply, "verify_cli_probe_gate_late_burn")
+    for timestamp, probe_code in (("1790000000", 5), ("0", 6)):
+        reply["local_timestamp"] = timestamp
+        assert run([BLOCK, RAW, burn, "http://127.0.0.1:7076", "--not-after", "1700000000"])[0] == probe_code
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "http://127.0.0.1:7076", run=run,
+                                      not_after="1700000000")
+        assert code == 3 and "APPROVE" not in lines and lines[-1] == "WRONG-RECIPIENT: nothing approved"
+
+
+def test_late_probe_without_the_probe_account_as_recipient_is_7():
+    # Exit 5 or 6 on the probe counts as "pays the probe account" only from a parsed receipt
+    # whose account is the probe account; the real check would confirm a wrong recipient.
+    for receipt in ('{"verdict": "late", "account": "%s"}' % PAYEE, '{"verdict": "late"}',
+                    '{"verdict": "unknown_time", "account": "%s"}' % THIRD, "",
+                    '{"verdict": "mismatch", "account": "%s"}' % probe_gate.PROBE_ACCOUNTS[0]):
+        calls = []
+
+        def run(args):
+            calls.append(args)
+            if len(calls) == 1:
+                return 5, receipt
+            return 3, mismatch(args[2], got=probe_gate.PROBE_ACCOUNTS[0])
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, receipt
+
+
+def test_exit_2_without_a_not_yet_receipt_is_7_not_pending():
+    # Python exits 2 when it cannot open verify_cli.py; that is a broken check, not a block
+    # that is not confirmed yet, so a caller that retries on 2 must not be told to wait.
+    for out in ("", "python3: can't open file", '{"settled": true}', '{"verdict": "mismatch"}'):
+        run, calls = scripted(lambda probe: (2, out))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, out
+        calls = []
+
+        def real_two(args):
+            calls.append(args)
+            return (3, mismatch(args[2])) if len(calls) == 1 else (2, out)
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=real_two)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, out
+    # A real not-yet receipt still reads as pending, on the probe and on the real check.
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=fake([2])[0])[0] == 2
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=fake([3, 2])[0])[0] == 2
+
+
+def test_missing_verify_cli_exits_7_not_pending(monkeypatch, tmp_path):
+    # End to end through run_cli: the interpreter cannot open the script and exits 2.
+    monkeypatch.setattr(probe_gate, "CLI", str(tmp_path / "verify_cli.py"))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "https://127.0.0.1:9")
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    assert not any("PENDING" in line for line in lines)
