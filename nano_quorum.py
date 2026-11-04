@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -79,50 +80,122 @@ class Disagreement(Exception):
     answers mean one endpoint is broken or lying. Which one is not knowable from
     here, so nothing is served.
 
-    Both sides are kept, not just the refusal. `answers` maps each endpoint to
-    its answer as text (as it always has, and as the message prints it).
-    `observations` maps each endpoint to the whole thing it returned - the
-    `Receipt` a `Corroboration` would have carried, the `(balance_raw,
-    receivable_raw)` figure, the payer report - so a dispute record can show
-    what each node actually said. `record()` is that as a JSON-ready dict.
+    Both sides are kept, not just the refusal. `answers` is exactly what it
+    always was: the first endpoint that settled on an answer and the endpoint
+    that contradicted it, each with its answer as text, as the message prints
+    them. That holds for any `agree`; with `agree >= 3` the endpoints that
+    agreed with the first one are not added to it.
+
+    Everything else is additive. `observations` maps every endpoint that
+    answered before the contradiction, and the one that contradicted, to the
+    whole thing it returned - the `Receipt` a `Corroboration` would have
+    carried, the `(balance_raw, receivable_raw)` figure, the payer report - in
+    the order asked. `observed_answers` maps those same endpoints to their
+    answers as text. `record()` is all of it as a JSON-ready dict.
+
+    Raises `TypeError` when `answers`, `observations` or `observed_answers` is
+    not a mapping (`observations` and `observed_answers` may be None).
     """
 
-    def __init__(self, answers: dict, observations: dict | None = None) -> None:
+    def __init__(
+        self,
+        answers: dict,
+        observations: dict | None = None,
+        observed_answers: dict | None = None,
+    ) -> None:
+        answers = _mapping("answers", answers)
         detail = "; ".join(f"{url}: {answer}" for url, answer in answers.items())
         super().__init__(f"endpoints disagree: {detail}")
-        self.answers = dict(answers)
-        self.observations = dict(observations or {})
+        self.answers = answers
+        self.observations = _mapping("observations", observations)
+        self.observed_answers = _mapping("observed_answers", observed_answers)
 
     def record(self) -> dict:
-        """Both observations as a JSON-serialisable dict, for a dispute log.
+        """Every observation as a strict-JSON dict, for a dispute log.
 
+        `{"verdict": "disagreement", "observations": [{"rpc_url", "answer",
+        "payload"}, ...], "served": None}`, one entry per endpoint: those in
+        `observations` in their order, then any endpoint only `answers` names.
         `served` is always None: on a disagreement nothing is served.
+
+        Whatever the values hold, this does not raise and `json.dumps(...,
+        allow_nan=False)` accepts the result: see `_jsonable` for how each
+        value is written. The one refusal is structural: if `answers`,
+        `observations` or `observed_answers` has been replaced by something that
+        is not a mapping, it raises `TypeError`, as the constructor would have.
         """
-        urls = list(self.answers) + [u for u in self.observations if u not in self.answers]
-        return {
-            "verdict": "disagreement",
-            "observations": [
-                {
-                    "rpc_url": url,
-                    "answer": _jsonable(self.answers.get(url)),
-                    "payload": _jsonable(self.observations.get(url)),
-                }
-                for url in urls
-            ],
-            "served": None,
-        }
+        answers = _mapping("answers", self.answers)
+        observations = _mapping("observations", self.observations)
+        observed_answers = _mapping("observed_answers", self.observed_answers)
+        entries = []
+        try:
+            seen = list(observations)
+            seen += [url for url in answers if url not in observations]
+            for url in seen:
+                if url in observed_answers:
+                    answer = observed_answers[url]
+                else:
+                    answer = answers.get(url)
+                entries.append(
+                    {
+                        "rpc_url": _jsonable(url),
+                        "answer": _jsonable(answer),
+                        "payload": _jsonable(observations.get(url)),
+                    }
+                )
+        except Exception as error:  # a key whose __eq__ or __hash__ raises
+            entries.append({"rpc_url": None, "answer": None, "payload": _repr(error)})
+        return {"verdict": "disagreement", "observations": entries, "served": None}
 
 
-def _jsonable(value, _active=None):
-    """`value` as plain JSON types: a receipt or report by its own `to_json`.
+def _mapping(name: str, value) -> dict:
+    """`value` as a plain dict, or `TypeError` naming `name` when it is not a mapping."""
+    if value is None and name != "answers":
+        return {}
+    if not isinstance(value, Mapping) and not callable(getattr(value, "items", None)):
+        raise TypeError(
+            f"Disagreement {name} must be a mapping of endpoint to value, "
+            f"got {type(value).__name__}"
+        )
+    try:
+        return dict(value.items())
+    except Exception as error:
+        raise TypeError(f"Disagreement {name} could not be read as a mapping: {error!r}") from None
 
-    Always JSON-serialisable, strictly (`allow_nan=False`): a type with no JSON
-    form - bytes, a Decimal, an object of some caller's - becomes its `repr`
-    string rather than reaching `json.dumps` and raising there, in the middle of
-    writing a dispute log. So do NaN and infinity, which are not JSON, and a
-    container that contains itself. Ints are kept as ints of any size: an
-    amount of raw stays exact.
+
+# How deep record() follows nested containers before writing a placeholder, so
+# a deeply nested value cannot exhaust the interpreter's recursion limit.
+_MAX_DEPTH = 64
+
+
+def _jsonable(value, _active=None, _depth=0):
+    """`value` as plain, strict JSON types (`allow_nan=False`), never raising.
+
+    - None, bools, ints (of any size: an amount of raw stays exact) and finite
+      floats are kept; NaN and infinity become their `repr` text.
+    - A dataclass - a `Receipt`, a payer report - is an object of every one of
+      its fields under the field's own name, `seen_at` and `not_after`
+      included even where its `to_json` leaves them out, plus whatever else its
+      `to_json` adds (a derived `repeat_rate`, a `time_source`). The field's
+      value wins where both give one.
+    - Another object with a `to_json` is what that returns.
+    - A mapping whose keys are all strings stays an object with those same
+      keys. A mapping with any other key becomes a list of `[key, value]`
+      pairs in its own order, each key written by these same rules, so an int
+      key stays an int and `1` and `"1"` are never merged into one.
+    - Lists and tuples are lists; a set is a list in a stable order.
+    - Anything else - bytes, a Decimal, an object of some caller's - is its
+      `repr`; one whose `repr` raises is a placeholder naming its type. So is a
+      container that contains itself, one nested deeper than `_MAX_DEPTH`, and
+      any value whose inspection raises.
     """
+    try:
+        return _jsonable_inner(value, set() if _active is None else _active, _depth)
+    except Exception:
+        return _repr(value)
+
+
+def _jsonable_inner(value, active, depth):
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -131,25 +204,34 @@ def _jsonable(value, _active=None):
         return float(value) if math.isfinite(value) else repr(value)
     if isinstance(value, str):
         return str(value)
-    active = set() if _active is None else _active
     if id(value) in active:
         return "<cycle %s>" % type(value).__name__
+    if depth >= _MAX_DEPTH:
+        return "<too deep %s>" % type(value).__name__
     active.add(id(value))
     try:
-        if hasattr(value, "to_json"):
-            try:
-                return _jsonable(json.loads(value.to_json()), active)
-            except Exception:
-                return _repr(value)
+        nested = depth + 1
         if is_dataclass(value) and not isinstance(value, type):
-            try:
-                return _jsonable(asdict(value), active)
-            except Exception:
-                return _repr(value)
-        if isinstance(value, dict):
-            return {_key(key): _jsonable(item, active) for key, item in value.items()}
+            out = {}
+            extra = _to_json(value)
+            if isinstance(extra, dict):
+                out.update((str(key), item) for key, item in extra.items())
+            for spec in fields(value):
+                out[spec.name] = getattr(value, spec.name)
+            return {key: _jsonable(item, active, nested) for key, item in out.items()}
+        if hasattr(value, "to_json"):
+            loaded = _to_json(value)
+            return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, active, nested)
+        if isinstance(value, Mapping):
+            pairs = list(value.items())
+            if all(isinstance(key, str) for key, _ in pairs):
+                return {str(key): _jsonable(item, active, nested) for key, item in pairs}
+            return [
+                [_jsonable(key, active, nested), _jsonable(item, active, nested)]
+                for key, item in pairs
+            ]
         if isinstance(value, (list, tuple, set, frozenset)):
-            items = [_jsonable(item, active) for item in value]
+            items = [_jsonable(item, active, nested) for item in value]
             if isinstance(value, (set, frozenset)):
                 # A set has no order of its own; give the record one.
                 items.sort(key=lambda item: json.dumps(item, sort_keys=True))
@@ -159,11 +241,18 @@ def _jsonable(value, _active=None):
         active.discard(id(value))
 
 
-def _key(key) -> str:
-    """A dict key as text, never raising."""
-    if isinstance(key, str):
-        return str(key)
-    return _repr(key) if not isinstance(key, (int, float, bool, type(None))) else str(key)
+_NO_JSON = object()
+
+
+def _to_json(value):
+    """`json.loads(value.to_json())`, or `_NO_JSON` when there is none or it fails."""
+    try:
+        method = getattr(value, "to_json", None)
+        if method is None:
+            return _NO_JSON
+        return json.loads(method())
+    except Exception:
+        return _NO_JSON
 
 
 def _repr(value) -> str:
@@ -171,7 +260,11 @@ def _repr(value) -> str:
     try:
         return str(repr(value))
     except Exception:
-        return "<unrepresentable %s>" % type(value).__name__
+        try:
+            name = type(value).__name__
+        except Exception:
+            name = "object"
+        return "<unrepresentable %s>" % name
 
 
 @dataclass(frozen=True)
@@ -373,10 +466,14 @@ def verify_corroborated(
         if settled_by and answer not in settled_by:
             # Every settled endpoint so far is kept, each with what it itself
             # said, then the one that contradicts them.
+            # `answers` is as it always was - the first endpoint to settle and
+            # the one that contradicts it - and every settled endpoint so far
+            # is kept beside it, each with what it itself said.
             witnesses = settled + [(rpc_url, answer, payload)]
             raise Disagreement(
-                {url: str(said) for url, said, _ in witnesses},
+                {settled[0][0]: str(settled[0][1]), rpc_url: str(answer)},
                 observations={url: receipt for url, _, receipt in witnesses},
+                observed_answers={url: str(said) for url, said, _ in witnesses},
             )
         settled_by.setdefault(answer, []).append(rpc_url)
         settled.append((rpc_url, answer, payload))
@@ -555,8 +652,9 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
         if figures and figure not in figures:
             witnesses = reported + [(rpc_url, figure)]
             raise Disagreement(
-                {url: str(said) for url, said in witnesses},
+                {reported[0][0]: str(reported[0][1]), rpc_url: str(figure)},
                 observations={url: said for url, said in witnesses},
+                observed_answers={url: str(said) for url, said in witnesses},
             )
         figures.setdefault(figure, []).append(rpc_url)
         reported.append((rpc_url, figure))

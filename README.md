@@ -381,15 +381,21 @@ The rules it holds to, each of which is a way of failing closed:
 - **It never sends.** `process` is deliberately absent; this reads, like the rest of the
   package.
 
-**On disagreement, both observations are kept.** `Disagreement.answers` still names each
-endpoint with its answer as text, and `Disagreement.observations` maps each endpoint to the
-whole thing it returned - the `Receipt` a `Corroboration` would have carried (amount,
-height, payee, settled), the confirmed balance figure, or the payer report. For a dispute
-log, `Disagreement.record()` returns them as a JSON-ready dict:
+**On disagreement, both observations are kept.** `Disagreement.answers` and the message are
+unchanged for any `agree`: the first endpoint that settled and the endpoint that contradicted
+it, each with its answer as text. The rest is additive. `Disagreement.observations` maps
+every endpoint that answered before the contradiction, and the contradicting one, to the whole
+thing it returned - the `Receipt` a `Corroboration` would have carried (amount, height, payee,
+settled, `seen_at`), the confirmed balance figure, or the payer report - in the order asked,
+and `Disagreement.observed_answers` maps the same endpoints to their answers as text. For a
+dispute log, `Disagreement.record()` returns them as a JSON-ready dict:
 `{"verdict": "disagreement", "observations": [{"rpc_url", "answer", "payload"}, ...], "served": None}`.
-Every endpoint that answered before the contradiction is kept, each with its own answer and
-its own observation, in the order asked. The record is always strict JSON: a value with no
-JSON form (bytes, a Decimal, NaN) is written as its `repr`, and amounts stay exact integers.
+The record is always strict JSON and `record()` does not raise on what the values hold: a
+dataclass is written field by field under its own field names (`seen_at` included), a mapping
+keeps its own string keys (one with any non-string key becomes a list of `[key, value]` pairs,
+so `1` and `"1"` stay apart), a value with no JSON form (bytes, a Decimal, NaN, an object
+whose attributes raise) is written as its `repr`, and amounts stay exact integers. The one
+refusal is a `TypeError` when `answers` or `observations` is not a mapping at all.
 Nothing is served on a disagreement; the record only says what each node said.
 
 Two more functions come with it:
@@ -458,7 +464,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-849 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+854 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

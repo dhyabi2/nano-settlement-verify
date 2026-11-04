@@ -225,8 +225,8 @@ def test_a_disagreement_after_two_agreeing_nodes_keeps_every_node_with_its_own_r
     error = caught.value
     assert list(error.observations) == [A, B, C]
     assert {url: r.seen_at for url, r in error.observations.items()} == {A: 1, B: 2, C: 3}
-    assert list(error.answers) == [A, B, C]
-    assert error.answers[A] == error.answers[B] != error.answers[C]
+    assert list(error.observed_answers) == [A, B, C]
+    assert error.observed_answers[A] == error.observed_answers[B] != error.observed_answers[C]
     record = json.loads(json.dumps(error.record(), allow_nan=False))
     assert [o["rpc_url"] for o in record["observations"]] == [A, B, C]
     assert [o["payload"]["height"] for o in record["observations"]] == [7, 7, 9]
@@ -264,15 +264,109 @@ def test_a_disagreement_record_is_always_json_even_for_types_json_does_not_know(
     text = json.dumps(error.record(), allow_nan=False)
     record = json.loads(text)
     a, b = (o["payload"] for o in record["observations"])
-    assert a["blob"] == repr(b"\x00\xff")
-    assert a["d"] == "Decimal('1.5')"
-    assert a["o"] == "Opaque()"
-    assert a["3"] == "<unrepresentable BadRepr>"
+    assert a == [
+        ["blob", repr(b"\x00\xff")],
+        ["d", "Decimal('1.5')"],
+        ["o", "Opaque()"],
+        [3, "<unrepresentable BadRepr>"],
+    ]
     assert b == ["nan", "inf", ["Opaque()"], 10**60, None, True]
     assert isinstance(b[3], int)
     looped = []
     looped.append(looped)
     json.dumps(Disagreement({A: "x"}, observations={A: looped}).record(), allow_nan=False)
+
+
+def _three_receipts(monkeypatch, heights):
+    def verify(block_hash, expect_raw, account, rpc_url):
+        return nano_settlement_verify.Receipt(
+            settled=True, amount_raw=expect_raw, height=heights[rpc_url], account=account
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+
+
+def test_with_agree_3_a_disagreement_keeps_the_answers_and_message_it_always_had(monkeypatch):
+    """`answers` and the message name the first settled endpoint and the contradictor.
+
+    Callers written before observations existed read exactly two entries; the
+    agreeing B is recorded only in the new, additive attributes.
+    """
+    _three_receipts(monkeypatch, {A: 7, B: 7, C: 9})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    c9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, C: c9}
+    assert str(caught.value) == f"endpoints disagree: {A}: {a7}; {C}: {c9}"
+    assert list(caught.value.observations) == [A, B, C]
+    assert caught.value.observed_answers == {A: a7, B: a7, C: c9}
+    record = caught.value.record()
+    assert [(o["rpc_url"], o["answer"]) for o in record["observations"]] == [
+        (A, a7), (B, a7), (C, c9)
+    ]
+
+
+def test_with_agree_3_a_balance_disagreement_keeps_the_answers_it_always_had(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO, 5), C: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B, C], agree=3)
+    assert caught.value.answers == {A: str((ONE_XNO, 5)), C: str((ONE_XNO - 1, 5))}
+    assert str(caught.value) == (
+        f"endpoints disagree: {A}: {(ONE_XNO, 5)}; {C}: {(ONE_XNO - 1, 5)}"
+    )
+
+
+def test_a_disagreement_record_never_raises_on_caller_built_observations():
+    """Hostile or odd values are written, not raised: record() feeds a dispute log."""
+
+    class Hostile:
+        def __getattr__(self, name):
+            raise RuntimeError("no attribute for you")
+
+    deep = []
+    node = deep
+    for _ in range(5000):
+        node.append([])
+        node = node[0]
+    error = Disagreement(
+        {b"raw-url": "x", A: "y"},
+        observations={A: Hostile(), B: deep},
+    )
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    by_url = {o["rpc_url"]: o for o in record["observations"]}
+    assert set(by_url) == {A, B, repr(b"raw-url")}
+    assert by_url[A]["payload"].startswith("<") and "Hostile" in by_url[A]["payload"]
+    assert by_url[repr(b"raw-url")]["answer"] == "x"
+    assert record["served"] is None
+
+
+def test_a_disagreement_built_from_non_mappings_is_a_type_error():
+    """The one refusal is structural, a TypeError, before anything is recorded."""
+    with pytest.raises(TypeError, match="observations must be a mapping"):
+        Disagreement({A: "x"}, observations=[1, 2])
+    with pytest.raises(TypeError, match="answers must be a mapping"):
+        Disagreement([(A, "x")])
+    error = Disagreement({A: "x"})
+    error.observations = "not a mapping"
+    with pytest.raises(TypeError, match="observations must be a mapping"):
+        error.record()
+
+
+def test_a_disagreement_record_keeps_seen_at_and_the_callers_keys():
+    receipt = nano_settlement_verify.Receipt(
+        settled=True, amount_raw=ONE_XNO, height=7, account=PAYEE, seen_at=1700000000
+    )
+    error = Disagreement(
+        {A: "x", B: "y"},
+        observations={A: receipt, B: {1: "int key", "1": "str key", "k": "v"}},
+    )
+    a, b = (o["payload"] for o in json.loads(json.dumps(error.record()))["observations"])
+    assert a["seen_at"] == 1700000000 and a["not_after"] is None
+    assert a["amount_raw"] == ONE_XNO and a["height"] == 7 and a["account"] == PAYEE
+    assert b == [[1, "int key"], ["1", "str key"], ["k", "v"]]
+    plain = Disagreement({A: "x"}, observations={A: {"Rpc-Url": 1, "seen_at": 2}}).record()
+    assert plain["observations"][0]["payload"] == {"Rpc-Url": 1, "seen_at": 2}
 
 
 def test_a_disagreement_is_not_resolved_by_a_third_vote(monkeypatch):
