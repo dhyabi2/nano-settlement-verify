@@ -531,6 +531,48 @@ def test_a_payer_disagreement_keeps_both_reports(monkeypatch):
     assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 1]
 
 
+def _report(endpoint, accounts):
+    payer_list = tuple(
+        nano_payers.Payer(
+            account=account, payments=1, received_raw=CALL_PRICE,
+            first_timestamp=1790594630, last_timestamp=1790594630,
+        )
+        for account in accounts
+    )
+    return PayerReport(
+        account=PAYEE, distinct_payers=len(payer_list), payments=len(payer_list),
+        received_raw=CALL_PRICE * len(payer_list), payers=payer_list, self_payments=0,
+        unconfirmed_payments=0, blocks_read=len(payer_list), complete=True,
+        asked=(endpoint,),
+    )
+
+
+def test_a_long_first_answer_does_not_hide_the_endpoint_that_disagreed():
+    """1700 payers from the first node must not use up the record of the second."""
+    first = _report(A, ["nano_payer%05d" % n for n in range(1700)])
+    other = _report(B, ["nano_payer%05d" % n for n in range(1699)] + ["nano_stranger"])
+    # Built exactly as payers_corroborated builds it.
+    error = nano_quorum.Disagreement(
+        {
+            report.asked[0]: sorted(payer.account for payer in report.payers)
+            for report in (first, other)
+        },
+        observations={report.asked[0]: report for report in (first, other)},
+    )
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    entries = record["observations"]
+    assert [entry["rpc_url"] for entry in entries] == [A, B]
+    # The contradicting endpoint's answer is all there, the stranger included.
+    assert entries[1]["answer"] == sorted(p.account for p in other.payers)
+    assert "nano_stranger" in entries[1]["answer"]
+    assert entries[0]["answer"] == sorted(p.account for p in first.payers)
+    # And each payload still carries its report's figures.
+    for entry, report in zip(entries, (first, other)):
+        assert entry["payload"]["distinct_payers"] == report.distinct_payers
+        assert entry["payload"]["received_raw"] == report.received_raw
+        assert entry["payload"]["complete"] is True
+
+
 def test_the_same_endpoint_written_twice_is_one_witness(monkeypatch):
     nodes(monkeypatch, {A: history(open_block(PAYER_1, CALL_PRICE))})
     with pytest.raises(ValueError, match="distinct endpoint"):

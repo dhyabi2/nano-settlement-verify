@@ -95,7 +95,10 @@ class Disagreement(Exception):
     answers as text. `record()` is all of it as a JSON-ready dict.
 
     Raises `TypeError` when `answers`, `observations` or `observed_answers` is
-    not a mapping (`observations` and `observed_answers` may be None).
+    not a mapping (`observations` and `observed_answers` may be None). This is a
+    change for direct callers: before `observations` existed, an `answers`
+    without `.items()` failed with `AttributeError`. Nothing in this package
+    builds one from a non-mapping, so no verification outcome changes.
     """
 
     def __init__(
@@ -119,6 +122,11 @@ class Disagreement(Exception):
         `observations` in their order, then any endpoint only `answers` names.
         `served` is always None: on a disagreement nothing is served.
 
+        Each entry is written on its own budget (`_MAX_NODES` values for the
+        answer and again for the payload), and its `rpc_url` on a walk of its
+        own, so the endpoint that contradicted is always named with its answer,
+        however long the first endpoint's answer was.
+
         Whatever the values hold, this does not raise and `json.dumps(...,
         allow_nan=False)` accepts the result: see `_jsonable` for how each
         value is written. The one refusal is structural: if `answers`,
@@ -131,9 +139,11 @@ class Disagreement(Exception):
         answers_index, observations_index, observed_index = (
             _index(answers), _index(observations), _index(observed_answers)
         )
-        # One budget for the whole record, so shared substructures (`a = [a, a]`
-        # forty times over) cannot make it, or json.dumps of it, exponential.
-        walk = _Walk()
+        # Each endpoint's answer and payload get a budget of their own, so a
+        # long first answer (1500 payers) cannot crowd out the endpoint that
+        # contradicted it, while shared substructures (`a = [a, a]` forty times
+        # over) still cannot make the record, or json.dumps of it, exponential.
+        # The rpc_url is written on a walk of its own too: it is always there.
         entries = []
         seen = [url for url, _ in observations]
         seen += [
@@ -147,10 +157,10 @@ class Disagreement(Exception):
                     answer = _lookup(answers, answers_index, url)[1]
                 entries.append(
                     {
-                        "rpc_url": _jsonable(url, walk),
-                        "answer": _jsonable(answer, walk),
+                        "rpc_url": _jsonable(url, _Walk()),
+                        "answer": _jsonable(answer, _Walk()),
                         "payload": _jsonable(
-                            _lookup(observations, observations_index, url)[1], walk
+                            _lookup(observations, observations_index, url)[1], _Walk()
                         ),
                     }
                 )
@@ -223,10 +233,12 @@ def _lookup(pairs: list, index, key) -> tuple:
 # a deeply nested value cannot exhaust the interpreter's recursion limit.
 _MAX_DEPTH = 64
 
-# How many values one record() writes in all before the rest become a
-# placeholder. A structure that shares a substructure (`a = [a, a]`, repeated)
-# is a tree exponentially larger than the objects it is built from; this keeps
-# both record() and json.dumps of its result bounded.
+# How many values record() writes for one endpoint's answer, and again for its
+# payload, before the rest become a placeholder. Each endpoint has its own, so
+# one long answer cannot hide another endpoint's. A structure that shares a
+# substructure (`a = [a, a]`, repeated) is a tree exponentially larger than the
+# objects it is built from; this keeps both record() and json.dumps of its
+# result bounded, at most linearly in the number of endpoints.
 _MAX_NODES = 10_000
 
 # Ints with more decimal digits than this are written as a hex string (see
@@ -244,7 +256,7 @@ def _int_digits() -> int:
 
 
 class _Walk:
-    """State shared by one record(): the containers being written, and the budget."""
+    """State shared by one walk: the containers being written, and the budget."""
 
     def __init__(self) -> None:
         self.active: set = set()
@@ -262,9 +274,11 @@ def _jsonable(value, _walk=None, _depth=0):
       `to_json` adds (a derived `repeat_rate`, a `time_source`). The field's
       value wins where both give one.
     - Another object with a `to_json` is what that returns.
-    - A mapping whose keys are all strings stays an object with those same
-      keys. A mapping with any other key becomes a list of `[key, value]`
-      pairs in its own order, each key written by these same rules, so an int
+    - A mapping whose keys are all strings stays an object keyed by each
+      key's own text (not its `__str__`), as long as no two keys share a text;
+      two distinct keys that do (str subclasses with their own `__eq__`) make
+      it a list of pairs instead, so neither is lost. A mapping with any
+      other key becomes a list of `[key, value]` pairs in its own order, each key written by these same rules, so an int
       key stays an int and `1` and `"1"` are never merged into one.
     - Lists and tuples are lists; a set is a list in a stable order.
     - Anything else - bytes, a Decimal, an object of some caller's - is its
@@ -274,9 +288,11 @@ def _jsonable(value, _walk=None, _depth=0):
     - An int too long for `str()` (over `_MAX_INT_DIGITS` decimal digits;
       Python refuses over 4300) is the string `"<int 0x...>"`: its exact value
       in hex, which has no such limit, so it is still recoverable.
-    - After `_MAX_NODES` values in one record, every further value is the
+    - After `_MAX_NODES` values in one walk (record() gives each endpoint's
+      answer and payload a walk of their own), every further value is the
       placeholder `"<omitted TYPE>"`, so a structure that shares substructures
-      cannot make the record exponentially large.
+      cannot make the record exponentially large. A dataclass's scalar fields
+      are written before its containers, so they are not the ones omitted.
     """
     walk = _Walk() if _walk is None else _walk
     try:
@@ -300,7 +316,7 @@ def _jsonable_inner(value, walk, depth):
     if isinstance(value, float):
         return float(value) if math.isfinite(value) else repr(value)
     if isinstance(value, str):
-        return str(value)
+        return str.__str__(value)
     if id(value) in active:
         return "<cycle %s>" % type(value).__name__
     if depth >= _MAX_DEPTH:
@@ -315,14 +331,35 @@ def _jsonable_inner(value, walk, depth):
                 out.update((str(key), item) for key, item in extra.items())
             for spec in fields(value):
                 out[spec.name] = getattr(value, spec.name)
-            return {key: _jsonable(item, walk, nested) for key, item in out.items()}
+            # Scalar fields (an amount, a height, a count) are written before the
+            # containers, so a long list in one field cannot use up the budget
+            # they need; the object keeps its own field order.
+            written = {
+                key: _jsonable(item, walk, nested)
+                for key, item in out.items()
+                if item is None or isinstance(item, (bool, int, float, str))
+            }
+            written.update(
+                (key, _jsonable(item, walk, nested))
+                for key, item in out.items()
+                if key not in written
+            )
+            return {key: written[key] for key in out}
         if hasattr(value, "to_json"):
             loaded = _to_json(value)
             return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
         if isinstance(value, Mapping):
             pairs = list(value.items())
             if all(isinstance(key, str) for key, _ in pairs):
-                return {str(key): _jsonable(item, walk, nested) for key, item in pairs}
+                # A key's own text, not its `__str__`; two keys that are distinct
+                # to the mapping but share a text (str subclasses with their own
+                # `__eq__`) fall through to pairs below rather than merge.
+                texts = [str.__str__(key) for key, _ in pairs]
+                if len(set(texts)) == len(texts):
+                    return {
+                        text: _jsonable(item, walk, nested)
+                        for text, (_, item) in zip(texts, pairs)
+                    }
             return [
                 [_jsonable(key, walk, nested), _jsonable(item, walk, nested)]
                 for key, item in pairs

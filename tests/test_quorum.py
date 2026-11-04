@@ -854,3 +854,40 @@ def test_a_disagreement_record_survives_a_key_whose_hash_starts_raising():
     assert "Key" in entries[0]["rpc_url"]
     assert entries[0]["answer"] == "x" and entries[0]["payload"] == {"p": 1}
     assert entries[1] == {"rpc_url": A, "answer": "y", "payload": 2}
+
+
+def test_a_disagreement_record_does_not_merge_distinct_keys_that_share_a_text():
+    """Two str-subclass keys the mapping keeps apart stay apart in the record."""
+
+    class Tagged(str):
+        def __new__(cls, text, tag):
+            made = super().__new__(cls, text)
+            made.tag = tag
+            return made
+
+        def __eq__(self, other):
+            return isinstance(other, Tagged) and (str(self), self.tag) == (str(other), other.tag)
+
+        def __hash__(self):
+            return hash((str(self), self.tag))
+
+        def __str__(self):
+            return "shouted " + str.__str__(self).upper()
+
+    first, second = Tagged("node", 1), Tagged("node", 2)
+    payload = {first: "one", second: "two"}
+    assert len(payload) == 2
+    record = Disagreement({A: "x"}, observations={A: payload}).record()
+    written = json.loads(json.dumps(record, allow_nan=False))["observations"][0]["payload"]
+    assert written == [["node", "one"], ["node", "two"]]
+    # Keys that do not collide stay an object, keyed by their own text.
+    lone = Disagreement({A: "x"}, observations={A: {first: "one"}}).record()
+    assert lone["observations"][0]["payload"] == {"node": "one"}
+
+
+def test_a_disagreement_record_names_every_endpoint_however_large_the_first_answer():
+    """One shared budget let the first endpoint's answer omit the second's url."""
+    big = [["leaf"] * 10 for _ in range(1500)]
+    error = Disagreement({A: big, B: "different"}, observations={A: big, B: {"amount": 1}})
+    entries = error.record()["observations"]
+    assert entries[1] == {"rpc_url": B, "answer": "different", "payload": {"amount": 1}}
