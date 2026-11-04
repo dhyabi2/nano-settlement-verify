@@ -17,6 +17,16 @@ PAYEE = "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7"
 NOT_YET = '{"settled": false, "amount_raw": 0, "height": 0, "account": ""}'
 
 
+def receipt(args, account=None, **extra):
+    """verify_cli.py's exit-0 receipt for the call `args` (on time, with --not-after)."""
+    out = {"settled": True, "amount_raw": int(args[1]), "height": 42,
+           "account": args[2] if account is None else account}
+    if "--not-after" in args:
+        out.update(seen_at=1700000000, not_after=1700000000, time_source="node local_timestamp")
+    out.update(extra)
+    return json.dumps(out)
+
+
 def fake(codes):
     calls = []
 
@@ -27,6 +37,8 @@ def fake(codes):
             return code, mismatch(args[2])
         if code == 2:
             return code, NOT_YET
+        if code == 0:
+            return code, receipt(args)
         return code, '{"n": %d}' % len(calls)
     return run, calls
 
@@ -58,10 +70,14 @@ def test_unreadable_node_on_probe_is_not_a_refusal():
     assert code == 4 and "PROBE-REFUSED" not in lines and "APPROVE" not in lines
 
 
-def test_real_check_failure_passes_its_code_through():
+def test_real_check_unreadable_node_passes_through_but_not_yet_is_7():
+    run, _ = fake([3, 4])
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 4 and lines[0] == "PROBE-REFUSED" and "APPROVE" not in lines
+    # The probe's payee mismatch says the block is confirmed: "not yet" contradicts it.
     run, _ = fake([3, 2])
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
-    assert code == 2 and lines[0] == "PROBE-REFUSED" and "APPROVE" not in lines
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
 
 
 def test_probe_recipient_never_equals_the_payee():
@@ -97,7 +113,8 @@ def failover_nodes(nodes):
             code = nodes[url](positional[2], len(calls))
             if code != 4:
                 verdict = ({"verdict": "mismatch", "expected": positional[2], "got": PAYEE}
-                           if code == 3 else {"settled": code == 0})
+                           if code == 3 else json.loads(receipt(positional)) if code == 0
+                           else {"settled": False})
                 if len(urls) > 1:
                     verdict["rpc_index"] = index
                 return code, json.dumps(verdict)
@@ -107,14 +124,15 @@ def failover_nodes(nodes):
 
 def test_failover_cannot_hand_the_real_check_to_another_node():
     # The yes-to-anything node is down for the probe, so the honest node refuses it;
-    # it is back for the real check. The block paid someone else: honest says 3.
+    # it is back for the real check. The honest node then answers 3, contradicting its
+    # own probe (which said the block pays PAYEE): 7, and never the YES node.
     nodes = {
         YES: lambda account, n: 4 if n == 1 else 0,
         HONEST: lambda account, n: 3,
     }
     run, calls = failover_nodes(nodes)
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, YES + "," + HONEST, run=run)
-    assert code == 3 and "APPROVE" not in lines
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
     assert calls[1][3] == HONEST
 
 
@@ -126,7 +144,7 @@ def test_failover_list_from_the_environment_is_pinned_too(monkeypatch):
     }
     run, calls = failover_nodes(nodes)
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
-    assert code == 3 and "APPROVE" not in lines and calls[1][3] == HONEST
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines and calls[1][3] == HONEST
 
 
 def test_list_probe_without_rpc_index_approves_nothing():
@@ -199,7 +217,7 @@ def scripted(probe_reply):
         calls.append(args)
         if len(calls) == 1:
             return probe_reply(args[2])
-        return 0, '{"settled": true}'
+        return 0, receipt(args)
     return run, calls
 
 
@@ -442,7 +460,7 @@ def test_burn_address_payment_through_the_real_verify_cli_exits_3(monkeypatch, c
 THIRD = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
 
 
-def probe_then(probe_reply, real=(0, '{"settled": true}')):
+def probe_then(probe_reply, real=lambda args: (0, receipt(args))):
     """Probe answers (3, probe_reply(probe_account)); the real check answers `real`."""
     calls = []
 
@@ -576,9 +594,10 @@ def test_exit_2_without_a_not_yet_receipt_is_7_not_pending():
             return (3, mismatch(args[2])) if len(calls) == 1 else (2, out)
         code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=real_two)
         assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, out
-    # A real not-yet receipt still reads as pending, on the probe and on the real check.
+    # A real not-yet receipt still reads as pending on the probe; on the real check, after
+    # a probe that said confirmed, it contradicts the probe.
     assert probe_gate.gate(BLOCK, RAW, PAYEE, run=fake([2])[0])[0] == 2
-    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=fake([3, 2])[0])[0] == 2
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=fake([3, 2])[0])[0] == probe_gate.EXIT_PROBE_PASSED
 
 
 def test_missing_verify_cli_exits_7_not_pending(monkeypatch, tmp_path):
@@ -587,3 +606,96 @@ def test_missing_verify_cli_exits_7_not_pending(monkeypatch, tmp_path):
     code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, "https://127.0.0.1:9")
     assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
     assert not any("PENDING" in line for line in lines)
+
+
+# The real check after a probe refused on the payee, or naming a third account: only a
+# settled receipt for ACCOUNT and EXPECT_RAW approves, and an answer that contradicts the
+# probe (or a crash) exits 7.
+PAYEE_PROBE = lambda probe: mismatch(probe)  # noqa: E731 - confirmed, pays RAW to PAYEE
+THIRD_PROBE = lambda probe: mismatch(probe, got=THIRD)  # noqa: E731
+
+
+def _real(code, out):
+    return lambda args: (code, out(args) if callable(out) else out)
+
+
+def test_exit_0_without_a_settled_receipt_for_the_payee_approves_nothing():
+    for out in ("", "garbage", "[]", "null", '{"settled": true}',
+                lambda a: receipt(a, settled=False),
+                lambda a: receipt(a, settled="true"),
+                lambda a: receipt(a, account=a[0]),
+                lambda a: receipt(a, account=probe_gate.PROBE_ACCOUNTS[0]),
+                lambda a: receipt(a, account=THIRD),
+                lambda a: receipt(a, amount_raw=int(RAW) - 1),
+                lambda a: receipt(a, amount_raw=RAW),
+                lambda a: receipt(a, verdict="mismatch"),
+                lambda a: json.dumps({k: v for k, v in json.loads(receipt(a)).items()
+                                      if k != "amount_raw"})):
+        run, calls = probe_then(PAYEE_PROBE, real=_real(0, out))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, out
+        assert len(calls) == 2
+
+
+def test_exit_0_with_not_after_needs_an_on_time_receipt():
+    for out in (lambda a: receipt(a, seen_at=1700000001),
+                lambda a: receipt(a, seen_at=None),
+                lambda a: json.dumps({k: v for k, v in json.loads(receipt(a)).items()
+                                      if k not in ("seen_at", "not_after")})):
+        run, _ = probe_then(PAYEE_PROBE, real=_real(0, out))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    run, _ = probe_then(PAYEE_PROBE)
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+    assert code == 0 and lines[-1] == "APPROVE"
+
+
+def test_settled_receipt_in_xrb_spelling_of_the_payee_approves():
+    run, _ = probe_then(PAYEE_PROBE, real=_real(0, lambda a: receipt(a, account="xrb_" + PAYEE[5:])))
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+    assert code == 0 and lines[-1] == "APPROVE"
+
+
+def test_real_check_contradicting_a_payee_probe_is_7():
+    burn = probe_gate.PROBE_ACCOUNTS[0]
+    late = lambda account, **kw: json.dumps(dict(  # noqa: E731
+        {"verdict": "late", "seen_at": 1700000001, "not_after": 1700000000,
+         "amount_raw": int(RAW), "account": account}, **kw))
+    for real in ((2, NOT_YET), (3, '{"verdict": "no_such_block"}'),
+                 (3, mismatch(PAYEE, got=burn)), (3, mismatch(PAYEE, got=THIRD)),
+                 (3, mismatch(RAW, got=str(int(RAW) - 1))), (3, mismatch("send", got="receive")),
+                 (5, late(burn)), (5, late(THIRD)), (5, late(PAYEE, amount_raw=1)),
+                 (5, late(PAYEE, verdict="unknown_time")), (6, late(PAYEE)),
+                 (5, ""), (6, "garbage"), (64, ""), (1, "Traceback (most recent call last):")):
+        run, calls = probe_then(PAYEE_PROBE, real=real)
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, real
+        assert lines[-1].startswith("REAL-CHECK-DISAGREES-WITH-PROBE"), real
+
+
+def test_late_or_untimed_payment_to_the_payee_after_a_payee_probe_passes_through():
+    for code_in, verdict in ((5, "late"), (6, "unknown_time")):
+        out = json.dumps({"verdict": verdict, "seen_at": None, "not_after": 1700000000,
+                          "amount_raw": int(RAW), "account": PAYEE})
+        run, _ = probe_then(PAYEE_PROBE, real=(code_in, out))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == code_in and "APPROVE" not in lines
+
+
+def test_real_check_contradicting_a_third_account_probe_is_7():
+    late = json.dumps({"verdict": "late", "seen_at": 1700000001, "not_after": 1700000000,
+                       "amount_raw": int(RAW), "account": THIRD})
+    for real in ((5, late), (6, late.replace('"late"', '"unknown_time"')), (2, NOT_YET),
+                 (64, ""), (1, "Traceback (most recent call last):")):
+        run, calls = probe_then(THIRD_PROBE, real=real)
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, real
+    run, _ = probe_then(THIRD_PROBE, real=(4, '{"verdict": "node_unreachable"}'))
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=run)[0] == 4
+
+
+def test_crash_in_the_real_check_exits_7_not_1():
+    for probe in (PAYEE_PROBE, THIRD_PROBE):
+        run, _ = probe_then(probe, real=(1, "Traceback (most recent call last):\n  boom"))
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines

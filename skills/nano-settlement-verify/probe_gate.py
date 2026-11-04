@@ -9,11 +9,16 @@ swallows the exit code, a check that no longer compares the payee, a node that a
 either way. This keeps the refusal in the path: before the real check it runs verify_cli.py
 on the SAME block and amount with a recipient the block was not sent to, and it approves
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
-probe account and its "got" is ACCOUNT - AND the real check came back settled (exit 0). A
+probe account and its "got" is ACCOUNT - AND the real check came back settled (exit 0) with
+a receipt that says so: "settled" true, "account" ACCOUNT and "amount_raw" EXPECT_RAW (and,
+with --not-after, "seen_at" at or before "not_after"); an exit 0 with any other output exits
+7. After such a probe the only other answers the real check may give are 4 (node unreadable)
+and 5/6 (late/untimed) naming ACCOUNT and EXPECT_RAW; anything else (not yet, no such block,
+a mismatch, a late verdict naming another account, a crash) contradicts the probe and exits 7. A
 payee mismatch that names any other recipient is not a passing probe: one that names the
 probe account itself (or no account) contradicts itself and exits 7; one that names a third
 account is a payment to that account only if the real check, on the same node, refuses it as
-paid to that same account (exit 3), and exits 7 otherwise. Any other exit 3 on the
+paid to that same account (exit 3); exit 4 passes through, and any other answer exits 7. Any other exit 3 on the
 probe is not a refusal of the payee: no_such_block exits 3 like verify_cli.py ("do not
 serve"; asking again does not create the block), invalid_amount exits 7. A probe refused on a
 field checked before the payee - the amount (an honest underpayment to the right payee) or
@@ -45,19 +50,22 @@ the probe account; a 5 or 6 that names any other account, or none, exits 7.
 
 prints  PROBE-REFUSED, then the real check's JSON verdict, then APPROVE
 exit 0  approved
-     2  the block is not confirmed yet (on the probe or the real check): only when
-        verify_cli.py printed its not-confirmed receipt ("settled": false). Any other exit
-        2 (Python could not open verify_cli.py, say) exits 7; nothing approved
+     2  the block is not confirmed yet (on the probe): only when verify_cli.py printed
+        its not-confirmed receipt ("settled": false). Any other exit 2 (Python could not
+        open verify_cli.py, say), and any exit 2 from the real check after the probe was
+        answered, exits 7; nothing approved
      3  refused: wrong amount (too much or too little) or not a send, the same on the
         probe and the real check; a payment to the wrong recipient (also when it was sent
         to the probe account itself); or the probe's node has no such block. Terminal: do
         not serve, asking again gives the same answer; nothing approved
      7  the probe was NOT refused on the payee, or the two calls could not be pinned to one
-        node, or the real check disagreed with the probe: the check is not doing its job,
-        nothing is approved
+        node, or the real check disagreed with the probe, or exited 0 without a settled
+        receipt for ACCOUNT and EXPECT_RAW, or crashed (exit 1, or any code not listed
+        here): the check is not doing its job, nothing is approved
      4  the node could not be read (nothing was checked)
+     5  late, 6 unknown_time: the real check's own verdict after a probe refused on the
+        payee, only when it names ACCOUNT and EXPECT_RAW; nothing approved
     64  usage error (from this script or from verify_cli.py on the probe)
-     other  the real check's own exit code (3 mismatch, 5 late, ...); nothing approved
 """
 import json
 import os
@@ -221,6 +229,44 @@ def _paid_to(out, account, probe):
             and _account_body(got) == _account_body(probe))
 
 
+def _same_account(value, account):
+    return (isinstance(value, str) and value.startswith(_PREFIXES)
+            and _account_body(value) == _account_body(account))
+
+
+def _same_amount(value, expect_raw):
+    try:
+        return type(value) is int and value == int(expect_raw)
+    except ValueError:
+        return False
+
+
+def _settled_receipt(out, expect_raw, account, timed):
+    """True only for verify_cli.py's exit-0 receipt of this payment: "settled" true,
+    "amount_raw" EXPECT_RAW and "account" ACCOUNT, and, with --not-after, "seen_at"
+    at or before "not_after"."""
+    receipt = _verdict(out)
+    if receipt is None or "verdict" in receipt or receipt.get("settled") is not True:
+        return False
+    if not (_same_account(receipt.get("account"), account)
+            and _same_amount(receipt.get("amount_raw"), expect_raw)):
+        return False
+    if timed:
+        seen_at, deadline = receipt.get("seen_at"), receipt.get("not_after")
+        if type(seen_at) is not int or type(deadline) is not int or seen_at > deadline:
+            return False
+    return True
+
+
+def _late_for(out, code, expect_raw, account):
+    """True when an exit-5/6 verdict is late/unknown_time for EXPECT_RAW to ACCOUNT."""
+    verdict = _verdict(out)
+    return (verdict is not None
+            and verdict.get("verdict") == {5: "late", 6: "unknown_time"}[code]
+            and _same_account(verdict.get("account"), account)
+            and _same_amount(verdict.get("amount_raw"), expect_raw))
+
+
 def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, probe_code=0):
     """The probe matched the payee: settled (exit 0), or late/untimed (5/6) naming the
     probe account. Exit 3 only when the real check, on the same node, refuses the block
@@ -297,10 +343,12 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, out.strip()]
         if code == 3 and _paid_to(out, account, got):
             return 3, lines + ["WRONG-RECIPIENT: nothing approved"]
-        if code in (0, 3) or (code == 2 and not _not_yet(out)):
-            return EXIT_PROBE_PASSED, lines + [
-                "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
-        return code, lines
+        if code == 4:
+            return 4, lines
+        # Settled, not yet, late, untimed, another mismatch or a crash: none of them is
+        # "this block pays that account", which the probe said.
+        return EXIT_PROBE_PASSED, lines + [
+            "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
     if refusal != "payee":
         # Exit 3 for any other reason (a wrong amount or operation, an amount that is
         # not raw, unreadable JSON) says nothing about whether the payee is compared.
@@ -318,12 +366,22 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     if code == 0 and _rpc_index(out) is not None:
         # A single pinned URL never carries rpc_index; one that does was not pinned.
         return EXIT_PROBE_PASSED, lines + ["REAL-CHECK-NOT-PINNED: nothing approved"]
-    if code == 2 and not _not_yet(out):
-        return EXIT_PROBE_PASSED, lines + [
-            "REAL-CHECK-EXIT-2-WITHOUT-RECEIPT (not a not-confirmed verdict): nothing approved"]
     if code == 0:
-        lines.append("APPROVE")
-    return code, lines
+        if not _settled_receipt(out, expect_raw, account, not_after is not None):
+            # Exit 0 alone is not a settlement: the receipt must say settled, for
+            # ACCOUNT and EXPECT_RAW (and on time, with --not-after).
+            return EXIT_PROBE_PASSED, lines + [
+                "REAL-CHECK-EXIT-0-WITHOUT-RECEIPT (not a settled receipt for this payment): nothing approved"]
+        return 0, lines + ["APPROVE"]
+    if code == 4 or (code in (5, 6) and _late_for(out, code, expect_raw, account)):
+        # The node could not be read, or the payment to ACCOUNT failed only on time
+        # (checked after the payee, so the probe never reached it).
+        return code, lines
+    # The probe said the block is confirmed and pays EXPECT_RAW to ACCOUNT; any other
+    # answer from the same node (not yet, no such block, a mismatch, a late or untimed
+    # verdict naming another account, a crash) contradicts it.
+    return EXIT_PROBE_PASSED, lines + [
+        "REAL-CHECK-DISAGREES-WITH-PROBE (exit %d): nothing approved" % code]
 
 
 def _take_not_after(argv):
