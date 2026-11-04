@@ -22,6 +22,9 @@ the reply, or else the error's class.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
+The late (5) and unknown_time (6) verdicts carry "seen_at" (null for 6), "not_after",
+"amount_raw", "account" (the account the block paid, as on the settled receipt) and
+"time_source".
 The time is the node's own local_timestamp, not signed by the sender: read it on two nodes
 if seconds matter.
 """
