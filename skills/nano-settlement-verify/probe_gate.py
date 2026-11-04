@@ -11,8 +11,8 @@ on the SAME block and amount with a recipient the block was not sent to, and it 
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
 probe account and its "got" is ACCOUNT - AND the real check came back settled (exit 0) with
 a receipt that says so: "settled" true, "account" ACCOUNT and "amount_raw" EXPECT_RAW (and,
-with --not-after, "seen_at" at or before "not_after"); an exit 0 with any other output exits
-7. After such a probe the only other answers the real check may give are 4 (node unreadable)
+with --not-after, "seen_at" at or before WHEN itself, not the receipt's "not_after"); an exit
+0 with any other output exits 7. After such a probe the only other answers the real check may give are 4 (node unreadable)
 and 5/6 (late/untimed) naming ACCOUNT and EXPECT_RAW; anything else (not yet, no such block,
 a mismatch, a late verdict naming another account, a crash) contradicts the probe and exits 7. A
 payee mismatch that names any other recipient is not a passing probe: one that names the
@@ -27,7 +27,8 @@ node and, if it refuses with the same mismatch, the gate exits 3 like any mismat
 error text, --not-after) applies to both calls unchanged.
 
 A probe that came back settled is a probe that was not refused, with one honest cause: the
-block really pays the probe account (a payment sent to the burn address, checked for a
+block really pays the probe account, and its receipt must say so ("settled" true, "account"
+the probe account, "amount_raw" EXPECT_RAW; any other exit-0 output exits 7) (a payment sent to the burn address, checked for a
 seller). The real check is then run on the same node; if it refuses the block as a payee
 mismatch naming the probe account as the recipient, that is a wrong-recipient payment and
 the gate exits 3. Nothing in that path can approve: any other answer exits 7.
@@ -67,6 +68,7 @@ exit 0  approved
         payee, only when it names ACCOUNT and EXPECT_RAW; nothing approved
     64  usage error (from this script or from verify_cli.py on the probe)
 """
+import importlib.util
 import json
 import os
 import re
@@ -85,6 +87,22 @@ EXIT_PROBE_PASSED = 7
 _PREFIXES = ("nano_", "xrb_")
 # verify_cli.py splits RPC_URL on commas only when every piece starts with a scheme.
 _STARTS_WITH_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _parse_not_after(when):
+    """WHEN as unix seconds, read by the parse_not_after verify_cli.py uses (the
+    nano_settlement_verify.py next to this file), or None when it cannot be read."""
+    library = sys.modules.get("_probe_gate_nsv")
+    if library is None:
+        spec = importlib.util.spec_from_file_location(
+            "_probe_gate_nsv", os.path.join(HERE, "nano_settlement_verify.py"))
+        library = importlib.util.module_from_spec(spec)
+        sys.modules["_probe_gate_nsv"] = library
+        spec.loader.exec_module(library)
+    try:
+        return library.parse_not_after(when)
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def _account_body(account):
@@ -123,7 +141,7 @@ def _verdict(out):
     """The parsed JSON object verify_cli.py printed, or None."""
     try:
         verdict = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return verdict if isinstance(verdict, dict) else None
 
@@ -148,7 +166,7 @@ def _pays_probe_late(out, probe):
 def _rpc_index(out):
     try:
         verdict = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     index = verdict.get("rpc_index") if isinstance(verdict, dict) else None
     return index if type(index) is int else None
@@ -162,7 +180,7 @@ def _payee_refusal(out, probe, account):
     not an account at all, contradicts the mismatch)."""
     try:
         verdict = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(verdict, dict):
         return None
@@ -186,7 +204,7 @@ def _earlier_mismatch(out, expect_raw):
     comparison, so it neither passed nor refused it."""
     try:
         verdict = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(verdict, dict) or verdict.get("verdict") != "mismatch":
         return None
@@ -218,7 +236,7 @@ def _paid_to(out, account, probe):
     got the probe account: the block pays the probe account, not the payee."""
     try:
         verdict = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     if not isinstance(verdict, dict) or verdict.get("verdict") != "mismatch":
         return False
@@ -241,19 +259,19 @@ def _same_amount(value, expect_raw):
         return False
 
 
-def _settled_receipt(out, expect_raw, account, timed):
+def _settled_receipt(out, expect_raw, account, not_after):
     """True only for verify_cli.py's exit-0 receipt of this payment: "settled" true,
-    "amount_raw" EXPECT_RAW and "account" ACCOUNT, and, with --not-after, "seen_at"
-    at or before "not_after"."""
+    "amount_raw" EXPECT_RAW and "account" ACCOUNT, and, with --not-after WHEN,
+    "seen_at" at or before WHEN (the caller's deadline, not the receipt's own)."""
     receipt = _verdict(out)
     if receipt is None or "verdict" in receipt or receipt.get("settled") is not True:
         return False
     if not (_same_account(receipt.get("account"), account)
             and _same_amount(receipt.get("amount_raw"), expect_raw)):
         return False
-    if timed:
-        seen_at, deadline = receipt.get("seen_at"), receipt.get("not_after")
-        if type(seen_at) is not int or type(deadline) is not int or seen_at > deadline:
+    if not_after is not None:
+        seen_at, deadline = receipt.get("seen_at"), _parse_not_after(not_after)
+        if type(seen_at) is not int or deadline is None or seen_at > deadline:
             return False
     return True
 
@@ -267,11 +285,18 @@ def _late_for(out, code, expect_raw, account):
             and _same_amount(verdict.get("amount_raw"), expect_raw))
 
 
-def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, probe_code=0):
-    """The probe matched the payee: settled (exit 0), or late/untimed (5/6) naming the
-    probe account. Exit 3 only when the real check, on the same node, refuses the block
-    as paid to the probe account; never approve."""
+def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, probe_code=0,
+                   not_after=None):
+    """The probe matched the payee: settled (exit 0) with a settled receipt naming the
+    probe account, or late/untimed (5/6) naming the probe account. Exit 3 only when the
+    real check, on the same node, refuses the block as paid to the probe account; never
+    approve."""
     not_refused = [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % probe_code]
+    if probe_code == 0 and not _settled_receipt(out, expect_raw, probe, not_after):
+        # An exit 0 whose receipt names ACCOUNT, another account or none says nothing
+        # about a payment to the probe account: no real check can explain it.
+        return EXIT_PROBE_PASSED, not_refused + [
+            "PROBE-EXIT-0-WITHOUT-PROBE-RECEIPT (not a settled receipt for the probe account)"]
     pinned = _pinned(nodes, out)
     if pinned is None:
         return EXIT_PROBE_PASSED, not_refused
@@ -304,7 +329,8 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     if code == 0 or (code in (5, 6) and _pays_probe_late(out, probe)):
         # Settled, or late/untimed with the probe account as recipient: either way the
         # probe matched the payee, so only a payment to the probe account explains it.
-        return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, code)
+        return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, code,
+                              not_after)
     if code != 3:
         return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
     refusal = _payee_refusal(out, probe, account)
@@ -367,7 +393,7 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         # A single pinned URL never carries rpc_index; one that does was not pinned.
         return EXIT_PROBE_PASSED, lines + ["REAL-CHECK-NOT-PINNED: nothing approved"]
     if code == 0:
-        if not _settled_receipt(out, expect_raw, account, not_after is not None):
+        if not _settled_receipt(out, expect_raw, account, not_after):
             # Exit 0 alone is not a settlement: the receipt must say settled, for
             # ACCOUNT and EXPECT_RAW (and on time, with --not-after).
             return EXIT_PROBE_PASSED, lines + [

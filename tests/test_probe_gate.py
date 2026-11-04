@@ -237,7 +237,7 @@ def paid_to(recipient):
     def run(args):
         calls.append(args)
         if probe_gate._account_body(args[2]) == probe_gate._account_body(recipient):
-            return 0, '{"settled": true}'
+            return 0, receipt(args)
         return 3, mismatch(args[2], got=recipient)
     return run, calls
 
@@ -699,3 +699,51 @@ def test_crash_in_the_real_check_exits_7_not_1():
         run, _ = probe_then(probe, real=(1, "Traceback (most recent call last):\n  boom"))
         code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
         assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+
+
+def _scripted(answers):
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return answers[len(calls) - 1]
+    return run, calls
+
+
+def test_settled_probe_whose_receipt_does_not_name_the_probe_account_is_7():
+    probe = probe_gate.probe_account(PAYEE)
+    real = (3, mismatch(PAYEE, got=probe))
+    for out in (receipt([BLOCK, RAW, probe], account=PAYEE),
+                receipt([BLOCK, RAW, probe], account=THIRD),
+                receipt([BLOCK, RAW, probe], account=""),
+                '{"settled": true, "amount_raw": %s, "height": 1}' % RAW, ""):
+        run, _ = _scripted([(0, out), real])
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, out
+    run, _ = _scripted([(0, receipt([BLOCK, RAW, probe])), real])
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=run)[0] == 3
+
+
+def test_not_after_receipt_is_compared_to_the_callers_deadline_not_its_own():
+    late = receipt([BLOCK, RAW, PAYEE], seen_at=500, not_after=10 ** 12)
+    run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE))), (0, late)])
+    code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="100")
+    assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines
+    on_time = receipt([BLOCK, RAW, PAYEE], seen_at=100, not_after=1)
+    run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE))), (0, on_time)])
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="100")[0] == 0
+
+
+def test_deeply_nested_stdout_exits_7_not_1():
+    deep = "[" * 100000 + "]" * 100000
+    for code_in in (0, 2, 3, 5, 6):
+        run, _ = _scripted([(code_in, deep), (0, deep)])
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, code_in
+    for real_code in (0, 3, 5, 6):
+        run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE))), (real_code, deep)])
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="100")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, real_code
+    rpcs = "https://a.example,https://b.example"
+    run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE), rpc_index=0)), (0, deep)])
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, rpcs, run=run)[0] == probe_gate.EXIT_PROBE_PASSED
