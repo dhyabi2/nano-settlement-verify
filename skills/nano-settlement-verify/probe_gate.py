@@ -11,7 +11,7 @@ on the SAME block and amount with a recipient the block was not sent to, and it 
 only when that probe came back `mismatch` (exit 3) on the payee - its "expected" is the
 probe account and its "got" is ACCOUNT - AND the real check came back settled (exit 0) with
 a receipt that says so: "settled" true, "account" ACCOUNT and "amount_raw" EXPECT_RAW (and,
-with --not-after, "seen_at" at or before WHEN itself, not the receipt's "not_after"); an exit
+with --not-after, "seen_at" a positive integer at or before WHEN itself, not the receipt's "not_after"); an exit
 0 with any other output exits 7. After such a probe the only other answers the real check may give are 4 (node unreadable)
 and 5/6 (late/untimed) naming ACCOUNT and EXPECT_RAW; anything else (not yet, no such block,
 a mismatch, a late verdict naming another account, a crash) contradicts the probe and exits 7. A
@@ -119,8 +119,13 @@ def probe_account(account):
 
 
 def run_cli(args):
-    p = subprocess.run([sys.executable, CLI] + list(args), capture_output=True, text=True)
-    return p.returncode, p.stdout
+    """(exit code, stdout) of verify_cli.py. stdout that is not UTF-8 is not a verdict
+    verify_cli.py prints: it reads as a crash (exit 1), which the gate exits 7 on."""
+    p = subprocess.run([sys.executable, CLI] + list(args), capture_output=True)
+    try:
+        return p.returncode, p.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return 1, p.stdout.decode("utf-8", errors="replace")
 
 
 def _rpc_list(rpc):
@@ -262,7 +267,8 @@ def _same_amount(value, expect_raw):
 def _settled_receipt(out, expect_raw, account, not_after):
     """True only for verify_cli.py's exit-0 receipt of this payment: "settled" true,
     "amount_raw" EXPECT_RAW and "account" ACCOUNT, and, with --not-after WHEN,
-    "seen_at" at or before WHEN (the caller's deadline, not the receipt's own)."""
+    "seen_at" a positive whole number of seconds at or before WHEN (the caller's
+    deadline, not the receipt's own)."""
     receipt = _verdict(out)
     if receipt is None or "verdict" in receipt or receipt.get("settled") is not True:
         return False
@@ -271,7 +277,9 @@ def _settled_receipt(out, expect_raw, account, not_after):
         return False
     if not_after is not None:
         seen_at, deadline = receipt.get("seen_at"), _parse_not_after(not_after)
-        if type(seen_at) is not int or deadline is None or seen_at > deadline:
+        # 0 or a negative time is no time at all (the library reads a 0 local_timestamp
+        # as unknown): a receipt that carries one was not timed, so it approves nothing.
+        if type(seen_at) is not int or seen_at <= 0 or deadline is None or seen_at > deadline:
             return False
     return True
 

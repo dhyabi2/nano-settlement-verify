@@ -747,3 +747,37 @@ def test_deeply_nested_stdout_exits_7_not_1():
     rpcs = "https://a.example,https://b.example"
     run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE), rpc_index=0)), (0, deep)])
     assert probe_gate.gate(BLOCK, RAW, PAYEE, rpcs, run=run)[0] == probe_gate.EXIT_PROBE_PASSED
+
+
+def test_not_after_receipt_with_seen_at_zero_or_negative_is_7():
+    # seen_at <= 0 is "at or before" any deadline, but it is no time at all: approve nothing.
+    for seen_at in (0, -1, -1700000000):
+        out = receipt([BLOCK, RAW, PAYEE, "--not-after", "1700000000"], seen_at=seen_at)
+        run, _ = _scripted([(3, mismatch(probe_gate.probe_account(PAYEE))), (0, out)])
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, seen_at
+    # The same on a settled probe: its receipt is not one for the probe account on time.
+    probe = probe_gate.probe_account(PAYEE)
+    out = receipt([BLOCK, RAW, probe, "--not-after", "1700000000"], seen_at=0)
+    run, _ = _scripted([(0, out), (3, mismatch(PAYEE, got=probe))])
+    assert probe_gate.gate(BLOCK, RAW, PAYEE, run=run, not_after="1700000000")[0] \
+        == probe_gate.EXIT_PROBE_PASSED
+
+
+def test_non_utf8_stdout_from_verify_cli_exits_7_not_1(monkeypatch, tmp_path):
+    # End to end through run_cli: a child whose stdout is not UTF-8 is a broken check.
+    probe = probe_gate.probe_account(PAYEE)
+    cli = tmp_path / "verify_cli.py"
+    cli.write_text(
+        "import json, sys\n"
+        "if sys.argv[3] == %r and sys.argv[4] == 'probe-bad':\n"
+        "    sys.stdout.buffer.write(b'\\xff\\xfe{\"settled\": true}'); sys.exit(3)\n"
+        "if sys.argv[3] == %r:\n"
+        "    print(json.dumps({'verdict': 'mismatch', 'expected': sys.argv[3], 'got': %r}))\n"
+        "    sys.exit(3)\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe\\x80'); sys.exit(0)\n" % (probe, probe, PAYEE))
+    monkeypatch.setattr(probe_gate, "CLI", str(cli))
+    assert probe_gate.run_cli([BLOCK, RAW, PAYEE, "x"])[0] == 1
+    for rpc in ("probe-bad", "https://127.0.0.1:9"):
+        code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, rpc)
+        assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, rpc
