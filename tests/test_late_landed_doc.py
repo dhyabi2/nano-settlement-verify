@@ -19,6 +19,9 @@ def test_readme_says_a_late_payment_has_landed_and_names_the_receipt():
     section = text.split(HEADING, 1)[1].split("**Changes from the previous release.**", 1)[0]
     for needed in ("exc.receipt", "amount_raw", "account", "UnknownTime", "not_after=None"):
         assert needed in section, f"the late-payment paragraph no longer mentions {needed}"
+    # A confirmed send is receivable until the payee publishes its receive block.
+    assert "XNO is in your account" not in section
+    assert "receivable" in section
 
 
 def test_serve_anyway_is_the_default_and_the_deadline_belongs_before_broadcast():

@@ -275,12 +275,12 @@ would, and `1790150109.9999999` is never rounded up across the second. These rai
 
 **A late payment has still landed.** A seller reading this code pointed out that the README
 said why `Late` is raised but not what happens to the money. `Late` is a verdict for you, the
-seller, not a refusal the network enforces: the block is confirmed, the XNO is in your account,
-and the payer cannot undo a confirmed send. So a seller that gets `Late` should not keep the
+seller, not a refusal the network enforces: the send is confirmed and receivable by your account
+(your wallet takes it in by publishing its receive block), and the payer cannot undo a confirmed send. So a seller that gets `Late` should not keep the
 money and serve nothing. In order of preference:
 
 1. **Serve anyway** - the default. It needs nothing more: the block is confirmed, the amount is
-   exact, and it went to your account. The lateness is one node's first-seen
+   exact, and it was sent to your account. The lateness is one node's first-seen
    `local_timestamp` read against your own clock, a weak reason to hold a paid call.
 2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
    something that cannot simply be served twice (a one-time asset, a metered run): record the
