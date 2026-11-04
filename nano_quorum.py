@@ -108,7 +108,7 @@ class Disagreement(Exception):
         observed_answers: dict | None = None,
     ) -> None:
         answers = _mapping("answers", answers)
-        detail = "; ".join(f"{url}: {answer}" for url, answer in answers.items())
+        detail = "; ".join(f"{_text(url)}: {_text(answer)}" for url, answer in answers.items())
         super().__init__(f"endpoints disagree: {detail}")
         self.answers = answers
         self.observations = _mapping("observations", observations)
@@ -169,13 +169,56 @@ class Disagreement(Exception):
         return {"verdict": "disagreement", "observations": entries, "served": None}
 
 
-def _mapping(name: str, value) -> dict:
-    """`value` as a plain dict, or `TypeError` naming `name` when it is not a mapping."""
-    pairs = _pairs(name, value)
+def _text(value) -> str:
+    """`f"{value}"`, or a placeholder when that raises.
+
+    An int over 4300 decimal digits (or the interpreter's lower limit) cannot be
+    turned into text and raises `ValueError`; it is written `"<int 0x...>"`, its
+    exact value in hex, as `record()` writes it. Anything else whose text raises
+    is `"<unprintable TYPE>"`.
+    """
     try:
-        return dict(pairs)
-    except Exception as error:
-        raise TypeError(f"Disagreement {name} could not be read as a mapping: {error!r}") from None
+        return f"{value}"
+    except Exception:
+        try:
+            if isinstance(value, int):
+                return "<int %s>" % hex(int(value))
+        except Exception:
+            pass
+        return "<unprintable %s>" % _type_name(value)
+
+
+def _mapping(name: str, value) -> dict:
+    """`value` as a plain dict, or `TypeError` naming `name` when it is not a mapping.
+
+    An exact dict is copied with `dict(value)`, which reuses the hashes it
+    already holds, so a key whose `__hash__` raises when asked again is kept as
+    it is. Any other mapping is rebuilt from its items; a key that cannot be
+    hashed there is replaced by the placeholder `"<unhashable TYPE #i>"` (`i`
+    its position) rather than raising, and its value is kept.
+    """
+    pairs = _pairs(name, value)
+    if type(value) is dict:
+        try:
+            return dict(value)
+        except Exception:
+            pass
+    out = {}
+    for position, pair in enumerate(pairs):
+        try:
+            key, item = pair
+        except Exception as error:
+            raise TypeError(
+                f"Disagreement {name} could not be read as a mapping: {error!r}"
+            ) from None
+        try:
+            out[key] = item
+        except Exception:
+            placeholder = "<unhashable %s #%d>" % (_type_name(key), position)
+            while placeholder in out:
+                placeholder += "'"
+            out[placeholder] = item
+    return out
 
 
 def _pairs(name: str, value) -> list:

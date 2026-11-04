@@ -891,3 +891,74 @@ def test_a_disagreement_record_names_every_endpoint_however_large_the_first_answ
     error = Disagreement({A: big, B: "different"}, observations={A: big, B: {"amount": 1}})
     entries = error.record()["observations"]
     assert entries[1] == {"rpc_url": B, "answer": "different", "payload": {"amount": 1}}
+
+
+def test_a_disagreement_built_from_an_int_too_long_for_str_does_not_raise():
+    """str() of an int over 4300 digits raises ValueError; the message writes it as hex."""
+    huge = 10**5000 + 7
+    error = Disagreement({A: huge, huge: "y"}, observations={A: huge})
+    message = str(error)
+    assert f"{A}: <int {hex(huge)}>" in message
+    assert f"<int {hex(huge)}>: y" in message
+    assert error.answers[A] == huge
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert record["observations"][0]["answer"] == "<int %s>" % hex(huge)
+    assert str(Disagreement({A: "1 XNO", B: "2 XNO"})) == (
+        f"endpoints disagree: {A}: 1 XNO; {B}: 2 XNO"
+    )
+
+
+class _RehashRaises:
+    """Hashes once (when the caller's dict is built), raises on every later hash."""
+
+    def __init__(self):
+        self.hashed = False
+
+    def __hash__(self):
+        if self.hashed:
+            raise TypeError("rehash refused")
+        self.hashed = True
+        return 1
+
+    def __eq__(self, other):
+        return self is other
+
+
+@pytest.mark.parametrize("field", ["answers", "observations", "observed_answers"])
+def test_a_disagreement_keeps_a_dict_key_whose_hash_raises_when_asked_again(field):
+    """dict(value.items()) rehashed every key; dict(value) reuses the stored hash."""
+    key = _RehashRaises()
+    given = {key: "x", A: "y"}
+    arguments = {"answers": {A: "y"}}
+    arguments[field] = given
+    error = Disagreement(**arguments)
+    kept = getattr(error, field)
+    assert type(kept) is dict and kept == given and kept is not given
+    assert list(kept)[0] is key
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert len(record["observations"]) >= 1
+
+
+def test_a_disagreement_from_a_non_dict_mapping_with_an_unhashable_key_uses_a_placeholder():
+    """A mapping that is not a dict is rebuilt; a key that cannot be hashed is a placeholder."""
+    from collections.abc import Mapping
+
+    class Pairs(Mapping):
+        def __init__(self, pairs):
+            self._pairs = pairs
+
+        def __getitem__(self, key):
+            for candidate, value in self._pairs:
+                if candidate is key:
+                    return value
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter([key for key, _ in self._pairs])
+
+        def __len__(self):
+            return len(self._pairs)
+
+    error = Disagreement(Pairs([([1], "x"), (A, "y")]))
+    assert error.answers == {"<unhashable list #0>": "x", A: "y"}
+    assert "<unhashable list #0>: x" in str(error)
