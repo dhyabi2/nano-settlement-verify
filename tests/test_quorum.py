@@ -795,3 +795,62 @@ def test_every_endpoint_unreadable_is_not_corroborated_not_a_mismatch(monkeypatc
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], agree=2)
 
     assert caught.value.answered == 0
+
+
+def test_a_disagreement_record_is_bounded_on_shared_substructures():
+    """`a = [a, a]` forty times is 2**40 leaves as a tree; record() must not walk them all."""
+    import threading
+
+    shared = []
+    for _ in range(40):
+        shared = [shared, shared]
+    error = Disagreement({A: "x"}, observations={A: shared})
+    out = {}
+    worker = threading.Thread(
+        target=lambda: out.update(text=json.dumps(error.record(), allow_nan=False)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=20)
+    assert not worker.is_alive(), "record() did not finish on a shared structure"
+    assert "<omitted list>" in out["text"]
+    assert len(out["text"]) < 1_000_000
+
+
+def test_a_disagreement_record_writes_an_int_too_long_for_str_as_hex():
+    """Python refuses str() of an int over 4300 digits; record() writes it as exact hex."""
+    huge = 10**5000 + 7
+    record = Disagreement({A: "x"}, observations={A: {"amount": huge}}).record()
+    text = json.dumps(record, allow_nan=False)
+    written = json.loads(text)["observations"][0]["payload"]["amount"]
+    assert written == "<int %s>" % hex(huge)
+    assert int(written[len("<int "):-1], 16) == huge
+    assert Disagreement({A: "x"}, observations={A: ONE_XNO}).record()[
+        "observations"][0]["payload"] == ONE_XNO
+
+
+def test_a_disagreement_record_survives_a_key_whose_hash_starts_raising():
+    """A key that hashed at construction but raises now is written, not raised."""
+
+    class Key:
+        broken = False
+
+        def __hash__(self):
+            if Key.broken:
+                raise TypeError("rehash refused")
+            return 1
+
+        def __eq__(self, other):
+            if Key.broken:
+                raise TypeError("compare refused")
+            return self is other
+
+    key = Key()
+    error = Disagreement({key: "x", A: "y"}, observations={key: {"p": 1}, A: 2})
+    Key.broken = True
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    entries = record["observations"]
+    assert len(entries) == 2
+    assert "Key" in entries[0]["rpc_url"]
+    assert entries[0]["answer"] == "x" and entries[0]["payload"] == {"p": 1}
+    assert entries[1] == {"rpc_url": A, "answer": "y", "payload": 2}

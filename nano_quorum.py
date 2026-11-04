@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 
@@ -124,55 +125,137 @@ class Disagreement(Exception):
         `observations` or `observed_answers` has been replaced by something that
         is not a mapping, it raises `TypeError`, as the constructor would have.
         """
-        answers = _mapping("answers", self.answers)
-        observations = _mapping("observations", self.observations)
-        observed_answers = _mapping("observed_answers", self.observed_answers)
+        answers = _pairs("answers", self.answers)
+        observations = _pairs("observations", self.observations)
+        observed_answers = _pairs("observed_answers", self.observed_answers)
+        answers_index, observations_index, observed_index = (
+            _index(answers), _index(observations), _index(observed_answers)
+        )
+        # One budget for the whole record, so shared substructures (`a = [a, a]`
+        # forty times over) cannot make it, or json.dumps of it, exponential.
+        walk = _Walk()
         entries = []
-        try:
-            seen = list(observations)
-            seen += [url for url in answers if url not in observations]
-            for url in seen:
-                if url in observed_answers:
-                    answer = observed_answers[url]
-                else:
-                    answer = answers.get(url)
+        seen = [url for url, _ in observations]
+        seen += [
+            url for url, _ in answers
+            if not _lookup(observations, observations_index, url)[0]
+        ]
+        for url in seen:
+            try:
+                found, answer = _lookup(observed_answers, observed_index, url)
+                if not found:
+                    answer = _lookup(answers, answers_index, url)[1]
                 entries.append(
                     {
-                        "rpc_url": _jsonable(url),
-                        "answer": _jsonable(answer),
-                        "payload": _jsonable(observations.get(url)),
+                        "rpc_url": _jsonable(url, walk),
+                        "answer": _jsonable(answer, walk),
+                        "payload": _jsonable(
+                            _lookup(observations, observations_index, url)[1], walk
+                        ),
                     }
                 )
-        except Exception as error:  # a key whose __eq__ or __hash__ raises
-            entries.append({"rpc_url": None, "answer": None, "payload": _repr(error)})
+            except Exception as error:  # belt and braces: _lookup and _jsonable do not raise
+                entries.append({"rpc_url": None, "answer": None, "payload": _repr(error)})
         return {"verdict": "disagreement", "observations": entries, "served": None}
 
 
 def _mapping(name: str, value) -> dict:
     """`value` as a plain dict, or `TypeError` naming `name` when it is not a mapping."""
+    pairs = _pairs(name, value)
+    try:
+        return dict(pairs)
+    except Exception as error:
+        raise TypeError(f"Disagreement {name} could not be read as a mapping: {error!r}") from None
+
+
+def _pairs(name: str, value) -> list:
+    """`value`'s items as a list of pairs, without hashing a key again.
+
+    `TypeError` naming `name` when it is not a mapping or its `items()` fails.
+    """
     if value is None and name != "answers":
-        return {}
+        return []
     if not isinstance(value, Mapping) and not callable(getattr(value, "items", None)):
         raise TypeError(
             f"Disagreement {name} must be a mapping of endpoint to value, "
             f"got {type(value).__name__}"
         )
     try:
-        return dict(value.items())
+        return [tuple(pair) for pair in value.items()]
     except Exception as error:
         raise TypeError(f"Disagreement {name} could not be read as a mapping: {error!r}") from None
+
+
+def _index(pairs: list):
+    """`pairs` as a dict for fast lookups, or None when a key cannot be hashed."""
+    try:
+        return dict(pairs)
+    except Exception:
+        return None
+
+
+def _lookup(pairs: list, index, key) -> tuple:
+    """`(True, value)` for `key` in `pairs`, else `(False, None)`; never raises.
+
+    Uses `index` when it can; a key whose `__hash__` or `__eq__` raises falls
+    back to a scan by identity, then by an `==` that is allowed to fail.
+    """
+    if index is not None:
+        try:
+            if key in index:
+                return True, index[key]
+            return False, None
+        except Exception:
+            pass
+    for candidate, value in pairs:
+        if candidate is key:
+            return True, value
+    for candidate, value in pairs:
+        try:
+            if candidate == key:
+                return True, value
+        except Exception:
+            continue
+    return False, None
 
 
 # How deep record() follows nested containers before writing a placeholder, so
 # a deeply nested value cannot exhaust the interpreter's recursion limit.
 _MAX_DEPTH = 64
 
+# How many values one record() writes in all before the rest become a
+# placeholder. A structure that shares a substructure (`a = [a, a]`, repeated)
+# is a tree exponentially larger than the objects it is built from; this keeps
+# both record() and json.dumps of its result bounded.
+_MAX_NODES = 10_000
 
-def _jsonable(value, _active=None, _depth=0):
+# Ints with more decimal digits than this are written as a hex string (see
+# `_jsonable`): Python refuses str() of an int over 4300 digits by default.
+_MAX_INT_DIGITS = 4000
+
+
+def _int_digits() -> int:
+    """`_MAX_INT_DIGITS`, or less if the interpreter's own limit is set lower."""
+    try:
+        limit = int(sys.get_int_max_str_digits())
+    except Exception:
+        limit = 0
+    return min(_MAX_INT_DIGITS, limit) if limit > 0 else _MAX_INT_DIGITS
+
+
+class _Walk:
+    """State shared by one record(): the containers being written, and the budget."""
+
+    def __init__(self) -> None:
+        self.active: set = set()
+        self.left = _MAX_NODES
+
+
+def _jsonable(value, _walk=None, _depth=0):
     """`value` as plain, strict JSON types (`allow_nan=False`), never raising.
 
-    - None, bools, ints (of any size: an amount of raw stays exact) and finite
-      floats are kept; NaN and infinity become their `repr` text.
+    - None, bools, ints (up to `_MAX_INT_DIGITS` digits, which any amount of
+      raw is, so it stays exact) and finite floats are kept; NaN and infinity become their `repr` text.
     - A dataclass - a `Receipt`, a payer report - is an object of every one of
       its fields under the field's own name, `seen_at` and `not_after`
       included even where its `to_json` leaves them out, plus whatever else its
@@ -188,18 +271,32 @@ def _jsonable(value, _active=None, _depth=0):
       `repr`; one whose `repr` raises is a placeholder naming its type. So is a
       container that contains itself, one nested deeper than `_MAX_DEPTH`, and
       any value whose inspection raises.
+    - An int too long for `str()` (over `_MAX_INT_DIGITS` decimal digits;
+      Python refuses over 4300) is the string `"<int 0x...>"`: its exact value
+      in hex, which has no such limit, so it is still recoverable.
+    - After `_MAX_NODES` values in one record, every further value is the
+      placeholder `"<omitted TYPE>"`, so a structure that shares substructures
+      cannot make the record exponentially large.
     """
+    walk = _Walk() if _walk is None else _walk
     try:
-        return _jsonable_inner(value, set() if _active is None else _active, _depth)
+        return _jsonable_inner(value, walk, _depth)
     except Exception:
         return _repr(value)
 
 
-def _jsonable_inner(value, active, depth):
+def _jsonable_inner(value, walk, depth):
+    if walk.left <= 0:
+        return "<omitted %s>" % _type_name(value)
+    walk.left -= 1
+    active = walk.active
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
-        return int(value)
+        value = int(value)
+        if value.bit_length() > _int_digits() * 3.32:  # log2(10) ~ 3.3219
+            return "<int %s>" % hex(value)
+        return value
     if isinstance(value, float):
         return float(value) if math.isfinite(value) else repr(value)
     if isinstance(value, str):
@@ -218,20 +315,20 @@ def _jsonable_inner(value, active, depth):
                 out.update((str(key), item) for key, item in extra.items())
             for spec in fields(value):
                 out[spec.name] = getattr(value, spec.name)
-            return {key: _jsonable(item, active, nested) for key, item in out.items()}
+            return {key: _jsonable(item, walk, nested) for key, item in out.items()}
         if hasattr(value, "to_json"):
             loaded = _to_json(value)
-            return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, active, nested)
+            return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
         if isinstance(value, Mapping):
             pairs = list(value.items())
             if all(isinstance(key, str) for key, _ in pairs):
-                return {str(key): _jsonable(item, active, nested) for key, item in pairs}
+                return {str(key): _jsonable(item, walk, nested) for key, item in pairs}
             return [
-                [_jsonable(key, active, nested), _jsonable(item, active, nested)]
+                [_jsonable(key, walk, nested), _jsonable(item, walk, nested)]
                 for key, item in pairs
             ]
         if isinstance(value, (list, tuple, set, frozenset)):
-            items = [_jsonable(item, active, nested) for item in value]
+            items = [_jsonable(item, walk, nested) for item in value]
             if isinstance(value, (set, frozenset)):
                 # A set has no order of its own; give the record one.
                 items.sort(key=lambda item: json.dumps(item, sort_keys=True))
@@ -253,6 +350,13 @@ def _to_json(value):
         return json.loads(method())
     except Exception:
         return _NO_JSON
+
+
+def _type_name(value) -> str:
+    try:
+        return str(type(value).__name__)
+    except Exception:
+        return "object"
 
 
 def _repr(value) -> str:
