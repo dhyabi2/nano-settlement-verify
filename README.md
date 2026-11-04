@@ -277,14 +277,27 @@ would, and `1790150109.9999999` is never rounded up across the second. These rai
 said why `Late` is raised but not what happens to the money. `Late` is a verdict for you, the
 seller, not a refusal the network enforces: the block is confirmed, the XNO is in your account,
 and the payer cannot undo a confirmed send. So a seller that gets `Late` should not keep the
-money and serve nothing. It can serve anyway, keep the amount as credit against that block hash
-for a retry, or send it back from its own wallet - this library only reads and sends nothing.
+money and serve nothing. In order of preference:
+
+1. **Serve anyway** - the default. It needs nothing more: the block is confirmed, the amount is
+   exact, and it went to your account. The lateness is one node's first-seen
+   `local_timestamp` read against your own clock, a weak reason to hold a paid call.
+2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
+   something that cannot simply be served twice (a one-time asset, a metered run): record the
+   hash and let the payer re-present it. This library only reads, so it has nowhere to keep
+   that credit; your own store has to.
+3. **Send it back** - the last resort. It costs you a signed send block and its work, from
+   your own wallet; this library sends nothing.
+
 `exc.receipt` carries what any of those needs: `exc.receipt.amount_raw`, `exc.receipt.account`
 (your account, which was paid) and `exc.receipt.settled`; the payer is the block's own account,
 which you read from the block, not from the receipt. `UnknownTime` carries the same `receipt`.
 The time is the chosen node's first-seen `local_timestamp`, so a different node may give another
-time, or none (`UnknownTime`). Pick the deadline with that slack, or pass `not_after=None` to
-have no deadline.
+time, or none (`UnknownTime`). A deadline that is meant to matter has to be enforced before the
+payer broadcasts - as an expiry in your 402 that the payer checks - because after the broadcast
+nothing on Nano returns the money by itself. Checked after the fact, `not_after` can only tell
+you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
+deadline.
 
 **Changes from the previous release.** Code that relied on the old behaviour sees these:
 
@@ -460,7 +473,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-843 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+844 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
