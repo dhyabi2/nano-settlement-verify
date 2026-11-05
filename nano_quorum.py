@@ -168,14 +168,17 @@ class Disagreement(Exception):
                     }
                 )
             except Exception as error:  # belt and braces: _lookup and _jsonable do not raise
-                entries.append({"rpc_url": None, "answer": None, "payload": _repr(error)})
+                entries.append({"rpc_url": None, "answer": None, "payload": _capped_repr(error)})
         return {"verdict": "disagreement", "observations": entries, "served": None}
 
 
 def _text(value) -> str:
-    """`f"{value}"`, or a placeholder when that raises.
+    """`f"{value}"`, cut like `record()` cuts a string, or a placeholder when that raises.
 
-    An int over 4300 decimal digits (or the interpreter's lower limit) cannot be
+    Text over `_MAX_STR_CHARS` characters is cut to its first `_MAX_STR_CHARS`
+    characters plus `"...<truncated str of N chars>"` (`text` in place of `str`
+    for a value that is not a string), so one long answer cannot make the
+    message large. An int over 4300 decimal digits (or the interpreter's lower limit) cannot be
     turned into text and raises `ValueError`; it is written `"<int 0x...>"` in
     hex, as `record()` writes it: cut, like a long string, to its first
     `_MAX_STR_CHARS` characters plus `"...<truncated int of N chars>"`, so the
@@ -183,14 +186,14 @@ def _text(value) -> str:
     raises is `"<unprintable TYPE>"`.
     """
     try:
-        return f"{value}"
+        return _cap(str.__str__(f"{value}"), "str" if isinstance(value, str) else "text")
     except Exception:
         try:
             if isinstance(value, int):
                 return _int_hex(int(value))
         except Exception:
             pass
-        return "<unprintable %s>" % _type_name(value)
+        return "<unprintable %s>" % _cap(_type_name(value), "str")
 
 
 def _mapping(name: str, value) -> dict:
@@ -292,8 +295,12 @@ _MAX_NODES = 10_000
 # Strings (and the `repr` written for a value with no JSON form) longer than
 # this are cut to their first `_MAX_STR_CHARS` characters plus a marker that
 # gives the original length (see `_cap`), so one long string cannot make the
-# record large either: with `_MAX_NODES`, each walk is at most about
-# `_MAX_NODES * _MAX_STR_CHARS` characters of text.
+# record large either. Each value counted against `_MAX_NODES` is at most an
+# exact int of `_MAX_INT_DIGITS` digits or a cut string of about
+# `_MAX_STR_CHARS` characters, and an object entry also writes its key's text
+# (cut the same way, but not counted), so each walk is at most about
+# `_MAX_NODES * (_MAX_INT_DIGITS + 2 * _MAX_STR_CHARS)` characters: some 60 MB.
+# Bounded, not small; real answers are far below it.
 _MAX_STR_CHARS = 1_000
 
 # Ints with more decimal digits than this are written as a hex string (see
@@ -365,7 +372,7 @@ def _jsonable(value, _walk=None, _depth=0):
     try:
         return _jsonable_inner(value, walk, _depth)
     except Exception:
-        return _repr(value)
+        return _capped_repr(value)
 
 
 def _jsonable_inner(value, walk, depth):
@@ -395,7 +402,7 @@ def _jsonable_inner(value, walk, depth):
             out = {}
             extra = _to_json(value)
             if isinstance(extra, dict):
-                out.update((str(key), item) for key, item in extra.items())
+                out.update((_cap(str(key), "str"), item) for key, item in extra.items())
             for spec in fields(value):
                 out[spec.name] = getattr(value, spec.name)
             # Scalar fields (an amount, a height, a count) are written before the
@@ -415,7 +422,7 @@ def _jsonable_inner(value, walk, depth):
             return _omitted_entries(result, len(out) - len(written))
         if hasattr(value, "to_json"):
             loaded = _to_json(value)
-            return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
+            return _capped_repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
         if isinstance(value, Mapping):
             pairs = list(value.items())
             if all(isinstance(key, str) for key, _ in pairs):
@@ -447,7 +454,7 @@ def _jsonable_inner(value, walk, depth):
                 # A set has no order of its own; give the record one.
                 items.sort(key=lambda item: json.dumps(item, sort_keys=True))
             return _omitted_items(items, len(value))
-        return _cap(_repr(value), "repr")
+        return _capped_repr(value)
     finally:
         active.discard(id(value))
 
@@ -517,13 +524,21 @@ def _type_name(value) -> str:
         return "object"
 
 
+def _capped_repr(value) -> str:
+    """`_repr(value)` cut to `_MAX_STR_CHARS` characters as kind `"repr"`; never raises."""
+    try:
+        return _cap(str.__str__(_repr(value)), "repr")
+    except Exception:
+        return "<unrepresentable %s>" % _cap(_type_name(value), "str")
+
+
 def _repr(value) -> str:
     """`repr(value)`, or a placeholder when even that raises."""
     try:
         return str(repr(value))
     except Exception:
         try:
-            name = type(value).__name__
+            name = _cap(str.__str__(type(value).__name__), "str")
         except Exception:
             name = "object"
         return "<unrepresentable %s>" % name

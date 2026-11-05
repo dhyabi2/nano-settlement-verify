@@ -9,6 +9,7 @@ a "no" - rather than about the happy path.
 """
 
 import json
+from collections.abc import Mapping
 
 import pytest
 
@@ -1030,7 +1031,8 @@ def test_bounding_the_record_leaves_answers_message_and_decisions_unchanged(monk
     long = "z" * 100_000
     error = Disagreement({A: long, B: "b"}, observations={A: huge, B: long})
     assert error.answers == {A: long, B: "b"}
-    assert str(error) == f"endpoints disagree: {A}: {long}; {B}: b"
+    cut = "z" * 1_000 + "...<truncated str of 100000 chars>"
+    assert str(error) == f"endpoints disagree: {A}: {cut}; {B}: b"
     assert error.observations[A] is huge and error.observations[B] is long
     nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
     with pytest.raises(Disagreement) as caught:
@@ -1102,3 +1104,66 @@ def test_a_verify_disagreement_records_endpoints_that_answered_not_seen_or_not_y
     }
     record = json.loads(json.dumps(error.record(), allow_nan=False))
     assert [o["rpc_url"] for o in record["observations"]] == [A, B, C, D]
+
+
+class _IntBadInt(int):
+    def __int__(self):
+        raise RuntimeError("no int")
+
+    def __repr__(self):
+        return "i" * 10_000_000
+
+
+class _FloatBadFloat(float):
+    def __float__(self):
+        raise RuntimeError("no float")
+
+    def __repr__(self):
+        return "f" * 10_000_000
+
+
+class _MappingBadItems(Mapping):
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def items(self):
+        raise RuntimeError("no items")
+
+    def __repr__(self):
+        return "m" * 10_000_000
+
+
+class _ReprRaises:
+    def __repr__(self):
+        raise RuntimeError("no repr")
+
+
+@pytest.mark.parametrize(
+    "value", [_IntBadInt(5), _FloatBadFloat(1.5), _MappingBadItems()],
+    ids=["int-subclass", "float-subclass", "mapping-items-raises"],
+)
+def test_a_value_whose_inspection_raises_has_its_repr_cut(value):
+    """The fallback for a value that raises while it is written is cut like any repr."""
+    record = Disagreement({A: value, B: "b"}, observations={A: value}).record()
+    entry = record["observations"][0]
+    for written in (entry["answer"], entry["payload"]):
+        assert written.endswith("...<truncated repr of 10000000 chars>")
+        assert len(written) < 1_100
+    assert len(json.dumps(record, allow_nan=False)) < 5_000
+
+
+def test_a_repr_that_raises_in_the_fallback_is_a_short_placeholder():
+    written = nano_quorum._capped_repr(_ReprRaises())
+    assert written == "<unrepresentable _ReprRaises>"
+
+
+def test_a_long_string_answer_is_cut_in_the_message():
+    error = Disagreement({A: "q" * 10**7, B: "b"})
+    assert len(str(error)) < 1_200
+    assert "...<truncated str of 10000000 chars>" in str(error)
