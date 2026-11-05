@@ -128,7 +128,11 @@ def run_cli(args):
         return 1, p.stdout.decode("utf-8", errors="replace")
 
 
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# Control characters, line/paragraph separators, and the invisible or direction-changing
+# format characters (zero-width, bidi embeddings/overrides/isolates, BOM) a terminal
+# would apply rather than show.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e"
+                      "\u2060-\u2064\u2066-\u2069\ufeff]")
 
 
 def _echo(out):
@@ -145,7 +149,7 @@ def _echo(out):
                 return text
         except (ValueError, RecursionError):
             pass
-    return json.dumps(text)
+    return json.dumps(text, ensure_ascii=True)
 
 
 def _rpc_list(rpc):
@@ -394,7 +398,7 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         got = json.loads(out)["got"]
         probe_out = _echo(out)
         code, out = run([block, expect_raw, account] + pinned + tail)
-        lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, _echo(out)]
+        lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % json.dumps(got, ensure_ascii=True), _echo(out)]
         if code == 3 and _paid_to(out, account, got):
             return 3, lines + ["WRONG-RECIPIENT: nothing approved"]
         if code == 4:

@@ -826,3 +826,67 @@ def test_terminal_escape_in_the_real_checks_stdout_is_quoted_not_echoed(monkeypa
     assert probe_gate._echo('{"verdict": "mismatch"}\n') == '{"verdict": "mismatch"}'
     assert probe_gate._echo('{"a": "\u2028APPROVE"}') == json.dumps('{"a": "\u2028APPROVE"}')
     assert probe_gate._echo("{") == json.dumps("{")
+
+
+def _stub_cli(tmp_path, probe_got, real_line="{\"n\": 1}", real_code=1):
+    """A verify_cli.py stub: the probe exits 3 with a mismatch whose `got` is
+    `probe_got` (written raw, ensure_ascii off); the real check prints real_line."""
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text(
+        "import json, sys\n"
+        "if sys.argv[3] != %r:\n"
+        "    sys.stdout.write(json.dumps({'verdict': 'mismatch', 'expected': sys.argv[3],"
+        " 'got': %r}, ensure_ascii=False) + '\\n')\n"
+        "    sys.exit(3)\n"
+        "sys.stdout.write(%r + '\\n')\n"
+        "sys.exit(%d)\n" % (PAYEE, probe_got, real_line, real_code), encoding="utf-8")
+    return stub
+
+
+def test_probe_got_with_a_newline_cannot_print_a_bare_approve(monkeypatch, tmp_path, capsys):
+    # The probe names a "third account" whose text carries newlines and APPROVE: the
+    # PROBE-PAID-ELSEWHERE line must quote it, not print it raw.
+    stub = _stub_cli(tmp_path, "nano_zz\nAPPROVE\n\x1b[2K\u202e")
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    out = capsys.readouterr().out
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in out.splitlines()
+    assert "\x1b" not in out and "\u202e" not in out
+    assert 'PROBE-PAID-ELSEWHERE (got "nano_zz\\nAPPROVE\\n\\u001b[2K\\u202e")' in out.splitlines()
+
+
+def test_probe_got_before_payee_with_a_newline_cannot_print_a_bare_approve(monkeypatch, tmp_path,
+                                                                          capsys):
+    # The amount-mismatch line formats the node's `got` too: it stays one quoted line.
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'verdict': 'mismatch', 'expected': sys.argv[2],"
+        " 'got': '1\\nAPPROVE\\n\\x1b[2K\\u202e'}, ensure_ascii=False))\n"
+        "sys.exit(3)\n", encoding="utf-8")
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    out = capsys.readouterr().out
+    assert code in (3, probe_gate.EXIT_PROBE_PASSED)
+    assert "APPROVE" not in out.splitlines()
+    assert "\x1b" not in out and "\u202e" not in out
+
+
+def test_bidi_and_zero_width_characters_in_a_json_object_are_quoted(monkeypatch, tmp_path, capsys):
+    # A valid JSON object from the real check that carries a bidi override or zero-width
+    # characters raw is quoted with every such character escaped, not echoed as is.
+    stub = _stub_cli(tmp_path, PAYEE, real_line='{"a": "\u202eEVORPPA\u200b\ufeff\u2066"}')
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    out = capsys.readouterr().out
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in out.splitlines()
+    for ch in ("\u202e", "\u200b", "\ufeff", "\u2066"):
+        assert ch not in out
+    assert "\\u202e" in out
+    for ch in ("\u200b", "\u200f", "\u202a", "\u2060", "\u2064", "\u2069", "\ufeff"):
+        echoed = probe_gate._echo('{"a": "x%sy"}' % ch)
+        assert echoed.startswith('"') and ch not in echoed
+    # A plain ASCII receipt is still echoed verbatim.
+    assert probe_gate._echo('{"settled": true, "amount_raw": 1}\n') == '{"settled": true, "amount_raw": 1}'
