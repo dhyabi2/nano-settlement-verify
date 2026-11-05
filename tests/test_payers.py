@@ -531,6 +531,20 @@ def test_a_payer_disagreement_keeps_both_reports(monkeypatch):
     assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 1]
 
 
+def test_a_payer_disagreement_keeps_every_report_before_the_contradiction(monkeypatch):
+    """With agree=3, A and B agree and C contradicts: all three are observed."""
+    both = history(receive(PAYER_1, CALL_PRICE, height=2), open_block(PAYER_2, CALL_PRICE))
+    nodes(monkeypatch, {A: both, B: both, C: history(open_block(PAYER_2, CALL_PRICE))})
+    with pytest.raises(nano_quorum.Disagreement) as caught:
+        payers_corroborated(PAYEE, [A, B, C], agree=3)
+    error = caught.value
+    assert list(error.answers) == [A, C]
+    assert list(error.observations) == [A, B, C]
+    assert error.observed_answers[A] == error.observed_answers[B] != error.observed_answers[C]
+    record = json.loads(json.dumps(error.record()))
+    assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 2, 1]
+
+
 def _report(endpoint, accounts):
     payer_list = tuple(
         nano_payers.Payer(
@@ -915,7 +929,7 @@ def test_corroboration_witnesses_a_frontier_only_when_every_node_had_it(monkeypa
 # other_rails - what the recount did not count, named rather than dropped
 # --------------------------------------------------------------------------
 
-BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C2D4f71b54bdA02913"
 USDC_PAYEE = "0x1111111111111111111111111111111111111111"
 NOT_COUNTED = (
     "nano_payers reads the Nano ledger only; this entry's payments are on "

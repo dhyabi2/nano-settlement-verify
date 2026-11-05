@@ -91,7 +91,10 @@ class Disagreement(Exception):
     answered before the contradiction, and the one that contradicted, to the
     whole thing it returned - the `Receipt` a `Corroboration` would have
     carried, the `(balance_raw, receivable_raw)` figure, the payer report - in
-    the order asked. `observed_answers` maps those same endpoints to their
+    the order asked. In `verify_corroborated` an endpoint that answered that
+    it has not seen the send, or has not confirmed it yet, is there with None
+    (its answer text says which). An endpoint that could not be read did not
+    answer and is not there. `observed_answers` maps those same endpoints to their
     answers as text. `record()` is all of it as a JSON-ready dict.
 
     Raises `TypeError` when `answers`, `observations` or `observed_answers` is
@@ -173,16 +176,18 @@ def _text(value) -> str:
     """`f"{value}"`, or a placeholder when that raises.
 
     An int over 4300 decimal digits (or the interpreter's lower limit) cannot be
-    turned into text and raises `ValueError`; it is written `"<int 0x...>"`, its
-    exact value in hex, as `record()` writes it. Anything else whose text raises
-    is `"<unprintable TYPE>"`.
+    turned into text and raises `ValueError`; it is written `"<int 0x...>"` in
+    hex, as `record()` writes it: cut, like a long string, to its first
+    `_MAX_STR_CHARS` characters plus `"...<truncated int of N chars>"`, so the
+    message stays bounded however large the int. Anything else whose text
+    raises is `"<unprintable TYPE>"`.
     """
     try:
         return f"{value}"
     except Exception:
         try:
             if isinstance(value, int):
-                return "<int %s>" % hex(int(value))
+                return _int_hex(int(value))
         except Exception:
             pass
         return "<unprintable %s>" % _type_name(value)
@@ -336,8 +341,12 @@ def _jsonable(value, _walk=None, _depth=0):
       container that contains itself, one nested deeper than `_MAX_DEPTH`, and
       any value whose inspection raises.
     - An int too long for `str()` (over `_MAX_INT_DIGITS` decimal digits;
-      Python refuses over 4300) is the string `"<int 0x...>"`: its exact value
-      in hex, which has no such limit, so it is still recoverable.
+      Python refuses over 4300) is the string `"<int 0x...>"` in hex, which
+      has no such limit. Like a long string it is cut to its first
+      `_MAX_STR_CHARS` characters followed by `"...<truncated int of N
+      chars>"`, N the length of the whole hex text, so its leading digits and
+      its size are kept and the record stays bounded. Any amount of raw is far
+      below this and is written as an exact int.
     - After `_MAX_NODES` values in one walk (record() gives each endpoint's
       answer and payload a walk of their own), every further value is the
       placeholder `"<omitted TYPE>"`, so a structure that shares substructures
@@ -369,7 +378,7 @@ def _jsonable_inner(value, walk, depth):
     if isinstance(value, int):
         value = int(value)
         if value.bit_length() > _int_digits() * 3.32:  # log2(10) ~ 3.3219
-            return "<int %s>" % hex(value)
+            return _int_hex(value)
         return value
     if isinstance(value, float):
         return float(value) if math.isfinite(value) else repr(value)
@@ -441,6 +450,26 @@ def _jsonable_inner(value, walk, depth):
         return _cap(_repr(value), "repr")
     finally:
         active.discard(id(value))
+
+
+def _int_hex(value: int) -> str:
+    """`"<int 0x...>"` for `value`, passed through `_cap` as kind `"int"`.
+
+    Only the leading hex digits that survive the cap are computed, so a
+    200,000-digit int costs no more than a short one: the result is what
+    `_cap("<int %s>" % hex(value), "int")` would be, without building the
+    whole hex text first.
+    """
+    sign = "-" if value < 0 else ""
+    magnitude = -value if value < 0 else value
+    digits = max(1, (magnitude.bit_length() + 3) // 4)
+    head = "<int %s0x" % sign
+    total = len(head) + digits + 1
+    if total <= _MAX_STR_CHARS:
+        return "%s%x>" % (head, magnitude)
+    keep = max(0, _MAX_STR_CHARS - len(head))
+    leading = "%x" % (magnitude >> (4 * (digits - keep))) if keep else ""
+    return "%s...<truncated int of %d chars>" % ((head + leading)[:_MAX_STR_CHARS], total)
 
 
 def _cap(text: str, kind: str) -> str:
@@ -679,6 +708,11 @@ def verify_corroborated(
     # keyed by answer, a later agreeing node's receipt overwrote an earlier
     # one's, and a Disagreement attributed it to the wrong endpoint.
     settled: list[tuple[str, tuple, Receipt]] = []
+    # Every endpoint that answered at all, in the order asked: the settled ones
+    # with their receipts, and those that have not seen the send or not yet
+    # confirmed it with None, so a Disagreement records every answer before
+    # the contradiction, not only the settled ones.
+    heard: list[tuple[str, tuple, Receipt | None]] = []
 
     for rpc_url in endpoints:
         try:
@@ -695,14 +729,14 @@ def verify_corroborated(
             # up yet and read its silence as agreement.
             raise payload
         if answer[0] != "settled":
+            heard.append((rpc_url, answer, payload))
             continue
         if settled_by and answer not in settled_by:
-            # Every settled endpoint so far is kept, each with what it itself
-            # said, then the one that contradicts them.
             # `answers` is as it always was - the first endpoint to settle and
-            # the one that contradicts it - and every settled endpoint so far
-            # is kept beside it, each with what it itself said.
-            witnesses = settled + [(rpc_url, answer, payload)]
+            # the one that contradicts it - and every endpoint that answered so
+            # far is kept beside it, each with what it itself said, then the
+            # one that contradicts them.
+            witnesses = heard + [(rpc_url, answer, payload)]
             raise Disagreement(
                 {settled[0][0]: str(settled[0][1]), rpc_url: str(answer)},
                 observations={url: receipt for url, _, receipt in witnesses},
@@ -710,6 +744,7 @@ def verify_corroborated(
             )
         settled_by.setdefault(answer, []).append(rpc_url)
         settled.append((rpc_url, answer, payload))
+        heard.append((rpc_url, answer, payload))
         if len(settled_by[answer]) >= agree:
             return Corroboration(
                 # The receipt of the endpoint that completed the quorum, as

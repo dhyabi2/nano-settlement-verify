@@ -817,14 +817,15 @@ def test_a_disagreement_record_is_bounded_on_shared_substructures():
     assert len(out["text"]) < 1_000_000
 
 
-def test_a_disagreement_record_writes_an_int_too_long_for_str_as_hex():
-    """Python refuses str() of an int over 4300 digits; record() writes it as exact hex."""
+def test_a_disagreement_record_writes_an_int_too_long_for_str_as_capped_hex():
+    """Python refuses str() of an int over 4300 digits; record() writes it as hex, capped."""
     huge = 10**5000 + 7
     record = Disagreement({A: "x"}, observations={A: {"amount": huge}}).record()
     text = json.dumps(record, allow_nan=False)
     written = json.loads(text)["observations"][0]["payload"]["amount"]
-    assert written == "<int %s>" % hex(huge)
-    assert int(written[len("<int "):-1], 16) == huge
+    full = "<int %s>" % hex(huge)
+    assert written == "%s...<truncated int of %d chars>" % (full[:1_000], len(full))
+    assert full.startswith(written[:1_000])
     assert Disagreement({A: "x"}, observations={A: ONE_XNO}).record()[
         "observations"][0]["payload"] == ONE_XNO
 
@@ -898,11 +899,13 @@ def test_a_disagreement_built_from_an_int_too_long_for_str_does_not_raise():
     huge = 10**5000 + 7
     error = Disagreement({A: huge, huge: "y"}, observations={A: huge})
     message = str(error)
-    assert f"{A}: <int {hex(huge)}>" in message
-    assert f"<int {hex(huge)}>: y" in message
+    full = "<int %s>" % hex(huge)
+    capped = "%s...<truncated int of %d chars>" % (full[:1_000], len(full))
+    assert f"{A}: {capped}" in message
+    assert f"{capped}: y" in message
     assert error.answers[A] == huge
     record = json.loads(json.dumps(error.record(), allow_nan=False))
-    assert record["observations"][0]["answer"] == "<int %s>" % hex(huge)
+    assert record["observations"][0]["answer"] == capped
     assert str(Disagreement({A: "1 XNO", B: "2 XNO"})) == (
         f"endpoints disagree: {A}: 1 XNO; {B}: 2 XNO"
     )
@@ -1038,3 +1041,64 @@ def test_bounding_the_record_leaves_answers_message_and_decisions_unchanged(monk
     assert [o["payload"]["height"] for o in caught.value.record()["observations"]] == [7, 9]
     nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=7)})
     assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled
+
+
+def test_a_record_of_many_huge_ints_stays_within_its_documented_bound():
+    """Uncapped hex let 10**200000 repeated 10,000 times make a 1.66 GB record.
+
+    Each walk is bounded by about `_MAX_NODES * _MAX_STR_CHARS` characters
+    (plus a short truncation marker per value); a huge int is now cut like a
+    string, so this smaller case shows the per-value cap holds.
+    """
+    huge = 10**200_000
+    n = 200
+    error = Disagreement({A: "x", B: "y"}, observations={A: [huge] * n})
+    text = json.dumps(error.record(), allow_nan=False)
+    per_value = nano_quorum._MAX_STR_CHARS + len("...<truncated int of 1000000 chars>") + 4
+    assert len(text) < n * per_value + 1_000
+    written = json.loads(text)["observations"][0]["payload"]
+    assert len(written) == n
+    assert all(item.startswith("<int 0x") and "<truncated int of " in item for item in written)
+    assert len(str(error)) < 3 * per_value
+
+
+def test_a_capped_int_hex_matches_capping_the_whole_hex_text():
+    """`_int_hex` computes only the leading digits, but writes what `_cap` would."""
+    for value in (0, 7, -7, 16**990 - 1, 16**995, -(10**5000), 10**5000 + 7):
+        assert nano_quorum._int_hex(value) == nano_quorum._cap("<int %s>" % hex(value), "int")
+
+
+def test_a_verify_disagreement_records_endpoints_that_answered_not_seen_or_not_yet(monkeypatch):
+    """An endpoint that answered without settling is on record with None, not dropped."""
+    NotFound = nano_quorum.NotFound
+    D = "http://127.0.0.1:7074"
+
+    def verify(block_hash, expect_raw, account, rpc_url):
+        if rpc_url == A:
+            return nano_settlement_verify.Receipt(
+                settled=True, amount_raw=expect_raw, height=7, account=account
+            )
+        if rpc_url == B:
+            raise NotFound("not seen")
+        if rpc_url == C:
+            return nano_settlement_verify.Receipt(
+                settled=False, amount_raw=0, height=0, account=""
+            )
+        return nano_settlement_verify.Receipt(
+            settled=True, amount_raw=expect_raw, height=9, account=account
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C, D], agree=3)
+    error = caught.value
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    d9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert error.answers == {A: a7, D: d9}
+    assert list(error.observations) == [A, B, C, D]
+    assert error.observations[B] is None and error.observations[C] is None
+    assert error.observed_answers == {
+        A: a7, B: str(("not-seen",)), C: str(("not-yet",)), D: d9
+    }
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B, C, D]

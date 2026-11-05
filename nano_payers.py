@@ -737,9 +737,12 @@ def payers_corroborated(
 
     first, *rest = reports
     expected = {public_key_from_address(payer.account) for payer in first.payers}
-    for other in rest:
+    for position, other in enumerate(rest, start=1):
         got = {public_key_from_address(payer.account) for payer in other.payers}
         if got != expected:
+            # Every report that answered before the contradiction, and the one
+            # that contradicted; `answers` stays the first and the contradictor.
+            heard = reports[: position + 1]
             # Reported as who each endpoint named, not as a count: two endpoints
             # can agree on how many have paid and name different accounts, and a
             # count would hide exactly the disagreement worth looking into.
@@ -748,7 +751,11 @@ def payers_corroborated(
                     _where(report): sorted(payer.account for payer in report.payers)
                     for report in (first, other)
                 },
-                observations={_where(report): report for report in (first, other)},
+                observations={_where(report): report for report in heard},
+                observed_answers={
+                    _where(report): sorted(payer.account for payer in report.payers)
+                    for report in heard
+                },
             )
     return PayerReport(
         account=first.account,
