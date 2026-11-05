@@ -285,9 +285,10 @@ money and serve nothing. In order of preference:
 2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
    something that cannot simply be served twice (a one-time asset, a metered run): record the
    hash and let the payer re-present it. This library only reads, so it has nowhere to keep
-   that credit; your own store has to. pursekeeper's x402 door does exactly this and documents
-   it in the hand-back paragraph of pursekeeper.dev/api: the price is kept as credit on the
-   hash and the payer gets a represent token to present with the same payload.
+   that credit; your own store has to. pursekeeper reports that its x402 door does this, in the
+   hand-back paragraph of pursekeeper.dev/api: the price is kept as credit on the hash and the
+   payer gets a represent token to present with the same payload. That is their description of
+   their door; we have not tested it.
 3. **Send it back** - the last resort. It costs you a signed send block and its work, from
    your own wallet; this library sends nothing.
 
@@ -297,12 +298,17 @@ which you read from the block, not from the receipt. `UnknownTime` carries the s
 The time is the chosen node's first-seen `local_timestamp`, so a different node may give another
 time, or none (`UnknownTime`). A deadline that is meant to matter has to be enforced before the
 payer broadcasts - as an expiry in your 402 that the payer checks - because after the broadcast
-nothing on Nano returns the money by itself. x402's `maxTimeoutSeconds` is not such an expiry:
-it bounds how long the seller waits to settle, and a payer's client need not read it. A window
-that binds is one the quote itself carries, for example a fresh `payTo` for every quote that is
-only honoured for a short time, with the paid retry required to present the same quote and
-`payTo` pair (pursekeeper names Subnano's door as one built that way: a new `payTo` per GET,
-sixty seconds). Checked after the fact, `not_after` can only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
+nothing on Nano returns the money by itself. For a Nano send, x402's `maxTimeoutSeconds` is not
+such an expiry: it bounds how long the seller waits to settle, and nothing in the send itself
+carries it, so a payer's client need not read it. (On x402's EVM `exact` scheme it does bind:
+the EIP-3009 authorization the payer signs carries its own `validBefore`, which the x402
+reference client sets to the time of signing plus `maxTimeoutSeconds`.) Nor does a fresh `payTo`
+for every quote bind the payer or stop a late send. What it gives you is attribution: a payment
+to that `payTo` is known to belong to that quote, so a send that arrives after the quote's
+window is still that quote's money, to be served or credited as above, not a stranger's.
+pursekeeper reports Subnano's door as built that way, a new `payTo` per GET and sixty seconds;
+that is their report, not something we have measured. Checked after the fact, `not_after` can
+only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
 deadline.
 
 **Changes from the previous release.** Code that relied on the old behaviour sees these:

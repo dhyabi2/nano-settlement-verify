@@ -38,3 +38,13 @@ def test_serve_anyway_is_the_default_and_the_deadline_belongs_before_broadcast()
     assert "the default" in section[serve:credit]
     assert "signed send block" in section[back:]
     assert "before the\npayer broadcasts" in section or "before the payer broadcasts" in section
+    # A fresh payTo per quote attributes a payment to its quote; it does not
+    # bind the payer, and a late send to it is still that quote's money.
+    flat = " ".join(section.split())
+    assert "Nor does a fresh `payTo` for every quote bind the payer or stop a late send" in flat
+    assert "still that quote's money" in flat
+    # maxTimeoutSeconds is not an expiry for a Nano send; on EVM exact it is signed.
+    assert "For a Nano send, x402's `maxTimeoutSeconds` is not such an expiry" in flat
+    assert "`validBefore`" in flat
+    # Third-party descriptions are marked as theirs.
+    assert "pursekeeper reports" in flat and "not something we have measured" in flat
