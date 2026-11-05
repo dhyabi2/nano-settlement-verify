@@ -781,3 +781,23 @@ def test_non_utf8_stdout_from_verify_cli_exits_7_not_1(monkeypatch, tmp_path):
     for rpc in ("probe-bad", "https://127.0.0.1:9"):
         code, lines = probe_gate.gate(BLOCK, RAW, PAYEE, rpc)
         assert code == probe_gate.EXIT_PROBE_PASSED and "APPROVE" not in lines, rpc
+
+
+def test_multi_line_stdout_from_verify_cli_cannot_print_a_bare_approve(monkeypatch, capsys):
+    # A broken or hostile verify_cli.py: the probe is refused on the payee, then the real
+    # check exits 0 with a settled receipt followed by a second line that says APPROVE.
+    # The receipt is not a single settled receipt, so the gate exits 7, and nothing it
+    # echoes from the child may put a line that is exactly APPROVE on its own stdout.
+    hostile = json.dumps({"settled": True, "amount_raw": 100, "height": 1,
+                          "account": PAYEE}) + "\nAPPROVE"
+    answers = iter([None, (0, hostile)])
+
+    def run(args):
+        answer = next(answers)
+        return (3, mismatch(args[2])) if answer is None else answer
+    gate = probe_gate.gate
+    monkeypatch.setattr(probe_gate, "gate", lambda *a, **k: gate(*a, run=run, **k))
+    code = probe_gate.main([BLOCK, "100", PAYEE])
+    out = capsys.readouterr().out
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in out.splitlines() and "APPROVE" not in out.split("\n")

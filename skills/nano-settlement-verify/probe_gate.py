@@ -128,6 +128,16 @@ def run_cli(args):
         return 1, p.stdout.decode("utf-8", errors="replace")
 
 
+def _echo(out):
+    """verify_cli.py's stdout as one printed line. A single-line JSON object (what it
+    prints) is kept as is; anything else is quoted with json.dumps, so a child's stdout
+    can never put a bare line such as APPROVE on the gate's stdout."""
+    text = out.strip()
+    if not text or (text.startswith("{") and len(text.splitlines()) == 1):
+        return text
+    return json.dumps(text)
+
+
 def _rpc_list(rpc):
     """The nodes verify_cli.py would ask for this RPC_URL, in order (None: its default)."""
     if rpc is None:
@@ -299,7 +309,7 @@ def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, pro
     probe account, or late/untimed (5/6) naming the probe account. Exit 3 only when the
     real check, on the same node, refuses the block as paid to the probe account; never
     approve."""
-    not_refused = [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % probe_code]
+    not_refused = [_echo(out), "PROBE-NOT-REFUSED (exit %d): nothing approved" % probe_code]
     if probe_code == 0 and not _settled_receipt(out, expect_raw, probe, not_after):
         # An exit 0 whose receipt names ACCOUNT, another account or none says nothing
         # about a payment to the probe account: no real check can explain it.
@@ -312,9 +322,9 @@ def _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, pro
     if code == 3 and _paid_to(real, account, probe):
         state = ("PROBE-SETTLED" if probe_code == 0
                  else "PROBE-PAYEE-MATCHED-BUT-NOT-ON-TIME (exit %d)" % probe_code)
-        return 3, [out.strip(), state + " (the block pays the probe account)", real.strip(),
+        return 3, [_echo(out), state + " (the block pays the probe account)", _echo(real),
                    "WRONG-RECIPIENT: nothing approved"]
-    return EXIT_PROBE_PASSED, not_refused + [real.strip(),
+    return EXIT_PROBE_PASSED, not_refused + [_echo(real),
                                              "REAL-CHECK-DOES-NOT-EXPLAIN-PROBE (exit %d)" % code]
 
 
@@ -326,26 +336,26 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     probe = probe_account(account)
     code, out = run([block, expect_raw, probe] + extra + tail)
     if code == 4:
-        return 4, [out.strip(), "PROBE-UNREAD (node unreachable; nothing was checked)"]
+        return 4, [_echo(out), "PROBE-UNREAD (node unreachable; nothing was checked)"]
     if code == 2:
         if not _not_yet(out):
             return EXIT_PROBE_PASSED, [
-                out.strip(), "PROBE-EXIT-2-WITHOUT-RECEIPT (not a not-confirmed verdict): nothing approved"]
-        return 2, [out.strip(), "PROBE-PENDING (block not confirmed yet; nothing approved)"]
+                _echo(out), "PROBE-EXIT-2-WITHOUT-RECEIPT (not a not-confirmed verdict): nothing approved"]
+        return 2, [_echo(out), "PROBE-PENDING (block not confirmed yet; nothing approved)"]
     if code == 64:
-        return 64, [out.strip(), "PROBE-USAGE-ERROR (exit 64): nothing approved"]
+        return 64, [_echo(out), "PROBE-USAGE-ERROR (exit 64): nothing approved"]
     if code == 0 or (code in (5, 6) and _pays_probe_late(out, probe)):
         # Settled, or late/untimed with the probe account as recipient: either way the
         # probe matched the payee, so only a payment to the probe account explains it.
         return _probe_settled(block, expect_raw, account, probe, nodes, out, run, tail, code,
                               not_after)
     if code != 3:
-        return EXIT_PROBE_PASSED, [out.strip(), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
+        return EXIT_PROBE_PASSED, [_echo(out), "PROBE-NOT-REFUSED (exit %d): nothing approved" % code]
     refusal = _payee_refusal(out, probe, account)
     if refusal == "no_such_block":
         # verify_cli.py's own exit 3, "do not serve": a made-up or wrong hash stays
         # missing, so a caller that retries on 2 must not be told to wait for it.
-        return 3, [out.strip(), "PROBE-BLOCK-NOT-FOUND (no such block on this node; nothing approved)"]
+        return 3, [_echo(out), "PROBE-BLOCK-NOT-FOUND (no such block on this node; nothing approved)"]
     earlier = _earlier_mismatch(out, expect_raw) if refusal != "payee" else None
     if earlier is not None:
         # The block is refused before its payee is read: wrong amount (an honest
@@ -354,11 +364,11 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         # same node, refuses with the same mismatch. Anything else approves nothing.
         pinned = _pinned(nodes, out)
         if pinned is None:
-            return EXIT_PROBE_PASSED, [out.strip(),
+            return EXIT_PROBE_PASSED, [_echo(out),
                                        "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
-        probe_out = out.strip()
+        probe_out = _echo(out)
         code, out = run([block, expect_raw, account] + pinned + tail)
-        lines = [probe_out, "PROBE-MISMATCH-BEFORE-PAYEE (expected %r, got %r)" % earlier, out.strip()]
+        lines = [probe_out, "PROBE-MISMATCH-BEFORE-PAYEE (expected %r, got %r)" % earlier, _echo(out)]
         if code == 3 and _earlier_mismatch(out, expect_raw) == earlier:
             return 3, lines + ["MISMATCH: nothing approved"]
         return EXIT_PROBE_PASSED, lines + [
@@ -369,12 +379,12 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
         # the block pays that same account; it can never approve.
         pinned = _pinned(nodes, out)
         if pinned is None:
-            return EXIT_PROBE_PASSED, [out.strip(),
+            return EXIT_PROBE_PASSED, [_echo(out),
                                        "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
         got = json.loads(out)["got"]
-        probe_out = out.strip()
+        probe_out = _echo(out)
         code, out = run([block, expect_raw, account] + pinned + tail)
-        lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, out.strip()]
+        lines = [probe_out, "PROBE-PAID-ELSEWHERE (got %s)" % got, _echo(out)]
         if code == 3 and _paid_to(out, account, got):
             return 3, lines + ["WRONG-RECIPIENT: nothing approved"]
         if code == 4:
@@ -386,17 +396,17 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
     if refusal != "payee":
         # Exit 3 for any other reason (a wrong amount or operation, an amount that is
         # not raw, unreadable JSON) says nothing about whether the payee is compared.
-        return EXIT_PROBE_PASSED, [out.strip(),
+        return EXIT_PROBE_PASSED, [_echo(out),
                                    "PROBE-NOT-REFUSED-ON-PAYEE (exit 3, not a payee mismatch): nothing approved"]
     # Pin the real check to the node that refused the probe, passed explicitly
     # so neither the rest of the list nor $NANO_RPC_URL can answer it instead.
     pinned = _pinned(nodes, out)
     if pinned is None:
-        return EXIT_PROBE_PASSED, [out.strip(),
+        return EXIT_PROBE_PASSED, [_echo(out),
                                    "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
     lines = ["PROBE-REFUSED"]
     code, out = run([block, expect_raw, account] + pinned + tail)
-    lines.append(out.strip())
+    lines.append(_echo(out))
     if code == 0 and _rpc_index(out) is not None:
         # A single pinned URL never carries rpc_index; one that does was not pinned.
         return EXIT_PROBE_PASSED, lines + ["REAL-CHECK-NOT-PINNED: nothing approved"]
