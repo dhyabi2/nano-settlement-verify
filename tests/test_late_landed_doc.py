@@ -25,7 +25,8 @@ def test_readme_says_a_late_payment_has_landed_and_names_the_receipt():
 
 
 def test_serve_anyway_is_the_default_and_the_deadline_belongs_before_broadcast():
-    """A seller's review (2026-11-04): serving needs nothing, credit needs state,
+    """A seller's review (2026-11-04): serving needs a used-hash record like any
+    payment, credit needs state,
     sending back costs a signed block, and a deadline only binds before the payer
     broadcasts. The paragraph must rank them that way and say so."""
     text = README.read_text(encoding="utf-8")
@@ -36,6 +37,11 @@ def test_serve_anyway_is_the_default_and_the_deadline_belongs_before_broadcast()
     assert -1 not in (serve, credit, back), "the three choices are no longer named"
     assert serve < credit < back, "serve anyway must come first and sending back last"
     assert "the default" in section[serve:credit]
+    # verify keeps no record of accepted hashes: serving still needs the
+    # seller to refuse a hash it has already used, or an old send replays.
+    serve_text = " ".join(section[serve:credit].split())
+    assert "It needs nothing more" not in serve_text
+    assert "record the block hash once and refuse a hash already used" in serve_text
     assert "signed send block" in section[back:]
     assert "before the\npayer broadcasts" in section or "before the payer broadcasts" in section
     # A fresh payTo per quote attributes a payment to its quote; it does not

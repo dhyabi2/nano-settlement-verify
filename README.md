@@ -279,8 +279,11 @@ seller, not a refusal the network enforces: the send is confirmed and receivable
 (your wallet takes it in by publishing its receive block), and the payer cannot undo a confirmed send. So a seller that gets `Late` should not keep the
 money and serve nothing. In order of preference:
 
-1. **Serve anyway** - the default. It needs nothing more: the block is confirmed, the amount is
-   exact, and it was sent to your account. The lateness is one node's first-seen
+1. **Serve anyway** - the default. The block is confirmed, the amount is exact, and it was sent
+   to your account. But, like serving any payment, it needs you to record the block hash once
+   and refuse a hash already used: `verify` keeps no record of the hashes it accepted, so a
+   seller that keeps none could be paid with an old confirmed send of the same amount, again
+   and again. The lateness is one node's first-seen
    `local_timestamp` read against your own clock, a weak reason to hold a paid call.
 2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
    something that cannot simply be served twice (a one-time asset, a metered run): record the
