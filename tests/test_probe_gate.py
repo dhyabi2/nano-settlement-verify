@@ -801,3 +801,28 @@ def test_multi_line_stdout_from_verify_cli_cannot_print_a_bare_approve(monkeypat
     out = capsys.readouterr().out
     assert code == probe_gate.EXIT_PROBE_PASSED
     assert "APPROVE" not in out.splitlines() and "APPROVE" not in out.split("\n")
+
+
+def test_terminal_escape_in_the_real_checks_stdout_is_quoted_not_echoed(monkeypatch, tmp_path, capsys):
+    # A stub verify_cli.py refuses the probe on the payee, then crashes with stdout that
+    # starts with "{" but carries ESC sequences a terminal would render as "APPROVE".
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text(
+        "import json, sys\n"
+        "if sys.argv[3] != %r:\n"
+        "    print(json.dumps({'verdict': 'mismatch', 'expected': sys.argv[3], 'got': %r}))\n"
+        "    sys.exit(3)\n"
+        "sys.stdout.write('{\\x1b[2K\\x1b[1GAPPROVE\\n')\n"
+        "sys.exit(1)\n" % (PAYEE, PAYEE))
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    out = capsys.readouterr().out
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "\x1b" not in out
+    assert "APPROVE" not in out.splitlines()
+    assert "REAL-CHECK-DISAGREES-WITH-PROBE (exit 1): nothing approved" in out
+    # Controls: a JSON object without control characters is echoed as is; one that is
+    # valid JSON but not an object, or carries U+2028, is quoted.
+    assert probe_gate._echo('{"verdict": "mismatch"}\n') == '{"verdict": "mismatch"}'
+    assert probe_gate._echo('{"a": "\u2028APPROVE"}') == json.dumps('{"a": "\u2028APPROVE"}')
+    assert probe_gate._echo("{") == json.dumps("{")

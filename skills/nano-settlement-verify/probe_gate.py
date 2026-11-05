@@ -128,13 +128,23 @@ def run_cli(args):
         return 1, p.stdout.decode("utf-8", errors="replace")
 
 
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
 def _echo(out):
-    """verify_cli.py's stdout as one printed line. A single-line JSON object (what it
-    prints) is kept as is; anything else is quoted with json.dumps, so a child's stdout
-    can never put a bare line such as APPROVE on the gate's stdout."""
+    """verify_cli.py's stdout as one printed line. A JSON object (what it prints) with no
+    control character in it is kept as is; anything else is quoted with json.dumps, so a
+    child's stdout can never put a bare line such as APPROVE, or a terminal escape that
+    redraws one, on the gate's stdout."""
     text = out.strip()
-    if not text or (text.startswith("{") and len(text.splitlines()) == 1):
+    if not text:
         return text
+    if not _CONTROL.search(text):
+        try:
+            if isinstance(json.loads(text), dict):
+                return text
+        except (ValueError, RecursionError):
+            pass
     return json.dumps(text)
 
 
