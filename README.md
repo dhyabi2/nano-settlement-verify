@@ -273,6 +273,47 @@ would, and `1790150109.9999999` is never rounded up across the second. These rai
 (`float32`, `float16` - too coarse to hold a unix time to the second), and anything beyond
 2\*\*63 seconds either side of 1970.
 
+**A late payment has still landed.** A seller reading this code pointed out that the README
+said why `Late` is raised but not what happens to the money. `Late` is a verdict for you, the
+seller, not a refusal the network enforces: the send is confirmed and receivable by your account
+(your wallet takes it in by publishing its receive block), and the payer cannot undo a confirmed send. So a seller that gets `Late` should not keep the
+money and serve nothing. In order of preference:
+
+1. **Serve anyway** - the default. The block is confirmed, the amount is exact, and it was sent
+   to your account. But, like serving any payment, it needs you to record the block hash once
+   and refuse a hash already used: `verify` keeps no record of the hashes it accepted, so a
+   seller that keeps none could be paid with an old confirmed send of the same amount, again
+   and again. The lateness is one node's first-seen
+   `local_timestamp` read against your own clock, a weak reason to hold a paid call.
+2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
+   something that cannot simply be served twice (a one-time asset, a metered run): record the
+   hash and let the payer re-present it. This library only reads, so it has nowhere to keep
+   that credit; your own store has to. pursekeeper reports that its x402 door does this, in the
+   hand-back paragraph of pursekeeper.dev/api: the price is kept as credit on the hash and the
+   payer gets a represent token to present with the same payload. That is their description of
+   their door; we have not tested it.
+3. **Send it back** - the last resort. It costs you a signed send block and its work, from
+   your own wallet; this library sends nothing.
+
+`exc.receipt` carries what any of those needs: `exc.receipt.amount_raw`, `exc.receipt.account`
+(your account, which was paid) and `exc.receipt.settled`; the payer is the block's own account,
+which you read from the block, not from the receipt. `UnknownTime` carries the same `receipt`.
+The time is the chosen node's first-seen `local_timestamp`, so a different node may give another
+time, or none (`UnknownTime`). A deadline that is meant to matter has to be enforced before the
+payer broadcasts - as an expiry in your 402 that the payer checks - because after the broadcast
+nothing on Nano returns the money by itself. For a Nano send, x402's `maxTimeoutSeconds` is not
+such an expiry: it bounds how long the seller waits to settle, and nothing in the send itself
+carries it, so a payer's client need not read it. (On x402's EVM `exact` scheme it does bind:
+the EIP-3009 authorization the payer signs carries its own `validBefore`, which the x402
+reference client sets to the time of signing plus `maxTimeoutSeconds`.) Nor does a fresh `payTo`
+for every quote bind the payer or stop a late send. What it gives you is attribution: a payment
+to that `payTo` is known to belong to that quote, so a send that arrives after the quote's
+window is still that quote's money, to be served or credited as above, not a stranger's.
+pursekeeper reports Subnano's door as built that way, a new `payTo` per GET and sixty seconds;
+that is their report, not something we have measured. Checked after the fact, `not_after` can
+only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
+deadline.
+
 **Changes from the previous release.** Code that relied on the old behaviour sees these:
 
 - A deadline beyond 2\*\*63 seconds - such as a huge "never expires" sentinel like `1e300` -
@@ -447,7 +488,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-832 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+844 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
