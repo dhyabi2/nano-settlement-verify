@@ -284,6 +284,13 @@ _MAX_DEPTH = 64
 # result bounded, at most linearly in the number of endpoints.
 _MAX_NODES = 10_000
 
+# Strings (and the `repr` written for a value with no JSON form) longer than
+# this are cut to their first `_MAX_STR_CHARS` characters plus a marker that
+# gives the original length (see `_cap`), so one long string cannot make the
+# record large either: with `_MAX_NODES`, each walk is at most about
+# `_MAX_NODES * _MAX_STR_CHARS` characters of text.
+_MAX_STR_CHARS = 1_000
+
 # Ints with more decimal digits than this are written as a hex string (see
 # `_jsonable`): Python refuses str() of an int over 4300 digits by default.
 _MAX_INT_DIGITS = 4000
@@ -334,8 +341,16 @@ def _jsonable(value, _walk=None, _depth=0):
     - After `_MAX_NODES` values in one walk (record() gives each endpoint's
       answer and payload a walk of their own), every further value is the
       placeholder `"<omitted TYPE>"`, so a structure that shares substructures
-      cannot make the record exponentially large. A dataclass's scalar fields
-      are written before its containers, so they are not the ones omitted.
+      cannot make the record exponentially large. A container met once the
+      budget is spent writes ONE marker for everything it did not write - a
+      list `"<omitted N of M items>"`, an object the key `"<omitted>"` with
+      `"N of M entries"` - not one per element, so a three-million-element
+      list costs one string, and the record stays bounded by the budget. A
+      dataclass's scalar fields are written before its containers, so they are
+      not the ones omitted.
+    - A string (or a `repr`) over `_MAX_STR_CHARS` characters is cut to its
+      first `_MAX_STR_CHARS` characters followed by `"...<truncated str of N
+      chars>"`, N its original length; so is a mapping key's text.
     """
     walk = _Walk() if _walk is None else _walk
     try:
@@ -359,7 +374,7 @@ def _jsonable_inner(value, walk, depth):
     if isinstance(value, float):
         return float(value) if math.isfinite(value) else repr(value)
     if isinstance(value, str):
-        return str.__str__(value)
+        return _cap(str.__str__(value), "str")
     if id(value) in active:
         return "<cycle %s>" % type(value).__name__
     if depth >= _MAX_DEPTH:
@@ -377,17 +392,18 @@ def _jsonable_inner(value, walk, depth):
             # Scalar fields (an amount, a height, a count) are written before the
             # containers, so a long list in one field cannot use up the budget
             # they need; the object keeps its own field order.
-            written = {
-                key: _jsonable(item, walk, nested)
-                for key, item in out.items()
+            scalars = [
+                key for key, item in out.items()
                 if item is None or isinstance(item, (bool, int, float, str))
-            }
-            written.update(
-                (key, _jsonable(item, walk, nested))
-                for key, item in out.items()
-                if key not in written
-            )
-            return {key: written[key] for key in out}
+            ]
+            order = scalars + [key for key in out if key not in set(scalars)]
+            written = {}
+            for key in order:
+                if walk.left <= 0:
+                    break
+                written[key] = _jsonable(out[key], walk, nested)
+            result = {key: written[key] for key in out if key in written}
+            return _omitted_entries(result, len(out) - len(written))
         if hasattr(value, "to_json"):
             loaded = _to_json(value)
             return _repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
@@ -397,25 +413,58 @@ def _jsonable_inner(value, walk, depth):
                 # A key's own text, not its `__str__`; two keys that are distinct
                 # to the mapping but share a text (str subclasses with their own
                 # `__eq__`) fall through to pairs below rather than merge.
-                texts = [str.__str__(key) for key, _ in pairs]
+                # A capped text that collides with another key's makes it pairs too.
+                texts = [_cap(str.__str__(key), "str") for key, _ in pairs]
                 if len(set(texts)) == len(texts):
-                    return {
-                        text: _jsonable(item, walk, nested)
-                        for text, (_, item) in zip(texts, pairs)
-                    }
-            return [
-                [_jsonable(key, walk, nested), _jsonable(item, walk, nested)]
-                for key, item in pairs
-            ]
+                    result = {}
+                    for text, (_, item) in zip(texts, pairs):
+                        if walk.left <= 0:
+                            break
+                        result[text] = _jsonable(item, walk, nested)
+                    return _omitted_entries(result, len(pairs) - len(result))
+            items = []
+            for key, item in pairs:
+                if walk.left < 2:  # a pair is at least two values: do not write half of one
+                    break
+                items.append([_jsonable(key, walk, nested), _jsonable(item, walk, nested)])
+            return _omitted_items(items, len(pairs))
         if isinstance(value, (list, tuple, set, frozenset)):
-            items = [_jsonable(item, walk, nested) for item in value]
+            items = []
+            for item in value:
+                if walk.left <= 0:
+                    break
+                items.append(_jsonable(item, walk, nested))
             if isinstance(value, (set, frozenset)):
                 # A set has no order of its own; give the record one.
                 items.sort(key=lambda item: json.dumps(item, sort_keys=True))
-            return items
-        return _repr(value)
+            return _omitted_items(items, len(value))
+        return _cap(_repr(value), "repr")
     finally:
         active.discard(id(value))
+
+
+def _cap(text: str, kind: str) -> str:
+    """`text`, or its first `_MAX_STR_CHARS` characters and a marker with its length."""
+    if len(text) <= _MAX_STR_CHARS:
+        return text
+    return "%s...<truncated %s of %d chars>" % (text[:_MAX_STR_CHARS], kind, len(text))
+
+
+def _omitted_items(items: list, total: int) -> list:
+    """`items`, plus one `"<omitted N of M items>"` if fewer than `total` were written."""
+    if len(items) < total:
+        items.append("<omitted %d of %d items>" % (total - len(items), total))
+    return items
+
+
+def _omitted_entries(result: dict, missing: int) -> dict:
+    """`result`, plus one `"<omitted>"` entry counting the `missing` entries not written."""
+    if missing > 0:
+        key = "<omitted>"
+        while key in result:  # a real key of that text was written; do not overwrite it
+            key = "<" + key + ">"
+        result[key] = "%d of %d entries" % (missing, len(result) + missing)
+    return result
 
 
 _NO_JSON = object()

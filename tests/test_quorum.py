@@ -813,7 +813,7 @@ def test_a_disagreement_record_is_bounded_on_shared_substructures():
     worker.start()
     worker.join(timeout=20)
     assert not worker.is_alive(), "record() did not finish on a shared structure"
-    assert "<omitted list>" in out["text"]
+    assert "<omitted" in out["text"]
     assert len(out["text"]) < 1_000_000
 
 
@@ -962,3 +962,79 @@ def test_a_disagreement_from_a_non_dict_mapping_with_an_unhashable_key_uses_a_pl
     error = Disagreement(Pairs([([1], "x"), (A, "y")]))
     assert error.answers == {"<unhashable list #0>": "x", A: "y"}
     assert "<unhashable list #0>: x" in str(error)
+
+
+# --- record() stays bounded once the budget is spent -------------------------
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda n: list(range(n)),
+        lambda n: tuple(range(n)),
+        lambda n: {str(i): i for i in range(n)},
+        lambda n: {i: i for i in range(n)},
+    ],
+    ids=["list", "tuple", "str-keyed dict", "int-keyed dict"],
+)
+def test_a_huge_container_is_recorded_with_one_omitted_marker_not_one_per_element(build):
+    """3,000,000 elements once wrote 3,000,000 `<omitted int>` markers (~51 MB of JSON).
+
+    Past the 10,000-value budget the container writes ONE marker naming how many
+    it left out, so the record stays small whatever the size of the value.
+    """
+    n = 3_000_000
+    value = build(n)
+    record = Disagreement({A: "x"}, observations={A: value}).record()
+    text = json.dumps(record, allow_nan=False)
+    assert len(text) < 1_000_000
+    assert text.count("<omitted") == 1
+    payload = record["observations"][0]["payload"]
+    if isinstance(payload, dict):
+        written = len(payload) - 1
+        assert payload["<omitted>"] == "%d of %d entries" % (n - written, n)
+    else:
+        written = len(payload) - 1
+        assert payload[-1] == "<omitted %d of %d items>" % (n - written, n)
+    assert 0 < written < 10_000
+    assert record["observations"][0]["rpc_url"] == A
+
+
+def test_a_long_string_is_recorded_capped_with_its_original_length():
+    long = "x" * 1_000_000
+    record = Disagreement({A: "x"}, observations={A: {"note": long, long: 1}}).record()
+    text = json.dumps(record, allow_nan=False)
+    assert len(text) < 10_000
+    payload = record["observations"][0]["payload"]
+    capped = "x" * 1_000 + "...<truncated str of 1000000 chars>"
+    assert payload == {"note": capped, capped: 1}
+    # Under the cap a string is written exactly as it is.
+    assert Disagreement({A: "x"}, observations={A: "y" * 1_000}).record()[
+        "observations"][0]["payload"] == "y" * 1_000
+
+
+def test_a_long_repr_is_recorded_capped():
+    record = Disagreement({A: "x"}, observations={A: b"\x00" * 1_000_000}).record()
+    payload = record["observations"][0]["payload"]
+    assert payload.startswith("b'\\x00")
+    assert payload.endswith("...<truncated repr of %d chars>" % len(repr(b"\x00" * 1_000_000)))
+    assert len(payload) < 1_100
+
+
+def test_bounding_the_record_leaves_answers_message_and_decisions_unchanged(monkeypatch):
+    """Only the record is bounded: answers, the message and the verdict are as before."""
+    huge = list(range(3_000_000))
+    long = "z" * 100_000
+    error = Disagreement({A: long, B: "b"}, observations={A: huge, B: long})
+    assert error.answers == {A: long, B: "b"}
+    assert str(error) == f"endpoints disagree: {A}: {long}; {B}: b"
+    assert error.observations[A] is huge and error.observations[B] is long
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    b9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, B: b9}
+    assert [o["payload"]["height"] for o in caught.value.record()["observations"]] == [7, 9]
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=7)})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled
