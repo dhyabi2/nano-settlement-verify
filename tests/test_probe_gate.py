@@ -890,3 +890,31 @@ def test_bidi_and_zero_width_characters_in_a_json_object_are_quoted(monkeypatch,
         assert echoed.startswith('"') and ch not in echoed
     # A plain ASCII receipt is still echoed verbatim.
     assert probe_gate._echo('{"settled": true, "amount_raw": 1}\n') == '{"settled": true, "amount_raw": 1}'
+
+
+def test_other_format_and_control_code_points_in_a_json_object_are_quoted(monkeypatch, tmp_path,
+                                                                         capsys):
+    # Cf/Cc/Zl/Zp/Co/Cn code points beyond the zero-width and bidi ranges (Arabic letter
+    # mark, soft hyphen, Arabic number signs, Mongolian vowel separator, deprecated format
+    # characters, interlinear annotation, tag characters, private use, unassigned) are
+    # escaped, never echoed raw inside a JSON object.
+    points = ("؜", "­", "؀", "؅", "᠎", "⁪", "⁯",
+              "￹", "￻", "\U000e0001", "\U000e0041", "\U000e007f", "",
+              "͸", "\x85")
+    for ch in points:
+        echoed = probe_gate._echo('{"a": "x%sAPPROVE"}' % ch)
+        assert echoed.startswith('"') and ch not in echoed, repr(ch)
+        assert all(" " <= c <= "~" for c in echoed), repr(ch)
+        assert json.loads(echoed) == '{"a": "x%sAPPROVE"}' % ch
+    stub = _stub_cli(tmp_path, PAYEE,
+                     real_line='{"a": "؜­᠎\U000e0041APPROVE\U000e007f"}')
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    out = capsys.readouterr().out
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in out.splitlines()
+    for ch in ("؜", "­", "᠎", "\U000e0041", "\U000e007f"):
+        assert ch not in out
+    # Ordinary ASCII objects and printable non-ASCII letters are still echoed as is.
+    assert probe_gate._echo('{"verdict": "mismatch", "n": 1}') == '{"verdict": "mismatch", "n": 1}'
+    assert probe_gate._echo('{"a": "café"}') == '{"a": "café"}'

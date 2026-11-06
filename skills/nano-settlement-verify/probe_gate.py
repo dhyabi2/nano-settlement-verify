@@ -74,6 +74,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, "verify_cli.py")
@@ -128,11 +129,16 @@ def run_cli(args):
         return 1, p.stdout.decode("utf-8", errors="replace")
 
 
-# Control characters, line/paragraph separators, and the invisible or direction-changing
-# format characters (zero-width, bidi embeddings/overrides/isolates, BOM) a terminal
-# would apply rather than show.
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e"
-                      "\u2060-\u2064\u2066-\u2069\ufeff]")
+# Unicode categories a terminal would apply rather than show, or that have no glyph:
+# controls (Cc), format characters (Cf: zero-width, bidi, soft hyphen, Arabic letter
+# mark, tags, ...), line/paragraph separators (Zl, Zp), private-use (Co), surrogates
+# (Cs) and unassigned code points (Cn).
+_CONTROL_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn"))
+
+
+def _has_control(text):
+    return any(not (" " <= ch <= "~") and unicodedata.category(ch) in _CONTROL_CATEGORIES
+               for ch in text)
 
 
 def _echo(out):
@@ -143,7 +149,7 @@ def _echo(out):
     text = out.strip()
     if not text:
         return text
-    if not _CONTROL.search(text):
+    if not _has_control(text):
         try:
             if isinstance(json.loads(text), dict):
                 return text
