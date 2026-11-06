@@ -29,7 +29,10 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -77,12 +80,465 @@ class Disagreement(Exception):
     both confirmed it report the same amount, height and payee. Different
     answers mean one endpoint is broken or lying. Which one is not knowable from
     here, so nothing is served.
+
+    Both sides are kept, not just the refusal. `answers` is exactly what it
+    always was: the first endpoint that settled on an answer and the endpoint
+    that contradicted it, each with its answer as text, as the message prints
+    them. That holds for any `agree`; with `agree >= 3` the endpoints that
+    agreed with the first one are not added to it.
+
+    Everything else is additive. `observations` maps every endpoint that
+    answered before the contradiction, and the one that contradicted, to the
+    whole thing it returned - the `Receipt` a `Corroboration` would have
+    carried, the `(balance_raw, receivable_raw)` figure, the payer report - in
+    the order asked. In `verify_corroborated` an endpoint that answered that
+    it has not seen the send, or has not confirmed it yet, is there with None
+    (its answer text says which). An endpoint that could not be read did not
+    answer and is not there. `observed_answers` maps those same endpoints to their
+    answers as text. `record()` is all of it as a JSON-ready dict.
+
+    Raises `TypeError` when `answers`, `observations` or `observed_answers` is
+    not a mapping (`observations` and `observed_answers` may be None). This is a
+    change for direct callers: before `observations` existed, an `answers`
+    without `.items()` failed with `AttributeError`. Nothing in this package
+    builds one from a non-mapping, so no verification outcome changes.
     """
 
-    def __init__(self, answers: dict) -> None:
-        detail = "; ".join(f"{url}: {answer}" for url, answer in answers.items())
+    def __init__(
+        self,
+        answers: dict,
+        observations: dict | None = None,
+        observed_answers: dict | None = None,
+    ) -> None:
+        answers = _mapping("answers", answers)
+        detail = "; ".join(f"{_text(url)}: {_text(answer)}" for url, answer in answers.items())
         super().__init__(f"endpoints disagree: {detail}")
-        self.answers = dict(answers)
+        self.answers = answers
+        self.observations = _mapping("observations", observations)
+        self.observed_answers = _mapping("observed_answers", observed_answers)
+
+    def record(self) -> dict:
+        """Every observation as a strict-JSON dict, for a dispute log.
+
+        `{"verdict": "disagreement", "observations": [{"rpc_url", "answer",
+        "payload"}, ...], "served": None}`, one entry per endpoint: those in
+        `observations` in their order, then any endpoint only `answers` names.
+        `served` is always None: on a disagreement nothing is served.
+
+        Each entry is written on its own budget (`_MAX_NODES` values for the
+        answer and again for the payload), and its `rpc_url` on a walk of its
+        own, so the endpoint that contradicted is always named with its answer,
+        however long the first endpoint's answer was.
+
+        Whatever the values hold, this does not raise and `json.dumps(...,
+        allow_nan=False)` accepts the result: see `_jsonable` for how each
+        value is written. The one refusal is structural: if `answers`,
+        `observations` or `observed_answers` has been replaced by something that
+        is not a mapping, it raises `TypeError`, as the constructor would have.
+        """
+        answers = _pairs("answers", self.answers)
+        observations = _pairs("observations", self.observations)
+        observed_answers = _pairs("observed_answers", self.observed_answers)
+        answers_index, observations_index, observed_index = (
+            _index(answers), _index(observations), _index(observed_answers)
+        )
+        # Each endpoint's answer and payload get a budget of their own, so a
+        # long first answer (1500 payers) cannot crowd out the endpoint that
+        # contradicted it, while shared substructures (`a = [a, a]` forty times
+        # over) still cannot make the record, or json.dumps of it, exponential.
+        # The rpc_url is written on a walk of its own too: it is always there.
+        entries = []
+        seen = [url for url, _ in observations]
+        seen += [
+            url for url, _ in answers
+            if not _lookup(observations, observations_index, url)[0]
+        ]
+        for url in seen:
+            try:
+                found, answer = _lookup(observed_answers, observed_index, url)
+                if not found:
+                    answer = _lookup(answers, answers_index, url)[1]
+                entries.append(
+                    {
+                        "rpc_url": _jsonable(url, _Walk()),
+                        "answer": _jsonable(answer, _Walk()),
+                        "payload": _jsonable(
+                            _lookup(observations, observations_index, url)[1], _Walk()
+                        ),
+                    }
+                )
+            except Exception as error:  # belt and braces: _lookup and _jsonable do not raise
+                entries.append({"rpc_url": None, "answer": None, "payload": _capped_repr(error)})
+        return {"verdict": "disagreement", "observations": entries, "served": None}
+
+
+def _text(value) -> str:
+    """`f"{value}"`, cut like `record()` cuts a string, or a placeholder when that raises.
+
+    Text over `_MAX_STR_CHARS` characters is cut to its first `_MAX_STR_CHARS`
+    characters plus `"...<truncated str of N chars>"` (`text` in place of `str`
+    for a value that is not a string), so one long answer cannot make the
+    message large. An int over 4300 decimal digits (or the interpreter's lower limit) cannot be
+    turned into text and raises `ValueError`; it is written `"<int 0x...>"` in
+    hex, as `record()` writes it: cut, like a long string, to its first
+    `_MAX_STR_CHARS` characters plus `"...<truncated int of N chars>"`, so the
+    message stays bounded however large the int. Anything else whose text
+    raises is `"<unprintable TYPE>"`.
+    """
+    try:
+        return _cap(str.__str__(f"{value}"), "str" if isinstance(value, str) else "text")
+    except Exception:
+        try:
+            if isinstance(value, int):
+                return _int_hex(int(value))
+        except Exception:
+            pass
+        return "<unprintable %s>" % _type_name(value)
+
+
+def _mapping(name: str, value) -> dict:
+    """`value` as a plain dict, or `TypeError` naming `name` when it is not a mapping.
+
+    An exact dict is copied with `dict(value)`, which reuses the hashes it
+    already holds, so a key whose `__hash__` raises when asked again is kept as
+    it is. Any other mapping is rebuilt from its items; a key that cannot be
+    hashed there is replaced by the placeholder `"<unhashable TYPE #i>"` (`i`
+    its position) rather than raising, and its value is kept.
+    """
+    pairs = _pairs(name, value)
+    if type(value) is dict:
+        try:
+            return dict(value)
+        except Exception:
+            pass
+    out = {}
+    for position, pair in enumerate(pairs):
+        try:
+            key, item = pair
+        except Exception as error:
+            raise TypeError(
+                f"Disagreement {name} could not be read as a mapping: {error!r}"
+            ) from None
+        try:
+            out[key] = item
+        except Exception:
+            placeholder = "<unhashable %s #%d>" % (_type_name(key), position)
+            while placeholder in out:
+                placeholder += "'"
+            out[placeholder] = item
+    return out
+
+
+def _pairs(name: str, value) -> list:
+    """`value`'s items as a list of pairs, without hashing a key again.
+
+    `TypeError` naming `name` when it is not a mapping or its `items()` fails.
+    """
+    if value is None and name != "answers":
+        return []
+    if not isinstance(value, Mapping) and not callable(getattr(value, "items", None)):
+        raise TypeError(
+            f"Disagreement {name} must be a mapping of endpoint to value, "
+            f"got {_type_name(value)}"
+        )
+    try:
+        return [tuple(pair) for pair in value.items()]
+    except Exception as error:
+        raise TypeError(f"Disagreement {name} could not be read as a mapping: {error!r}") from None
+
+
+def _index(pairs: list):
+    """`pairs` as a dict for fast lookups, or None when a key cannot be hashed."""
+    try:
+        return dict(pairs)
+    except Exception:
+        return None
+
+
+def _lookup(pairs: list, index, key) -> tuple:
+    """`(True, value)` for `key` in `pairs`, else `(False, None)`; never raises.
+
+    Uses `index` when it can; a key whose `__hash__` or `__eq__` raises falls
+    back to a scan by identity, then by an `==` that is allowed to fail.
+    """
+    if index is not None:
+        try:
+            if key in index:
+                return True, index[key]
+            return False, None
+        except Exception:
+            pass
+    for candidate, value in pairs:
+        if candidate is key:
+            return True, value
+    for candidate, value in pairs:
+        try:
+            if candidate == key:
+                return True, value
+        except Exception:
+            continue
+    return False, None
+
+
+# How deep record() follows nested containers before writing a placeholder, so
+# a deeply nested value cannot exhaust the interpreter's recursion limit.
+_MAX_DEPTH = 64
+
+# How many values record() writes for one endpoint's answer, and again for its
+# payload, before the rest become a placeholder. Each endpoint has its own, so
+# one long answer cannot hide another endpoint's. A structure that shares a
+# substructure (`a = [a, a]`, repeated) is a tree exponentially larger than the
+# objects it is built from; this keeps both record() and json.dumps of its
+# result bounded, at most linearly in the number of endpoints.
+_MAX_NODES = 10_000
+
+# Strings (and the `repr` written for a value with no JSON form) longer than
+# this are cut to their first `_MAX_STR_CHARS` characters plus a marker that
+# gives the original length (see `_cap`), so one long string cannot make the
+# record large either. Each value counted against `_MAX_NODES` is at most an
+# exact int of `_MAX_INT_DIGITS` digits or a cut string of about
+# `_MAX_STR_CHARS` characters, and an object entry also writes its key's text
+# (cut the same way, but not counted), so each walk is at most about
+# `_MAX_NODES * (_MAX_INT_DIGITS + 2 * _MAX_STR_CHARS)` characters: some 60 MB.
+# Bounded, not small; real answers are far below it.
+_MAX_STR_CHARS = 1_000
+
+# Ints with more decimal digits than this are written as a hex string (see
+# `_jsonable`): Python refuses str() of an int over 4300 digits by default.
+_MAX_INT_DIGITS = 4000
+
+
+def _int_digits() -> int:
+    """`_MAX_INT_DIGITS`, or less if the interpreter's own limit is set lower."""
+    try:
+        limit = int(sys.get_int_max_str_digits())
+    except Exception:
+        limit = 0
+    return min(_MAX_INT_DIGITS, limit) if limit > 0 else _MAX_INT_DIGITS
+
+
+class _Walk:
+    """State shared by one walk: the containers being written, and the budget."""
+
+    def __init__(self) -> None:
+        self.active: set = set()
+        self.left = _MAX_NODES
+
+
+def _jsonable(value, _walk=None, _depth=0):
+    """`value` as plain, strict JSON types (`allow_nan=False`), never raising.
+
+    - None, bools, ints (up to `_MAX_INT_DIGITS` digits, which any amount of
+      raw is, so it stays exact) and finite floats are kept; NaN and infinity become their `repr` text, cut like any `repr` below.
+    - A dataclass - a `Receipt`, a payer report - is an object of every one of
+      its fields under the field's own name, `seen_at` and `not_after`
+      included even where its `to_json` leaves them out, plus whatever else its
+      `to_json` adds (a derived `repeat_rate`, a `time_source`). The field's
+      value wins where both give one.
+    - Another object with a `to_json` is what that returns.
+    - A mapping whose keys are all strings stays an object keyed by each
+      key's own text (not its `__str__`), as long as no two keys share a text;
+      two distinct keys that do (str subclasses with their own `__eq__`) make
+      it a list of pairs instead, so neither is lost. A mapping with any
+      other key becomes a list of `[key, value]` pairs in its own order, each key written by these same rules, so an int
+      key stays an int and `1` and `"1"` are never merged into one.
+    - Lists and tuples are lists; a set is a list in a stable order.
+    - Anything else - bytes, a Decimal, an object of some caller's - is its
+      `repr`; one whose `repr` raises is a placeholder naming its type. So is a
+      container that contains itself, one nested deeper than `_MAX_DEPTH`, and
+      any value whose inspection raises.
+    - An int too long for `str()` (over `_MAX_INT_DIGITS` decimal digits;
+      Python refuses over 4300) is the string `"<int 0x...>"` in hex, which
+      has no such limit. Like a long string it is cut to its first
+      `_MAX_STR_CHARS` characters followed by `"...<truncated int of N
+      chars>"`, N the length of the whole hex text, so its leading digits and
+      its size are kept and the record stays bounded. Any amount of raw is far
+      below this and is written as an exact int.
+    - After `_MAX_NODES` values in one walk (record() gives each endpoint's
+      answer and payload a walk of their own), every further value is the
+      placeholder `"<omitted TYPE>"`, so a structure that shares substructures
+      cannot make the record exponentially large. A container met once the
+      budget is spent writes ONE marker for everything it did not write - a
+      list `"<omitted N of M items>"`, an object the key `"<omitted>"` with
+      `"N of M entries"` - not one per element, so a three-million-element
+      list costs one string, and the record stays bounded by the budget. A
+      dataclass's scalar fields are written before its containers, so they are
+      not the ones omitted.
+    - A string (or a `repr`) over `_MAX_STR_CHARS` characters is cut to its
+      first `_MAX_STR_CHARS` characters followed by `"...<truncated str of N
+      chars>"`, N its original length; so is a mapping key's text.
+    """
+    walk = _Walk() if _walk is None else _walk
+    try:
+        return _jsonable_inner(value, walk, _depth)
+    except Exception:
+        return _capped_repr(value)
+
+
+def _jsonable_inner(value, walk, depth):
+    if walk.left <= 0:
+        return "<omitted %s>" % _type_name(value)
+    walk.left -= 1
+    active = walk.active
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        value = int(value)
+        if value.bit_length() > _int_digits() * 3.32:  # log2(10) ~ 3.3219
+            return _int_hex(value)
+        return value
+    if isinstance(value, float):
+        return float(value) if math.isfinite(value) else _capped_repr(value)
+    if isinstance(value, str):
+        return _cap(str.__str__(value), "str")
+    if id(value) in active:
+        return "<cycle %s>" % _type_name(value)
+    if depth >= _MAX_DEPTH:
+        return "<too deep %s>" % _type_name(value)
+    active.add(id(value))
+    try:
+        nested = depth + 1
+        if is_dataclass(value) and not isinstance(value, type):
+            out = {}
+            extra = _to_json(value)
+            if isinstance(extra, dict):
+                out.update((_cap(str(key), "str"), item) for key, item in extra.items())
+            for spec in fields(value):
+                out[spec.name] = getattr(value, spec.name)
+            # Scalar fields (an amount, a height, a count) are written before the
+            # containers, so a long list in one field cannot use up the budget
+            # they need; the object keeps its own field order.
+            scalars = [
+                key for key, item in out.items()
+                if item is None or isinstance(item, (bool, int, float, str))
+            ]
+            order = scalars + [key for key in out if key not in set(scalars)]
+            written = {}
+            for key in order:
+                if walk.left <= 0:
+                    break
+                written[key] = _jsonable(out[key], walk, nested)
+            result = {key: written[key] for key in out if key in written}
+            return _omitted_entries(result, len(out) - len(written))
+        if hasattr(value, "to_json"):
+            loaded = _to_json(value)
+            return _capped_repr(value) if loaded is _NO_JSON else _jsonable(loaded, walk, nested)
+        if isinstance(value, Mapping):
+            pairs = list(value.items())
+            if all(isinstance(key, str) for key, _ in pairs):
+                # A key's own text, not its `__str__`; two keys that are distinct
+                # to the mapping but share a text (str subclasses with their own
+                # `__eq__`) fall through to pairs below rather than merge.
+                # A capped text that collides with another key's makes it pairs too.
+                texts = [_cap(str.__str__(key), "str") for key, _ in pairs]
+                if len(set(texts)) == len(texts):
+                    result = {}
+                    for text, (_, item) in zip(texts, pairs):
+                        if walk.left <= 0:
+                            break
+                        result[text] = _jsonable(item, walk, nested)
+                    return _omitted_entries(result, len(pairs) - len(result))
+            items = []
+            for key, item in pairs:
+                if walk.left < 2:  # a pair is at least two values: do not write half of one
+                    break
+                items.append([_jsonable(key, walk, nested), _jsonable(item, walk, nested)])
+            return _omitted_items(items, len(pairs))
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = []
+            for item in value:
+                if walk.left <= 0:
+                    break
+                items.append(_jsonable(item, walk, nested))
+            if isinstance(value, (set, frozenset)):
+                # A set has no order of its own; give the record one.
+                items.sort(key=lambda item: json.dumps(item, sort_keys=True))
+            return _omitted_items(items, len(value))
+        return _capped_repr(value)
+    finally:
+        active.discard(id(value))
+
+
+def _int_hex(value: int) -> str:
+    """`"<int 0x...>"` for `value`, passed through `_cap` as kind `"int"`.
+
+    Only the leading hex digits that survive the cap are computed, so a
+    200,000-digit int costs no more than a short one: the result is what
+    `_cap("<int %s>" % hex(value), "int")` would be, without building the
+    whole hex text first.
+    """
+    sign = "-" if value < 0 else ""
+    magnitude = -value if value < 0 else value
+    digits = max(1, (magnitude.bit_length() + 3) // 4)
+    head = "<int %s0x" % sign
+    total = len(head) + digits + 1
+    if total <= _MAX_STR_CHARS:
+        return "%s%x>" % (head, magnitude)
+    keep = max(0, _MAX_STR_CHARS - len(head))
+    leading = "%x" % (magnitude >> (4 * (digits - keep))) if keep else ""
+    return "%s...<truncated int of %d chars>" % ((head + leading)[:_MAX_STR_CHARS], total)
+
+
+def _cap(text: str, kind: str) -> str:
+    """`text`, or its first `_MAX_STR_CHARS` characters and a marker with its length."""
+    if len(text) <= _MAX_STR_CHARS:
+        return text
+    return "%s...<truncated %s of %d chars>" % (text[:_MAX_STR_CHARS], kind, len(text))
+
+
+def _omitted_items(items: list, total: int) -> list:
+    """`items`, plus one `"<omitted N of M items>"` if fewer than `total` were written."""
+    if len(items) < total:
+        items.append("<omitted %d of %d items>" % (total - len(items), total))
+    return items
+
+
+def _omitted_entries(result: dict, missing: int) -> dict:
+    """`result`, plus one `"<omitted>"` entry counting the `missing` entries not written."""
+    if missing > 0:
+        key = "<omitted>"
+        while key in result:  # a real key of that text was written; do not overwrite it
+            key = "<" + key + ">"
+        result[key] = "%d of %d entries" % (missing, len(result) + missing)
+    return result
+
+
+_NO_JSON = object()
+
+
+def _to_json(value):
+    """`json.loads(value.to_json())`, or `_NO_JSON` when there is none or it fails."""
+    try:
+        method = getattr(value, "to_json", None)
+        if method is None:
+            return _NO_JSON
+        return json.loads(method())
+    except Exception:
+        return _NO_JSON
+
+
+def _type_name(value) -> str:
+    """`value`'s type name cut like a string (`_cap`, kind `"str"`), or `"object"`."""
+    try:
+        return _cap(str.__str__(type(value).__name__), "str")
+    except Exception:
+        return "object"
+
+
+def _capped_repr(value) -> str:
+    """`_repr(value)` cut to `_MAX_STR_CHARS` characters as kind `"repr"`; never raises."""
+    try:
+        return _cap(str.__str__(_repr(value)), "repr")
+    except Exception:
+        return "<unrepresentable %s>" % _type_name(value)
+
+
+def _repr(value) -> str:
+    """`repr(value)`, or a placeholder when even that raises."""
+    try:
+        return str(repr(value))
+    except Exception:
+        return "<unrepresentable %s>" % _type_name(value)
 
 
 @dataclass(frozen=True)
@@ -259,7 +715,16 @@ def verify_corroborated(
     failures: dict[str, str] = {}
     answered: list[str] = []
     settled_by: dict[tuple, list[str]] = {}
-    settled_receipt: dict[tuple, Receipt] = {}
+    # Every endpoint that reported the send settled, in the order asked, with
+    # its own answer and its own receipt. Kept per endpoint, not per answer:
+    # keyed by answer, a later agreeing node's receipt overwrote an earlier
+    # one's, and a Disagreement attributed it to the wrong endpoint.
+    settled: list[tuple[str, tuple, Receipt]] = []
+    # Every endpoint that answered at all, in the order asked: the settled ones
+    # with their receipts, and those that have not seen the send or not yet
+    # confirmed it with None, so a Disagreement records every answer before
+    # the contradiction, not only the settled ones.
+    heard: list[tuple[str, tuple, Receipt | None]] = []
 
     for rpc_url in endpoints:
         try:
@@ -276,17 +741,27 @@ def verify_corroborated(
             # up yet and read its silence as agreement.
             raise payload
         if answer[0] != "settled":
+            heard.append((rpc_url, answer, payload))
             continue
         if settled_by and answer not in settled_by:
-            other = next(iter(settled_by))
+            # `answers` is as it always was - the first endpoint to settle and
+            # the one that contradicts it - and every endpoint that answered so
+            # far is kept beside it, each with what it itself said, then the
+            # one that contradicts them.
+            witnesses = heard + [(rpc_url, answer, payload)]
             raise Disagreement(
-                {settled_by[other][0]: str(other), rpc_url: str(answer)}
+                {settled[0][0]: str(settled[0][1]), rpc_url: str(answer)},
+                observations={url: receipt for url, _, receipt in witnesses},
+                observed_answers={url: str(said) for url, said, _ in witnesses},
             )
         settled_by.setdefault(answer, []).append(rpc_url)
-        settled_receipt[answer] = payload
+        settled.append((rpc_url, answer, payload))
+        heard.append((rpc_url, answer, payload))
         if len(settled_by[answer]) >= agree:
             return Corroboration(
-                receipt=settled_receipt[answer],
+                # The receipt of the endpoint that completed the quorum, as
+                # before; every agreeing receipt asserts the same facts.
+                receipt=payload,
                 agreed=tuple(settled_by[answer]),
                 answered=tuple(answered),
                 failed=tuple(failures),
@@ -397,6 +872,7 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
     }
     failures: dict[str, str] = {}
     figures: dict[tuple, list[str]] = {}
+    reported: list[tuple[str, tuple]] = []  # every endpoint's figure, in order asked
     for rpc_url in endpoints:
         try:
             reply = post(rpc_url, payload)
@@ -454,9 +930,14 @@ def balance_corroborated(account: str, rpc_urls, agree: int = AGREE_DEFAULT):
             failures[rpc_url] = f"{type(error).__name__}: {error}"
             continue
         if figures and figure not in figures:
-            other = next(iter(figures))
-            raise Disagreement({figures[other][0]: str(other), rpc_url: str(figure)})
+            witnesses = reported + [(rpc_url, figure)]
+            raise Disagreement(
+                {reported[0][0]: str(reported[0][1]), rpc_url: str(figure)},
+                observations={url: said for url, said in witnesses},
+                observed_answers={url: str(said) for url, said in witnesses},
+            )
         figures.setdefault(figure, []).append(rpc_url)
+        reported.append((rpc_url, figure))
         if len(figures[figure]) >= agree:
             return figure
     raise NotCorroborated(
