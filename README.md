@@ -317,9 +317,18 @@ time on the wire: the 402 has no expires-at field. What makes it bind is the hou
 quoted from docs.subnano.ai/v1/api/payments.md: "Once an empty expired checkout address has been
 retired, new sends receive no automatic fulfillment or refund", and an expired unbroadcast quote
 "can be re-quoted under the same spending policy". These are pursekeeper's quotes, not something
-we have measured: neither page answers from where we run. Checked after the fact, `not_after` can
-only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
-deadline.
+we have measured: neither page answers from where we run.
+
+pursekeeper reports its own x402 door as the other case. Its 402 carries `maxTimeoutSeconds` 60
+and nothing else about time: a duration with no start. A block that lands after sixty seconds is
+not refused; the price is kept as credit on that block hash, and pursekeeper points to the
+hand-back paragraph on pursekeeper.dev/api as the source. So on that door the window is echoed
+and does not bind. Unlike Subnano's, its `payTo` is fixed, one address for every quote, so there
+is no checkout address to expire; this too is pursekeeper's report, not something we have
+measured, and that page does not answer from where we run either.
+
+Checked after the fact, `not_after` can only tell you that you were paid late. Pick it with that
+slack, or pass `not_after=None` to have no deadline.
 
 **Changes from the previous release.** Code that relied on the old behaviour sees these:
 
