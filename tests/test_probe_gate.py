@@ -918,3 +918,33 @@ def test_other_format_and_control_code_points_in_a_json_object_are_quoted(monkey
     # Ordinary ASCII objects and printable non-ASCII letters are still echoed as is.
     assert probe_gate._echo('{"verdict": "mismatch", "n": 1}') == '{"verdict": "mismatch", "n": 1}'
     assert probe_gate._echo('{"a": "café"}') == '{"a": "café"}'
+
+
+def test_non_ascii_got_before_payee_under_an_ascii_stdout_exits_3_not_a_traceback(tmp_path):
+    # The amount-mismatch line formats the node's `got`: a printable non-ASCII value
+    # (verify_cli.py itself prints ASCII JSON) must not crash the gate with
+    # UnicodeEncodeError when its stdout can only encode ASCII.
+    import subprocess
+    import sys
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'verdict': 'mismatch', 'expected': sys.argv[2],"
+        " 'got': '1\\u00e9\\u4e00'}))\n"
+        "sys.exit(3)\n", encoding="utf-8")
+    driver = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('probe_gate', sys.argv[1])\n"
+        "gate = importlib.util.module_from_spec(spec); spec.loader.exec_module(gate)\n"
+        "gate.CLI = sys.argv[2]\n"
+        "sys.exit(gate.main(sys.argv[3:]))\n")
+    env = dict(os.environ, PYTHONIOENCODING="ascii")
+    env.pop("PYTHONUTF8", None)
+    done = subprocess.run([sys.executable, "-c", driver, str(SKILL / "probe_gate.py"), str(stub),
+                           BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"],
+                          capture_output=True, env=env, timeout=60)
+    assert b"Traceback" not in done.stderr, done.stderr
+    assert done.returncode == 3, (done.returncode, done.stderr)
+    out = done.stdout.decode("ascii")
+    assert 'PROBE-MISMATCH-BEFORE-PAYEE (expected "%s", got "1\\u00e9\\u4e00")' % RAW in out.splitlines()
+    assert "APPROVE" not in out.splitlines()

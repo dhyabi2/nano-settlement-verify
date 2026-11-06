@@ -388,7 +388,8 @@ def gate(block, expect_raw, account, rpc=None, run=run_cli, not_after=None):
                                        "PROBE-NODE-UNKNOWN (no rpc_index to pin to): nothing approved"]
         probe_out = _echo(out)
         code, out = run([block, expect_raw, account] + pinned + tail)
-        lines = [probe_out, "PROBE-MISMATCH-BEFORE-PAYEE (expected %r, got %r)" % earlier, _echo(out)]
+        lines = [probe_out, "PROBE-MISMATCH-BEFORE-PAYEE (expected %s, got %s)" % tuple(
+            json.dumps(field, ensure_ascii=True) for field in earlier), _echo(out)]
         if code == 3 and _earlier_mismatch(out, expect_raw) == earlier:
             return 3, lines + ["MISMATCH: nothing approved"]
         return EXIT_PROBE_PASSED, lines + [
