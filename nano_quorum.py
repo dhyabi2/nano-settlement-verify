@@ -193,7 +193,7 @@ def _text(value) -> str:
                 return _int_hex(int(value))
         except Exception:
             pass
-        return "<unprintable %s>" % _cap(_type_name(value), "str")
+        return "<unprintable %s>" % _type_name(value)
 
 
 def _mapping(name: str, value) -> dict:
@@ -239,7 +239,7 @@ def _pairs(name: str, value) -> list:
     if not isinstance(value, Mapping) and not callable(getattr(value, "items", None)):
         raise TypeError(
             f"Disagreement {name} must be a mapping of endpoint to value, "
-            f"got {type(value).__name__}"
+            f"got {_type_name(value)}"
         )
     try:
         return [tuple(pair) for pair in value.items()]
@@ -329,7 +329,7 @@ def _jsonable(value, _walk=None, _depth=0):
     """`value` as plain, strict JSON types (`allow_nan=False`), never raising.
 
     - None, bools, ints (up to `_MAX_INT_DIGITS` digits, which any amount of
-      raw is, so it stays exact) and finite floats are kept; NaN and infinity become their `repr` text.
+      raw is, so it stays exact) and finite floats are kept; NaN and infinity become their `repr` text, cut like any `repr` below.
     - A dataclass - a `Receipt`, a payer report - is an object of every one of
       its fields under the field's own name, `seen_at` and `not_after`
       included even where its `to_json` leaves them out, plus whatever else its
@@ -388,13 +388,13 @@ def _jsonable_inner(value, walk, depth):
             return _int_hex(value)
         return value
     if isinstance(value, float):
-        return float(value) if math.isfinite(value) else repr(value)
+        return float(value) if math.isfinite(value) else _capped_repr(value)
     if isinstance(value, str):
         return _cap(str.__str__(value), "str")
     if id(value) in active:
-        return "<cycle %s>" % type(value).__name__
+        return "<cycle %s>" % _type_name(value)
     if depth >= _MAX_DEPTH:
-        return "<too deep %s>" % type(value).__name__
+        return "<too deep %s>" % _type_name(value)
     active.add(id(value))
     try:
         nested = depth + 1
@@ -518,8 +518,9 @@ def _to_json(value):
 
 
 def _type_name(value) -> str:
+    """`value`'s type name cut like a string (`_cap`, kind `"str"`), or `"object"`."""
     try:
-        return str(type(value).__name__)
+        return _cap(str.__str__(type(value).__name__), "str")
     except Exception:
         return "object"
 
@@ -529,7 +530,7 @@ def _capped_repr(value) -> str:
     try:
         return _cap(str.__str__(_repr(value)), "repr")
     except Exception:
-        return "<unrepresentable %s>" % _cap(_type_name(value), "str")
+        return "<unrepresentable %s>" % _type_name(value)
 
 
 def _repr(value) -> str:
@@ -537,11 +538,7 @@ def _repr(value) -> str:
     try:
         return str(repr(value))
     except Exception:
-        try:
-            name = _cap(str.__str__(type(value).__name__), "str")
-        except Exception:
-            name = "object"
-        return "<unrepresentable %s>" % name
+        return "<unrepresentable %s>" % _type_name(value)
 
 
 @dataclass(frozen=True)

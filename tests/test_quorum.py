@@ -1167,3 +1167,64 @@ def test_a_long_string_answer_is_cut_in_the_message():
     error = Disagreement({A: "q" * 10**7, B: "b"})
     assert len(str(error)) < 1_200
     assert "...<truncated str of 10000000 chars>" in str(error)
+
+
+def test_a_non_finite_float_subclass_with_a_huge_repr_is_capped():
+    """A NaN or infinite float subclass is written by its repr, cut like any other repr."""
+
+    class LoudFloat(float):
+        def __repr__(self):
+            return "N" * 5_000_000
+
+    cap = nano_quorum._MAX_STR_CHARS
+    for value in (LoudFloat("nan"), LoudFloat("inf"), LoudFloat("-inf")):
+        written = nano_quorum._jsonable(value)
+        assert written == "N" * cap + "...<truncated repr of 5000000 chars>"
+        record = json.dumps(nano_quorum._jsonable({"a": [value, value]}))
+        assert len(record) < 3 * (cap + 100)
+    # A finite one stays a number, and a plain NaN stays its repr text.
+    assert nano_quorum._jsonable(LoudFloat("1.5")) == 1.5
+    assert nano_quorum._jsonable(float("nan")) == "nan"
+
+
+def test_a_huge_type_name_is_capped_in_every_placeholder():
+    """`<cycle T>`, `<too deep T>`, `<omitted T>`, `<unhashable T #i>`, `<unprintable T>`
+    and `<unrepresentable T>` name the type cut to `_MAX_STR_CHARS`, so a 2 MB class name
+    cannot make a 2 MB record."""
+    cap = nano_quorum._MAX_STR_CHARS
+    name = "T" * 2_000_000
+    capped = "T" * cap + "...<truncated str of 2000000 chars>"
+    Big = type(name, (list,), {})
+
+    looped = Big()
+    looped.append(looped)
+    assert nano_quorum._jsonable(looped) == ["<cycle %s>" % capped]
+
+    deep = inner = Big()
+    for _ in range(nano_quorum._MAX_DEPTH + 2):
+        nxt = Big()
+        inner.append(nxt)
+        inner = nxt
+    record = json.dumps(nano_quorum._jsonable(deep))
+    assert ("<too deep %s>" % capped) in record and len(record) < 200 * (cap + 100)
+
+    walk = nano_quorum._Walk()
+    walk.left = 0
+    assert nano_quorum._jsonable(Big(), walk) == "<omitted %s>" % capped
+
+    assert nano_quorum._type_name(Big()) == capped
+    Unhashable = type(name, (), {"__hash__": None})
+    BadText = type(name, (), {"__format__": lambda self, spec: 1 / 0,
+                              "__repr__": lambda self: 1 / 0})
+    assert nano_quorum._text(BadText()) == "<unprintable %s>" % capped
+    written = nano_quorum._capped_repr(BadText())
+    assert written.startswith("<unrepresentable TTT") and len(written) < cap + 100
+    assert nano_quorum._repr(BadText()) == "<unrepresentable %s>" % capped
+
+    class Pairs:
+        def items(self):
+            return [(Unhashable(), "x")]
+    assert nano_quorum._mapping("answers", Pairs()) == {"<unhashable %s #0>" % capped: "x"}
+    with pytest.raises(TypeError) as error:
+        nano_quorum._mapping("answers", BadText())
+    assert len(str(error.value)) < cap + 200
