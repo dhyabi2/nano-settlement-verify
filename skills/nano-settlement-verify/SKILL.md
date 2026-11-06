@@ -125,7 +125,7 @@ Act on the exit code, or on a whole line that is exactly `APPROVE` (`^APPROVE$`)
 the output: echoed verdicts carry node-supplied fields (a mismatch's `got`), which can contain the word APPROVE
 inside a quoted line on any exit.
 
-Each verify_cli.py call is killed after 120 s (`NANO_PROBE_GATE_TIMEOUT`, in seconds, overrides it) and then reads
+Each verify_cli.py call is killed after 120 s (`NANO_PROBE_GATE_TIMEOUT`, in seconds, at most 3600, overrides it) and then reads
 as a crash: exit 7, nothing approved. A call that exits without a verdict has its last 20 stderr lines written,
 ASCII-escaped and cut, to the gate's stderr.
 

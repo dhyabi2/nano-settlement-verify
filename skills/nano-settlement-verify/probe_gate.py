@@ -49,7 +49,8 @@ for the substring "APPROVE": the echoed verdicts carry node-supplied fields (a m
 "got"), and those can contain that word inside a quoted line on any exit.
 
 Each verify_cli.py call is killed after 120 s ($NANO_PROBE_GATE_TIMEOUT overrides it, in
-seconds) and then reads as a crash: exit 7, nothing approved. When a call exits without a
+seconds, at most 3600) and then reads as a crash: exit 7, nothing approved. A call that
+cannot be started or waited on also exits 7, with one line on stderr. When a call exits without a
 verdict, its last stderr lines are written, ASCII-escaped and cut, to the gate's stderr.
 
 What it does not catch: only the recipient is varied, so a node that answers the true amount
@@ -84,6 +85,7 @@ exit 0  approved
 """
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -135,8 +137,10 @@ def probe_account(account):
 
 # How long one verify_cli.py call may take before it is killed and read as a crash
 # (exit 7, nothing approved). $NANO_PROBE_GATE_TIMEOUT overrides it in seconds; a value
-# that is not a positive number is ignored.
+# that is not a positive finite number is ignored, and one above MAX_TIMEOUT is cut to it
+# (a huge finite value would otherwise overflow the platform's wait call).
 DEFAULT_TIMEOUT = 120.0
+MAX_TIMEOUT = 3600.0
 _STDERR_LINES = 20
 _STDERR_LINE_CHARS = 300
 # Exit codes verify_cli.py gives with a verdict on stdout.
@@ -148,7 +152,9 @@ def _timeout():
         value = float(os.environ.get("NANO_PROBE_GATE_TIMEOUT", ""))
     except ValueError:
         return DEFAULT_TIMEOUT
-    return value if value > 0 and value != float("inf") else DEFAULT_TIMEOUT
+    if not (value > 0 and math.isfinite(value)):
+        return DEFAULT_TIMEOUT
+    return min(value, MAX_TIMEOUT)
 
 
 def _report_stderr(what, stderr):
@@ -175,6 +181,13 @@ def run_cli(args):
     except subprocess.TimeoutExpired as error:
         _report_stderr("ran past %g s and was killed (NANO_PROBE_GATE_TIMEOUT)" % timeout,
                        error.stderr)
+        return 1, ""
+    except (OverflowError, OSError, ValueError) as error:
+        # The child could not be started or waited on (an unrunnable interpreter, a
+        # timeout the platform cannot represent, ...): a crash, exit 7, one line.
+        print("probe_gate: verify_cli.py could not be run: %s"
+              % json.dumps("%s: %s" % (type(error).__name__, error), ensure_ascii=True)[1:-1][:300],
+              file=sys.stderr)
         return 1, ""
     try:
         out = p.stdout.decode("utf-8")

@@ -973,6 +973,37 @@ def test_the_timeout_defaults_to_120_seconds_and_ignores_bad_values(monkeypatch)
         assert probe_gate._timeout() == 120.0, bad
     monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", "7.5")
     assert probe_gate._timeout() == 7.5
+    for huge in ("3601", "1e300", "1.7e308"):
+        monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", huge)
+        assert probe_gate._timeout() == 3600.0, huge
+
+
+def test_a_huge_finite_timeout_exits_7_without_a_traceback(monkeypatch, tmp_path, capsys):
+    # 1e300 s used to reach the platform's poll() and raise OverflowError out of main().
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", "1e300")
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    captured = capsys.readouterr()
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in captured.out.splitlines()
+    assert "Traceback" not in captured.err
+
+
+def test_a_child_that_cannot_be_run_exits_7_with_one_line(monkeypatch, capsys):
+    for error in (OverflowError("timestamp too large"), OSError(8, "Exec format error"),
+                  PermissionError(13, "Permission denied \u202e")):
+        def boom(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(probe_gate.subprocess, "run", boom)
+        code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+        captured = capsys.readouterr()
+        assert code == probe_gate.EXIT_PROBE_PASSED, error
+        assert "APPROVE" not in captured.out.splitlines()
+        err = captured.err.splitlines()
+        assert len(err) == 1 and "could not be run" in err[0], captured.err
+        assert all(" " <= c <= "~" for c in err[0])
 
 
 def test_a_crash_writes_the_childs_last_stderr_lines_escaped_and_capped(monkeypatch, tmp_path,
