@@ -33,10 +33,24 @@ seller). The real check is then run on the same node; if it refuses the block as
 mismatch naming the probe account as the recipient, that is a wrong-recipient payment and
 the gate exits 3. Nothing in that path can approve: any other answer exits 7.
 
-Both calls are answered by ONE node. With an RPC_URL list (or a list in $NANO_RPC_URL) the
-probe may fail over as verify_cli.py does; the real check is then sent only to the node that
+Both calls go to ONE URL. With an RPC_URL list (or a list in $NANO_RPC_URL) the
+probe may fail over as verify_cli.py does; the real check is then sent only to the URL that
 answered the probe (its "rpc_index"), never to the rest of the list, so a node that refused
-the probe cannot hand the real check to one that says yes to anything.
+the probe cannot hand the real check to one that says yes to anything. One URL is not
+always one node: a public endpoint such as rpc.nano.to is a pool, and its two answers may
+come from different backends. A backend that lags the other (not yet confirmed, or no such
+block, on one of them) makes the calls disagree, and that exits 7 although nothing is wrong
+with the check: re-run, or pin RPC_URL to a single node you run, before reading 7 as a
+broken check. The gate makes every request verify_cli.py makes twice (probe, then real
+check), so it doubles the load on the node and counts twice against its rate limit.
+
+Read the exit code, or match a whole line that is exactly APPROVE. Never search the output
+for the substring "APPROVE": the echoed verdicts carry node-supplied fields (a mismatch's
+"got"), and those can contain that word inside a quoted line on any exit.
+
+Each verify_cli.py call is killed after 120 s ($NANO_PROBE_GATE_TIMEOUT overrides it, in
+seconds) and then reads as a crash: exit 7, nothing approved. When a call exits without a
+verdict, its last stderr lines are written, ASCII-escaped and cut, to the gate's stderr.
 
 What it does not catch: only the recipient is varied, so a node that answers the true amount
 and payee for this block (a stub written for this payment, or a reply about another block
@@ -119,14 +133,57 @@ def probe_account(account):
     return next(a for a in PROBE_ACCOUNTS if _account_body(a) != body)
 
 
+# How long one verify_cli.py call may take before it is killed and read as a crash
+# (exit 7, nothing approved). $NANO_PROBE_GATE_TIMEOUT overrides it in seconds; a value
+# that is not a positive number is ignored.
+DEFAULT_TIMEOUT = 120.0
+_STDERR_LINES = 20
+_STDERR_LINE_CHARS = 300
+# Exit codes verify_cli.py gives with a verdict on stdout.
+_VERDICT_CODES = (0, 2, 3, 4, 5, 6, 64)
+
+
+def _timeout():
+    try:
+        value = float(os.environ.get("NANO_PROBE_GATE_TIMEOUT", ""))
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 and value != float("inf") else DEFAULT_TIMEOUT
+
+
+def _report_stderr(what, stderr):
+    """Write `what` and the last lines of the child's stderr to OUR stderr, each line
+    ASCII-escaped and cut, so a crash says why without reaching the stdout callers read."""
+    text = (stderr or b"").decode("utf-8", errors="replace")
+    print("probe_gate: verify_cli.py %s" % what, file=sys.stderr)
+    for line in text.splitlines()[-_STDERR_LINES:]:
+        line = json.dumps(line, ensure_ascii=True)[1:-1]
+        if len(line) > _STDERR_LINE_CHARS:
+            line = line[:_STDERR_LINE_CHARS] + "...<cut>"
+        print("probe_gate:   | " + line, file=sys.stderr)
+
+
 def run_cli(args):
     """(exit code, stdout) of verify_cli.py. stdout that is not UTF-8 is not a verdict
-    verify_cli.py prints: it reads as a crash (exit 1), which the gate exits 7 on."""
-    p = subprocess.run([sys.executable, CLI] + list(args), capture_output=True)
+    verify_cli.py prints: it reads as a crash (exit 1), which the gate exits 7 on. So
+    does a call that runs past the timeout (killed; nothing approved). When the child
+    exits without a verdict, its last stderr lines are written to the gate's stderr."""
+    timeout = _timeout()
     try:
-        return p.returncode, p.stdout.decode("utf-8")
+        p = subprocess.run([sys.executable, CLI] + list(args), capture_output=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        _report_stderr("ran past %g s and was killed (NANO_PROBE_GATE_TIMEOUT)" % timeout,
+                       error.stderr)
+        return 1, ""
+    try:
+        out = p.stdout.decode("utf-8")
     except UnicodeDecodeError:
+        _report_stderr("wrote stdout that is not UTF-8 (exit %d)" % p.returncode, p.stderr)
         return 1, p.stdout.decode("utf-8", errors="replace")
+    if p.returncode not in _VERDICT_CODES or (p.returncode != 0 and not out.strip()):
+        _report_stderr("exited %d without a verdict" % p.returncode, p.stderr)
+    return p.returncode, out
 
 
 # Unicode categories a terminal would apply rather than show, or that have no glyph:

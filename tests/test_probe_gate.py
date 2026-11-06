@@ -948,3 +948,50 @@ def test_non_ascii_got_before_payee_under_an_ascii_stdout_exits_3_not_a_tracebac
     out = done.stdout.decode("ascii")
     assert 'PROBE-MISMATCH-BEFORE-PAYEE (expected "%s", got "1\\u00e9\\u4e00")' % RAW in out.splitlines()
     assert "APPROVE" not in out.splitlines()
+
+
+def test_a_verify_cli_call_past_the_timeout_exits_7_without_a_traceback(monkeypatch, tmp_path,
+                                                                       capsys):
+    # A child that hangs is killed after NANO_PROBE_GATE_TIMEOUT seconds and reads as a
+    # crash: a clean exit 7, nothing approved, and the reason on stderr, not a traceback.
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text("import sys, time\nsys.stderr.write('stuck \\u00e9\\n'); sys.stderr.flush()\n"
+                    "time.sleep(30)\n", encoding="utf-8")
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", "0.5")
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    captured = capsys.readouterr()
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    assert "APPROVE" not in captured.out.splitlines()
+    assert "Traceback" not in captured.err
+    assert "killed" in captured.err
+
+
+def test_the_timeout_defaults_to_120_seconds_and_ignores_bad_values(monkeypatch):
+    for bad in ("", "x", "0", "-5", "inf", "nan"):
+        monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", bad)
+        assert probe_gate._timeout() == 120.0, bad
+    monkeypatch.setenv("NANO_PROBE_GATE_TIMEOUT", "7.5")
+    assert probe_gate._timeout() == 7.5
+
+
+def test_a_crash_writes_the_childs_last_stderr_lines_escaped_and_capped(monkeypatch, tmp_path,
+                                                                        capsys):
+    stub = tmp_path / "verify_cli.py"
+    stub.write_text(
+        "import sys\n"
+        "for i in range(40):\n"
+        "    sys.stderr.write('line %d\\n' % i)\n"
+        "sys.stderr.write('\\x1b[2K\\u202eAPPROVE' + 'z' * 5000 + '\\n')\n"
+        "sys.exit(1)\n", encoding="utf-8")
+    monkeypatch.setattr(probe_gate, "CLI", str(stub))
+    code = probe_gate.main([BLOCK, RAW, PAYEE, "http://127.0.0.1:7076"])
+    captured = capsys.readouterr()
+    assert code == probe_gate.EXIT_PROBE_PASSED
+    err = captured.err.splitlines()
+    assert "exited 1 without a verdict" in err[0]
+    assert len(err) == 1 + 20
+    assert "| line 20\n" not in captured.err and "| line 21\n" in captured.err
+    assert all(" " <= c <= "~" for c in captured.err.replace("\n", ""))
+    assert err[-1].startswith("probe_gate:   | \\u001b[2K\\u202eAPPROVE") and len(err[-1]) < 400
+    assert "APPROVE" not in captured.out.splitlines()

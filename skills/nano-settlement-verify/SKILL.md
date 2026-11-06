@@ -114,8 +114,20 @@ refused exits 7 and approves nothing, so a check that stopped comparing the paye
 unconfirmed block on the probe exits 2 (wait and ask again) - only when verify_cli.py printed its `{"settled": false, ...}` receipt; any other exit 2, such as Python failing to open verify_cli.py, exits 7, so a caller retrying on 2 cannot loop on a broken install - and an unreadable node 4. `--not-after WHEN` is the order's expiry,
 passed to both calls exactly as verify_cli.py takes it (5 late, 6 unknown time).
 
-Both calls are answered by one node: with an RPC_URL list (or one in `NANO_RPC_URL`) the probe may fail over, and
-the real check then goes only to the node that refused the probe; if that cannot be pinned, it exits 7.
+Both calls go to one URL: with an RPC_URL list (or one in `NANO_RPC_URL`) the probe may fail over, and
+the real check then goes only to the URL that refused the probe; if that cannot be pinned, it exits 7. One URL is
+not always one node: a pooled endpoint such as rpc.nano.to may answer the two calls from different backends, and a
+lagging backend (not yet, or no such block, on one call) makes them disagree, which exits 7 with nothing wrong in
+the check. Re-run, or pin RPC_URL to a single node, before reading 7 as a broken check. The gate makes every
+request twice (probe, then real check), doubling the load and the rate-limit cost on the node.
+
+Act on the exit code, or on a whole line that is exactly `APPROVE` (`^APPROVE$`), never on a substring search of
+the output: echoed verdicts carry node-supplied fields (a mismatch's `got`), which can contain the word APPROVE
+inside a quoted line on any exit.
+
+Each verify_cli.py call is killed after 120 s (`NANO_PROBE_GATE_TIMEOUT`, in seconds, overrides it) and then reads
+as a crash: exit 7, nothing approved. A call that exits without a verdict has its last 20 stderr lines written,
+ASCII-escaped and cut, to the gate's stderr.
 
 It does not prove the node is honest. Only the recipient is varied, so a node that answers the true amount and
 payee for this block (a stub written for this payment, or a reply about another block that paid the same amount to
