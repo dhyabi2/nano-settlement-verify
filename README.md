@@ -309,8 +309,15 @@ reference client sets to the time of signing plus `maxTimeoutSeconds`.) Nor does
 for every quote bind the payer or stop a late send. What it gives you is attribution: a payment
 to that `payTo` is known to belong to that quote, so a send that arrives after the quote's
 window is still that quote's money, to be served or credited as above, not a stranger's.
-pursekeeper reports Subnano's door as built that way, a new `payTo` per GET and sixty seconds;
-that is their report, not something we have measured. Checked after the fact, `not_after` can
+pursekeeper reports Subnano's door as built that way, a new `payTo` per GET, and quotes
+Subnano's own pages for the window: five minutes ("New Nano allocations and USDC quotes last five
+minutes for every anchor", subnano.me/llms.txt), with `maxTimeoutSeconds` 300 in a quote read on
+2026-11-06 (an earlier quote, from 2026-10-08, carried 60). The window is a duration with no start
+time on the wire: the 402 has no expires-at field. What makes it bind is the house's own rule, as
+quoted from docs.subnano.ai/v1/api/payments.md: "Once an empty expired checkout address has been
+retired, new sends receive no automatic fulfillment or refund", and an expired unbroadcast quote
+"can be re-quoted under the same spending policy". These are pursekeeper's quotes; neither page
+answers from where we run, so we have not read them ourselves. Checked after the fact, `not_after` can
 only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
 deadline.
 
