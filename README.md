@@ -316,8 +316,8 @@ minutes for every anchor", subnano.me/llms.txt), with `maxTimeoutSeconds` 300 in
 time on the wire: the 402 has no expires-at field. What makes it bind is the house's own rule, as
 quoted from docs.subnano.ai/v1/api/payments.md: "Once an empty expired checkout address has been
 retired, new sends receive no automatic fulfillment or refund", and an expired unbroadcast quote
-"can be re-quoted under the same spending policy". These are pursekeeper's quotes; neither page
-answers from where we run, so we have not read them ourselves. Checked after the fact, `not_after` can
+"can be re-quoted under the same spending policy". These are pursekeeper's quotes, not something
+we have measured: neither page answers from where we run. Checked after the fact, `not_after` can
 only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
 deadline.
 
