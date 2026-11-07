@@ -388,8 +388,12 @@ Carrying the previous block's hash adds nothing by itself, because `previous` is
 inside the signed contents. What the previous block's full contents add is the amount: a
 state block only states the new balance, so the amount sent is the previous balance minus
 this one. Given those contents, the check also confirms they hash to this block's
-`previous` before it reports the change (`amount_raw`, and `balance_change_raw`, negative
-for a send).
+`previous` and are a state block of the same account (`previous_same_account`) before it
+reports the change (`amount_raw`, and `balance_change_raw`, negative for a send). With an
+invalid signature, a mismatched previous, another account's previous, or a legacy (non-state)
+previous block, both are null: it fails closed rather than report an amount nobody signed.
+Small-order public keys and R points (such as the identity key `nano_11a1...6iq5p4i8`, with
+which a forged signature would verify any contents) and non-canonical encodings are refused.
 
 ```
 python3 nano_offline.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F
@@ -520,7 +524,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-868 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+880 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

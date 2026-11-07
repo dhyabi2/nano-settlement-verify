@@ -13,7 +13,10 @@ What this proves, with no node asked:
    is the AMOUNT: a state block only states the new balance, so the amount sent
    is the previous block's balance minus this one. Given the previous block's
    contents as well, `offline_check` verifies hash(previous contents) ==
-   contents.previous and only then reports the balance change.
+   contents.previous, that the previous block belongs to the same account
+   (state blocks name their account; a legacy previous names none and is
+   refused - fail closed), and that this block's signature is valid. Only then
+   does it report the balance change; otherwise amount_raw is null.
 
 What this does not prove: that the block is on the ledger, or confirmed
 (cemented). A key holder can sign a block that never lands, or one that loses a
@@ -24,7 +27,9 @@ fork. Inclusion still needs nodes - see nano_quorum.
 fetches block_info (json_block=true) for the block and its previous from one
 node (default https://rpc.nano.to) and prints `offline_check` on the fetched
 contents as JSON. The node is only used to fetch bytes; the check runs on them.
-Exit 0 when the signature is valid and the previous block does not mismatch.
+Exit 0 when the signature is valid and the previous block, if any, matches
+and belongs to the same account. A previous block that is not a state block
+(legacy chains) is refused rather than guessed at: fail closed.
 """
 from __future__ import annotations
 
@@ -39,6 +44,8 @@ from nano_settlement_verify import post_json, public_key_from_address
 DEFAULT_RPC = "https://rpc.nano.to"
 NOTE = "offline: proves the account signed these contents; inclusion on the ledger still needs nodes (nano_quorum)"
 _HEX128 = re.compile(r"[0-9A-Fa-f]{128}")
+_DEC = re.compile(r"[0-9]{1,39}")  # ASCII digits only; 2**128-1 has 39
+_MAX_RAW = 2**128 - 1
 
 # --- ed25519 verify (RFC 8032 section 5.1, extended coordinates), hash = blake2b-512 ---
 P = 2**255 - 19
@@ -90,10 +97,23 @@ _GY = 4 * pow(5, P - 2, P) % P
 _BASE = _decode(_GY.to_bytes(32, "little"))
 
 
+_IDENTITY = (0, 1, 1, 0)
+
+
+def _small_order(pt) -> bool:
+    """8*pt is the identity: the identity itself or one of the 7 other torsion points."""
+    return _equal(_mul(8, pt), _IDENTITY)
+
+
 def _ed25519_blake2b_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
     A, R = _decode(public_key), _decode(signature[:32])
     s = int.from_bytes(signature[32:], "little")
     if A is None or R is None or s >= L:  # non-canonical S is rejected, not reduced
+        return False
+    # A small-order key (e.g. the identity, account nano_11a1...) or R lets a
+    # forged signature verify for any contents: refuse both. Non-canonical
+    # encodings (y >= p, x = 0 with the sign bit set) are refused by _decode.
+    if _small_order(A) or _small_order(R):
         return False
     h = int.from_bytes(hashlib.blake2b(signature[:32] + public_key + message, digest_size=64).digest(), "little") % L
     return _equal(_mul(s, _BASE), _add(R, _mul(h, A)))
@@ -125,11 +145,20 @@ def verify_block_signature(contents: object, signature_hex: object, account: str
 
 def _balance(contents: dict) -> int | None:
     raw = contents.get("balance")
-    if contents.get("type") == "state" and isinstance(raw, str) and raw.isdigit():
-        return int(raw)
+    if contents.get("type") == "state" and isinstance(raw, str) and _DEC.fullmatch(raw):
+        value = int(raw)
+        return value if value <= _MAX_RAW else None
     if contents.get("type") == "send" and isinstance(raw, str) and re.fullmatch(r"[0-9A-Fa-f]{32}", raw):
         return int(raw, 16)
     return None
+
+
+def _account_key(contents: object, account: str | None = None) -> bytes | None:
+    """The public key a block belongs to: named by a state block, else `account=`, else None."""
+    if not isinstance(contents, dict):
+        return None
+    named = contents.get("account") if contents.get("type") == "state" else account
+    return public_key_from_address(named)
 
 
 def offline_check(contents: object, signature_hex: object, previous_contents: object = None,
@@ -138,20 +167,29 @@ def offline_check(contents: object, signature_hex: object, previous_contents: ob
 
     previous_matches: None when no previous block was given; True when its
     recomputed hash equals contents["previous"]; False otherwise.
+    previous_same_account: None when no previous block was given; True only
+    when the previous block is a state block of the same account (a legacy
+    previous names no account and is refused: fail closed).
     balance_change_raw: this balance minus the previous balance, only when
-    previous_matches is True - negative for a send, positive for a receive.
+    signature_valid, previous_matches and previous_same_account are all True -
+    negative for a send, positive for a receive.
     amount_raw: the size of that change (always >= 0), or None.
     Neither says the block is on the ledger: see NOTE.
     """
     out = {"block_hash": block_hash_of(contents),
            "signature_valid": verify_block_signature(contents, signature_hex, account),
-           "previous_matches": None, "balance_change_raw": None, "amount_raw": None, "note": NOTE}
+           "previous_matches": None, "previous_same_account": None,
+           "balance_change_raw": None, "amount_raw": None, "note": NOTE}
     if previous_contents is None:
         return out
     prev_hash = block_hash_of(previous_contents)
     out["previous_matches"] = bool(prev_hash and isinstance(contents, dict)
                                    and str(contents.get("previous", "")).upper() == prev_hash)
-    if out["previous_matches"]:
+    own = _account_key(contents, account)
+    before_key = _account_key(previous_contents) if isinstance(previous_contents, dict) \
+        and previous_contents.get("type") == "state" else None
+    out["previous_same_account"] = bool(own is not None and before_key is not None and own == before_key)
+    if out["signature_valid"] and out["previous_matches"] and out["previous_same_account"]:
         now, before = _balance(contents), _balance(previous_contents)
         if now is not None and before is not None:
             out["balance_change_raw"] = now - before
@@ -178,7 +216,8 @@ def main(argv: list[str]) -> int:
     result = offline_check(contents, contents.get("signature"), prev_contents)
     result["requested_hash_matches"] = result["block_hash"] == block_hash
     print(json.dumps(result, indent=2))
-    ok = result["signature_valid"] and result["previous_matches"] is not False and result["requested_hash_matches"]
+    ok = (result["signature_valid"] and result["previous_matches"] is not False
+          and result["previous_same_account"] is not False and result["requested_hash_matches"])
     return 0 if ok else 1
 
 

@@ -112,3 +112,96 @@ def test_cli_exit_codes(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["amount_raw"] == 500000000000000000000000000
     replies[H]["contents"]["balance"] = "1"
     assert off.main([H]) == 1
+
+
+# --- break-review fixes: small-order keys, cross-account previous, unsigned amounts, balance parsing ---
+
+import hashlib
+
+_ALPHA = "13456789abcdefghijkmnopqrstuwxyz"
+
+
+def _address(key: bytes) -> str:
+    def b32(n, chars):
+        return "".join(_ALPHA[(n >> (5 * i)) & 31] for i in reversed(range(chars)))
+    check = int.from_bytes(hashlib.blake2b(key, digest_size=5).digest()[::-1], "big")
+    return "nano_" + b32(int.from_bytes(key, "big"), 52) + b32(check, 8)
+
+
+def _encode(pt) -> bytes:
+    x, y, z, _ = pt
+    zi = pow(z, off.P - 2, off.P)
+    x, y = x * zi % off.P, y * zi % off.P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _h(*parts) -> int:
+    return int.from_bytes(hashlib.blake2b(b"".join(parts), digest_size=64).digest(), "little")
+
+
+def _keypair(seed: bytes):
+    d = hashlib.blake2b(seed, digest_size=64).digest()
+    a = int.from_bytes(d[:32], "little")
+    a = (a & ((1 << 254) - 8)) | (1 << 254)
+    return a, d[32:], _encode(off._mul(a, off._BASE))
+
+
+def _sign(seed: bytes, contents: dict) -> str:
+    a, prefix, pub = _keypair(seed)
+    msg = bytes.fromhex(off.block_hash_of(contents))
+    r = _h(prefix, msg) % off.L
+    R = _encode(off._mul(r, off._BASE))
+    s = (r + _h(R, pub, msg) % off.L * a) % off.L
+    return (R + s.to_bytes(32, "little")).hex().upper()
+
+
+def _state(seed: bytes, previous: str, balance: int) -> dict:
+    return {"type": "state", "account": _address(_keypair(seed)[2]), "previous": previous,
+            "representative": C["representative"], "balance": str(balance), "link": "00" * 32}
+
+
+def test_identity_key_forgery_is_rejected():
+    identity_account = _address((1).to_bytes(32, "little"))  # the identity point, y = 1
+    assert identity_account.startswith("nano_11a1")
+    forged = dict(C, account=identity_account)
+    assert off.verify_block_signature(forged, "01" + "00" * 63) is False
+    assert off.verify_block_signature(dict(forged, balance="1"), "01" + "00" * 63) is False
+
+
+def test_all_small_order_points_are_flagged():
+    # the 8-torsion: points P with 8*P = identity; none of them may serve as A or R
+    torsion = [off._decode((1).to_bytes(32, "little")), off._decode((off.P - 1).to_bytes(32, "little"))]
+    assert all(t is not None and off._small_order(t) for t in torsion)
+    assert not off._small_order(off._BASE)
+    assert not off._small_order(off._decode(bytes.fromhex(SIG)[:32]))
+
+
+def test_previous_from_another_account_gives_no_amount():
+    seed = b"test-only key, holds nothing"
+    block = _state(seed, H, 1)  # signed by our key, but `previous` is another account's block (C)
+    sig = _sign(seed, block)
+    assert off.verify_block_signature(block, sig) is True
+    out = off.offline_check(block, sig, C)
+    assert out["previous_matches"] is True
+    assert out["amount_raw"] is None and out["balance_change_raw"] is None
+    assert out["previous_same_account"] is False
+    # control: the same key's own previous block does give an amount
+    first = _state(seed, "11" * 32, 10)
+    second = _state(seed, off.block_hash_of(first), 4)
+    out = off.offline_check(second, _sign(seed, second), first)
+    assert out["previous_same_account"] is True and out["balance_change_raw"] == -6 and out["amount_raw"] == 6
+
+
+def test_no_amount_without_a_valid_signature():
+    out = off.offline_check(dict(C, balance="0"), SIG, PC)  # balance edited: signature no longer valid
+    assert out["signature_valid"] is False and out["previous_matches"] is True
+    assert out["amount_raw"] is None and out["balance_change_raw"] is None
+
+
+@pytest.mark.parametrize("raw", ["５", "٥", "9" * 40, str(2**128), "", "+5", " 5"])
+def test_balance_parsing_is_ascii_and_bounded(raw):
+    assert off._balance({"type": "state", "balance": raw}) is None
+
+
+def test_balance_parsing_accepts_the_max():
+    assert off._balance({"type": "state", "balance": str(2**128 - 1)}) == 2**128 - 1
