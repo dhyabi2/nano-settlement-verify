@@ -288,10 +288,12 @@ money and serve nothing. In order of preference:
 2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
    something that cannot simply be served twice (a one-time asset, a metered run): record the
    hash and let the payer re-present it. This library only reads, so it has nowhere to keep
-   that credit; your own store has to. pursekeeper reports that its x402 door does this, in the
-   hand-back paragraph of pursekeeper.dev/api: the price is kept as credit on the hash and the
-   payer gets a represent token to present with the same payload. That is their description of
-   their door; we have not tested it.
+   that credit; your own store has to. pursekeeper reports a credit on the hash at its x402
+   door, but for a different case than lateness: a block the door broadcast that did not
+   confirm within eight seconds is held as credit on its hash for thirty days and served when
+   the payer re-presents the same payload with the represent token that 402 carried (the
+   hand-back paragraph of pursekeeper.dev/api). That is their description of their door; we
+   have not tested it.
 3. **Send it back** - the last resort. It costs you a signed send block and its work, from
    your own wallet; this library sends nothing.
 
@@ -320,10 +322,13 @@ retired, new sends receive no automatic fulfillment or refund", and an expired u
 we have measured: neither page answers from where we run.
 
 pursekeeper reports its own x402 door as the other case. Its 402 carries `maxTimeoutSeconds` 60
-and nothing else about time: a duration with no start. A block that lands after sixty seconds is
-not refused; the price is kept as credit on that block hash, and pursekeeper points to the
-hand-back paragraph on pursekeeper.dev/api as the source. So on that door the window is echoed
-and does not bind. Unlike Subnano's, its `payTo` is fixed, one address for every quote, so there
+and nothing else about time: a duration with no start. pursekeeper reports that its door
+measures no lateness: a block presented after sixty seconds is verified and served like any
+other. Separately, a block the door broadcast that did not confirm within eight seconds is kept
+as credit on its hash and served when the payer re-presents the same payload with the represent
+token from that 402. pursekeeper points to the hand-back paragraph on pursekeeper.dev/api and the
+live 402 on /v1/echo as the source (read by pursekeeper on 2026-11-07). So on that door the
+window is echoed and does not bind. Unlike Subnano's, its `payTo` is fixed, one address for every quote, so there
 is no checkout address to expire; this too is pursekeeper's report, not something we have
 measured, and that page does not answer from where we run either.
 
