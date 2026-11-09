@@ -211,6 +211,7 @@ def test_cli_late_exits_5():
     assert out["verdict"] == "late"
     assert out["seen_at"] == SEEN and out["not_after"] == SEEN - 1
     assert "local_timestamp" in out["time_source"]
+    assert out["account"] == ACCOUNT and out["amount_raw"] == int(AMOUNT)
 
 
 def test_cli_at_the_deadline_exits_0():
@@ -223,6 +224,7 @@ def test_cli_unknown_time_exits_6():
     assert done.returncode == 6, done.stderr
     out = json.loads(done.stdout)
     assert out["verdict"] == "unknown_time" and out["seen_at"] is None
+    assert out["account"] == ACCOUNT and out["amount_raw"] == int(AMOUNT)
 
 
 def test_cli_an_unreadable_deadline_is_a_usage_error():

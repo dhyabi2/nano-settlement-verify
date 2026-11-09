@@ -86,8 +86,8 @@ One JSON object on stdout, and an exit code:
 | 2 | `{"settled": false, ...}` - the node has the block but has not confirmed it | wait a second and ask again |
 | 3 | `{"verdict": "mismatch"}`, `{"verdict": "no_such_block"}` or `{"verdict": "invalid_amount"}` - wrong amount, wrong payee, no such block, or an `EXPECT_RAW` that is not a whole number of raw | do not serve |
 | 4 | `{"verdict": "node_unreachable"}` - nothing was checked, including a reply that is not a JSON object (a proxy's `"error"`, a bare number) | retry or try another RPC; do NOT treat this as a bad payment. A detail of *the RPC URL contains '@'*, *must be http or https*, *port must be a number from 0 to 65535*, *has no host*, *contains a control character*, *host must be ASCII letters, digits, ...* or *could not be parsed* is a configuration error that retrying will not fix: correct the URL |
-| 5 | `{"verdict": "late", "seen_at": ..., "not_after": ...}` - right amount and account, seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
-| 6 | `{"verdict": "unknown_time", "seen_at": null, ...}` - settled, but the node reports no time for it | do not treat as on time; ask another node |
+| 5 | `{"verdict": "late", "seen_at": ..., "not_after": ..., "account": ...}` - right amount and account (named in `account`), seen after `--not-after` | do not serve the order; the money did arrive, so refund or re-quote |
+| 6 | `{"verdict": "unknown_time", "seen_at": null, "account": ..., ...}` - settled to that account, but the node reports no time for it | do not treat as on time; ask another node |
 | 64 | usage error, or `{"verdict": "invalid_not_after"}` | fix the command |
 
 Only a `send` block settles anything. A receive, open or change block is refused however well
@@ -102,4 +102,33 @@ amount per order so a block can match only one order.
 
 ## Source
 
-One file, Python standard library only: https://github.com/dhyabi2/nano-settlement-verify (MIT).
+Python standard library only - `nano_settlement_verify.py`, its command line `verify_cli.py` and `probe_gate.py`: https://github.com/dhyabi2/nano-settlement-verify (MIT).
+
+## Keep the refusal in the path: probe_gate.py
+
+`python3 probe_gate.py BLOCK_HASH EXPECT_RAW ACCOUNT [RPC_URL] [--not-after WHEN]` runs the same check twice:
+first with a recipient the block was not sent to, which must come back `mismatch` (exit 3) naming that probe
+account as `expected` and ACCOUNT as `got`, then with the real one. A probe mismatch naming any other `got` is not a refusal: the probe account itself or no account exits 7; a third account exits 3 (wrong recipient) only when the real check on the same node names that same account, 4 when the real check cannot read the node (exit 4 passes through), else 7. Any other exit 3 on the probe is not a refusal of the payee: a block
+the node does not have exits 3 (`no_such_block`, terminal like verify_cli.py: do not serve, asking again will not make it appear), invalid_amount or any other reply exits 7; a probe that comes back settled exits 7 too (always, unless its receipt says `"settled": true` with `account` the probe account and `amount_raw` EXPECT_RAW), unless the block really pays the probe account (say, a payment sent to the burn address and checked for a seller) and the real check on the same node refuses it as a payee mismatch naming that account, which exits 3 (wrong recipient). The same holds for a probe that pays the probe account but fails only on time: with `--not-after`, a late (5) or untimed (6) probe whose verdict names the probe account as its `account` exits 3 when the real check on the same node refuses it as paid to that account, and 7 otherwise (a 5 or 6 naming any other account, or none, is 7). A usage error exits 64. On the probe, verify_cli.py's `invalid_amount` (exit 3) and a crash (exit 1, no verdict) both read as 7: the gate cannot tell a bad `EXPECT_RAW` from a broken check there, so fix the amount before reading 7 as a broken check. A probe refused on the amount or the operation (checked before the payee, so an honest underpayment to the right payee stops there) is not a payee refusal either: the real check is then run on the same node, and the gate exits 3 (mismatch) when it refuses with the same mismatch, 7 when it does not. It prints `PROBE-REFUSED`, the real verdict and `APPROVE` (exit 0) only when both hold and the real check's receipt says `"settled": true` with `account` ACCOUNT and `amount_raw` EXPECT_RAW (and, with `--not-after WHEN`, `seen_at` a positive integer at or before WHEN, the caller's deadline, not the receipt's own `not_after`): an exit 0 with any other output exits 7. After a probe refused on the payee (which says the block is confirmed and pays EXPECT_RAW to ACCOUNT) the real check may otherwise only exit 4, or 5/6 naming ACCOUNT and EXPECT_RAW; not yet, no such block, a mismatch, a late verdict naming another account or a crash (exit 1) contradicts the probe and exits 7, and after a probe naming a third account anything but 3 for that account or 4 exits 7. A probe that was not
+refused exits 7 and approves nothing, so a check that stopped comparing the payee cannot pass a spend. An
+unconfirmed block on the probe exits 2 (wait and ask again) - only when verify_cli.py printed its `{"settled": false, ...}` receipt; any other exit 2, such as Python failing to open verify_cli.py, exits 7, so a caller retrying on 2 cannot loop on a broken install - and an unreadable node 4. `--not-after WHEN` is the order's expiry,
+passed to both calls exactly as verify_cli.py takes it (5 late, 6 unknown time).
+
+Both calls go to one URL: with an RPC_URL list (or one in `NANO_RPC_URL`) the probe may fail over, and
+the real check then goes only to the URL that refused the probe; if that cannot be pinned, it exits 7. One URL is
+not always one node: a pooled endpoint such as rpc.nano.to may answer the two calls from different backends, and a
+lagging backend (not yet, or no such block, on one call) makes them disagree, which exits 7 with nothing wrong in
+the check. Re-run, or pin RPC_URL to a single node, before reading 7 as a broken check. The gate makes every
+request twice (probe, then real check), doubling the load and the rate-limit cost on the node.
+
+Act on the exit code, or on a whole line that is exactly `APPROVE` (`^APPROVE$`), never on a substring search of
+the output: echoed verdicts carry node-supplied fields (a mismatch's `got`), which can contain the word APPROVE
+inside a quoted line on any exit.
+
+Each verify_cli.py call is killed after 120 s (`NANO_PROBE_GATE_TIMEOUT`, in seconds, at most 3600, overrides it) and then reads
+as a crash: exit 7, nothing approved. A call that exits without a verdict has its last 20 stderr lines written,
+ASCII-escaped and cut, to the gate's stderr.
+
+It does not prove the node is honest. Only the recipient is varied, so a node that answers the true amount and
+payee for this block (a stub written for this payment, or a reply about another block that paid the same amount to
+the same payee) passes both calls. For that, ask independent nodes and require agreement (`nano_quorum`).
