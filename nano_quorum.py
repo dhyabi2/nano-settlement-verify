@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -39,6 +40,7 @@ __all__ = [
     "Corroboration",
     "Disagreement",
     "NotCorroborated",
+    "Observation",
     "balance_corroborated",
     "distinct_endpoints",
     "post_json_failover",
@@ -59,7 +61,7 @@ class NotCorroborated(Exception):
     for, and XNO does not come back. Hold the call and ask again.
     """
 
-    def __init__(self, answered: int, agree: int, failures: dict) -> None:
+    def __init__(self, answered: int, agree: int, failures: dict, observations=()) -> None:
         detail = "; ".join(f"{url}: {why}" for url, why in failures.items())
         super().__init__(
             f"{answered} of {answered + len(failures)} endpoints answered, "
@@ -68,6 +70,9 @@ class NotCorroborated(Exception):
         self.answered = answered
         self.agree = agree
         self.failures = dict(failures)
+        # One `Observation` per endpoint asked, in the order asked. Empty when
+        # the caller is not `verify_corroborated` (failover, balances).
+        self.observations = tuple(observations)
 
 
 class Disagreement(Exception):
@@ -79,10 +84,64 @@ class Disagreement(Exception):
     here, so nothing is served.
     """
 
-    def __init__(self, answers: dict) -> None:
+    def __init__(self, answers: dict, observations=()) -> None:
         detail = "; ".join(f"{url}: {answer}" for url, answer in answers.items())
         super().__init__(f"endpoints disagree: {detail}")
         self.answers = dict(answers)
+        # One `Observation` per endpoint asked, when raised by `verify_corroborated`.
+        self.observations = tuple(observations)
+
+
+@dataclass(frozen=True)
+class Observation:
+    """What one endpoint said about the block, and when its answer was read.
+
+    `state` is one of:
+      "confirmed"   - the node has the block, confirmed, and it matches;
+      "unconfirmed" - the node has the block but has not confirmed it yet;
+      "not-seen"    - the node answered that it has no such block;
+      "unreadable"  - no answer could be read (refused, timeout, a body that is
+                      not a node reply); `detail` says what happened instead;
+      "mismatch"    - the node has it confirmed and it does not match.
+
+    "not-seen" and "unconfirmed" are kept apart on purpose: both leave the
+    receipt unsettled, but they are different facts about different nodes, and
+    a record that folds them loses which node said which and when.
+    `read_at` is UTC ISO-8601.
+    """
+
+    rpc_url: str
+    state: str
+    read_at: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "rpc_url": self.rpc_url,
+            "state": self.state,
+            "read_at": self.read_at,
+            "detail": self.detail,
+        }
+
+
+_STATE_OF_ANSWER = {
+    "settled": "confirmed",
+    "not-yet": "unconfirmed",
+    "not-seen": "not-seen",
+    "mismatch": "mismatch",
+}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(moment: datetime) -> str:
+    """`moment` as UTC ISO-8601 with a trailing Z; a naive datetime is taken as UTC."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    text = moment.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return text.replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -94,12 +153,17 @@ class Corroboration:
     answered did not get there - the block is not confirmed yet, or not enough
     of them have seen it - and, exactly as in `verify`, that is "not yet", not
     "no".
+
+    `observations` has one `Observation` per endpoint asked, in the order
+    asked: which node said what, and when. Endpoints after the quorum were not
+    asked and are not listed.
     """
 
     receipt: Receipt
     agreed: tuple[str, ...]
     answered: tuple[str, ...]
     failed: tuple[str, ...]
+    observations: tuple[Observation, ...] = ()
 
     def to_json(self) -> str:
         return json.dumps(
@@ -111,6 +175,7 @@ class Corroboration:
                 "agreed": list(self.agreed),
                 "answered": list(self.answered),
                 "failed": list(self.failed),
+                "observations": [seen.to_dict() for seen in self.observations],
             }
         )
 
@@ -228,6 +293,8 @@ def verify_corroborated(
     account: str,
     rpc_urls,
     agree: int = AGREE_DEFAULT,
+    *,
+    clock=None,
 ) -> Corroboration:
     """Prove a send settled, believing it only when `agree` endpoints concur.
 
@@ -236,7 +303,13 @@ def verify_corroborated(
     quorum is not called at all, and the list should be ordered by how much the
     caller trusts it. Endpoints that cannot be read are skipped, not retried.
 
-    Returns a `Corroboration`. Its receipt is settled only on agreement.
+    Returns a `Corroboration`. Its receipt is settled only on agreement. Its
+    `observations` name every endpoint asked, the state it reported, and the
+    UTC time its answer was read; `NotCorroborated` and `Disagreement` raised
+    here carry the same list, and a `Mismatch` raised here is given it as an
+    `observations` attribute. `clock`, if given, is a no-argument callable
+    returning a datetime (naive is read as UTC); it exists so tests can fix
+    `read_at`, and changes no decision.
 
     Raises:
       `Mismatch` - an endpoint has the block confirmed and says it paid a
@@ -255,32 +328,47 @@ def verify_corroborated(
         # expectation is the caller's bug, and no number of nodes repairs it.
         raise TypeError(f"expect_raw must be an int of raw, got {type(expect_raw).__name__}")
     endpoints = distinct_endpoints(rpc_urls, agree=agree)
+    now = _utc_now if clock is None else clock
 
     failures: dict[str, str] = {}
     answered: list[str] = []
     settled_by: dict[tuple, list[str]] = {}
     settled_receipt: dict[tuple, Receipt] = {}
+    observations: list[Observation] = []
 
     for rpc_url in endpoints:
         try:
             answer, payload = _answer(block_hash, expect_raw, account, rpc_url)
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
+            observations.append(
+                Observation(rpc_url, "unreadable", _iso_utc(now()), failures[rpc_url])
+            )
             continue
         answered.append(rpc_url)
+        observations.append(
+            Observation(
+                rpc_url,
+                _STATE_OF_ANSWER[answer[0]],
+                _iso_utc(now()),
+                f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch" else "",
+            )
+        )
         if answer[0] == "mismatch":
             # Fail closed, immediately. This endpoint has the block CONFIRMED
             # and reports it paid someone else or a different amount. Blocks do
             # not change after confirmation, so asking another node cannot make
             # this answer go away - it can only find a node that has not caught
             # up yet and read its silence as agreement.
+            payload.observations = tuple(observations)
             raise payload
         if answer[0] != "settled":
             continue
         if settled_by and answer not in settled_by:
             other = next(iter(settled_by))
             raise Disagreement(
-                {settled_by[other][0]: str(other), rpc_url: str(answer)}
+                {settled_by[other][0]: str(other), rpc_url: str(answer)},
+                observations=observations,
             )
         settled_by.setdefault(answer, []).append(rpc_url)
         settled_receipt[answer] = payload
@@ -290,6 +378,7 @@ def verify_corroborated(
                 agreed=tuple(settled_by[answer]),
                 answered=tuple(answered),
                 failed=tuple(failures),
+                observations=tuple(observations),
             )
 
     if len(answered) < agree:
@@ -297,16 +386,21 @@ def verify_corroborated(
         # "nobody could tell us" and "they told us it is not confirmed yet" are
         # different facts, and only the second one is safe to act on by waiting
         # a little and asking again.
-        raise NotCorroborated(answered=len(answered), agree=agree, failures=failures)
+        raise NotCorroborated(
+            answered=len(answered), agree=agree, failures=failures, observations=observations
+        )
 
     # Enough endpoints answered, but fewer than `agree` of them reported the
     # send confirmed - the usual reason being that confirmation has not reached
-    # all of them yet. As in `verify`, that is "not yet", not "no".
+    # all of them yet. As in `verify`, that is "not yet", not "no". Which node
+    # had not seen the block and which had seen it unconfirmed is in
+    # `observations`, each with the time it was read.
     return Corroboration(
         receipt=Receipt(settled=False, amount_raw=0, height=0, account=""),
         agreed=(),
         answered=tuple(answered),
         failed=tuple(failures),
+        observations=tuple(observations),
     )
 
 

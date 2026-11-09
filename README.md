@@ -475,6 +475,15 @@ The rules it holds to, each of which is a way of failing closed:
 - **It never sends.** `process` is deliberately absent; this reads, like the rest of the
   package.
 
+Every `Corroboration` also carries `observations`: one entry per endpoint asked, in the
+order asked, each with `rpc_url`, `state` and `read_at` (the UTC ISO-8601 time its answer
+was read), plus a `detail` string for an endpoint that could not be read. `state` is
+`confirmed`, `unconfirmed` (the node has the block but has not confirmed it), `not-seen`
+(the node has no such block) or `unreadable`. An unsettled receipt therefore says which
+node had not seen the block and which had seen it unconfirmed, rather than one "not
+settled". `to_json()` includes the list, and `NotCorroborated` and `Disagreement`
+raised by `verify_corroborated` carry it as `.observations`; no decision depends on it.
+
 Two more functions come with it:
 
 ```python
@@ -541,7 +550,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-880 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+885 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

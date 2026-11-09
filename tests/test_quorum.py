@@ -586,3 +586,70 @@ def test_every_endpoint_unreadable_is_not_corroborated_not_a_mismatch(monkeypatc
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], agree=2)
 
     assert caught.value.answered == 0
+
+
+# --- which node said which, and when ---------------------------------------------
+
+
+def ticking_clock(*moments):
+    """A clock for `verify_corroborated(clock=...)`: one fixed UTC moment per read."""
+    from datetime import datetime, timezone
+
+    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments]
+    return lambda: queue.pop(0)
+
+
+def test_an_unsettled_receipt_keeps_not_seen_apart_from_unconfirmed(monkeypatch):
+    """A has no such block, B has it but not confirmed. Both leave the receipt
+    unsettled, but they are different facts, and the record names who said which
+    and when rather than folding them into one "not settled"."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    assert out.receipt.settled is False
+    assert [(o.rpc_url, o.state, o.read_at) for o in out.observations] == [
+        (A, "not-seen", "2026-11-09T12:00:01.000Z"),
+        (B, "unconfirmed", "2026-11-09T12:00:02.000Z"),
+    ]
+
+
+def test_an_unreadable_node_is_listed_beside_the_two_that_settle(monkeypatch):
+    nodes(monkeypatch, {A: OSError("timed out"), B: send_block(), C: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2, 3))
+    assert out.receipt.settled is True
+    assert out.agreed == (B, C)
+    assert [(o.rpc_url, o.state) for o in out.observations] == [
+        (A, "unreadable"), (B, "confirmed"), (C, "confirmed"),
+    ]
+    assert "timed out" in out.observations[0].detail
+    assert out.observations[0].read_at == "2026-11-09T12:00:01.000Z"
+
+
+def test_the_json_record_carries_each_node_its_state_and_read_time(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    record = json.loads(out.to_json())
+    assert record["settled"] is False
+    assert record["observations"] == [o.to_dict() for o in out.observations]
+    assert record["observations"][0] == {
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z", "detail": "",
+    }
+    assert record["observations"][1]["state"] == "unconfirmed"
+
+
+def test_not_corroborated_names_the_node_that_answered_and_the_one_that_did_not(monkeypatch):
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block()})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    assert [(o.rpc_url, o.state) for o in caught.value.observations] == [
+        (A, "unreadable"), (B, "confirmed"),
+    ]
+
+
+def test_read_at_without_a_clock_is_utc_iso_8601(monkeypatch):
+    from datetime import datetime
+
+    nodes(monkeypatch, {A: send_block(confirmed="false"), B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    for seen in out.observations:
+        assert seen.read_at.endswith("Z")
+        assert datetime.fromisoformat(seen.read_at.replace("Z", "+00:00")).utcoffset().total_seconds() == 0
