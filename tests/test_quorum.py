@@ -9,6 +9,7 @@ a "no" - rather than about the happy path.
 """
 
 import json
+from collections.abc import Mapping
 
 import pytest
 
@@ -168,6 +169,205 @@ def test_two_nodes_that_confirm_different_heights_for_one_hash_disagree(monkeypa
     with pytest.raises(Disagreement) as caught:
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
     assert set(caught.value.answers) == {A, B}
+
+
+def test_a_disagreement_keeps_both_nodes_observations_not_just_the_refusal(monkeypatch):
+    """A dispute record needs what each node said, in full, and nothing served."""
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    error = caught.value
+    assert error.observations[A].height == 7 and error.observations[B].height == 9
+    assert error.observations[A].settled and error.observations[B].settled
+    assert error.observations[A].amount_raw == ONE_XNO
+    assert error.observations[A].account == PAYEE
+    record = json.loads(json.dumps(error.record()))
+    assert record["verdict"] == "disagreement"
+    assert record["served"] is None
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B]
+    assert [o["payload"]["height"] for o in record["observations"]] == [7, 9]
+    assert record["observations"][0]["payload"]["amount_raw"] == ONE_XNO
+    assert record["observations"][0]["answer"] == error.answers[A]
+
+
+def test_a_disagreement_message_and_answers_are_unchanged(monkeypatch):
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    b9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, B: b9}
+    assert str(caught.value) == f"endpoints disagree: {A}: {a7}; {B}: {b9}"
+    assert Disagreement({A: "x"}).observations == {}
+
+
+def test_a_disagreement_after_two_agreeing_nodes_keeps_every_node_with_its_own_receipt(
+    monkeypatch,
+):
+    """With agree=3, A and B agree and C contradicts: all three are on record.
+
+    Each receipt is told apart by `seen_at`, which is not part of the answer
+    compared, so the record shows whose receipt is attributed to whom.
+    """
+    heights = {A: 7, B: 7, C: 9}
+
+    def verify(block_hash, expect_raw, account, rpc_url):
+        return nano_settlement_verify.Receipt(
+            settled=True,
+            amount_raw=expect_raw,
+            height=heights[rpc_url],
+            account=account,
+            seen_at={A: 1, B: 2, C: 3}[rpc_url],
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+    error = caught.value
+    assert list(error.observations) == [A, B, C]
+    assert {url: r.seen_at for url, r in error.observations.items()} == {A: 1, B: 2, C: 3}
+    assert list(error.observed_answers) == [A, B, C]
+    assert error.observed_answers[A] == error.observed_answers[B] != error.observed_answers[C]
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B, C]
+    assert [o["payload"]["height"] for o in record["observations"]] == [7, 7, 9]
+    assert all(o["answer"] is not None for o in record["observations"])
+    assert record["served"] is None
+
+
+def test_a_balance_disagreement_after_two_agreeing_nodes_keeps_every_node(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO, 5), C: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B, C], agree=3)
+    assert caught.value.observations == {A: (ONE_XNO, 5), B: (ONE_XNO, 5), C: (ONE_XNO - 1, 5)}
+
+
+def test_a_disagreement_record_is_always_json_even_for_types_json_does_not_know():
+    """record() feeds a dispute log; it must never raise in json.dumps."""
+
+    class Opaque:
+        def __repr__(self):
+            return "Opaque()"
+
+    class BadRepr:
+        def __repr__(self):
+            raise RuntimeError("no")
+
+    from decimal import Decimal
+
+    error = Disagreement(
+        {A: "x", B: "y"},
+        observations={
+            A: {"blob": b"\x00\xff", "d": Decimal("1.5"), "o": Opaque(), 3: BadRepr()},
+            B: (float("nan"), float("inf"), {Opaque()}, 10**60, None, True),
+        },
+    )
+    text = json.dumps(error.record(), allow_nan=False)
+    record = json.loads(text)
+    a, b = (o["payload"] for o in record["observations"])
+    assert a == [
+        ["blob", repr(b"\x00\xff")],
+        ["d", "Decimal('1.5')"],
+        ["o", "Opaque()"],
+        [3, "<unrepresentable BadRepr>"],
+    ]
+    assert b == ["nan", "inf", ["Opaque()"], 10**60, None, True]
+    assert isinstance(b[3], int)
+    looped = []
+    looped.append(looped)
+    json.dumps(Disagreement({A: "x"}, observations={A: looped}).record(), allow_nan=False)
+
+
+def _three_receipts(monkeypatch, heights):
+    def verify(block_hash, expect_raw, account, rpc_url):
+        return nano_settlement_verify.Receipt(
+            settled=True, amount_raw=expect_raw, height=heights[rpc_url], account=account
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+
+
+def test_with_agree_3_a_disagreement_keeps_the_answers_and_message_it_always_had(monkeypatch):
+    """`answers` and the message name the first settled endpoint and the contradictor.
+
+    Callers written before observations existed read exactly two entries; the
+    agreeing B is recorded only in the new, additive attributes.
+    """
+    _three_receipts(monkeypatch, {A: 7, B: 7, C: 9})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    c9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, C: c9}
+    assert str(caught.value) == f"endpoints disagree: {A}: {a7}; {C}: {c9}"
+    assert list(caught.value.observations) == [A, B, C]
+    assert caught.value.observed_answers == {A: a7, B: a7, C: c9}
+    record = caught.value.record()
+    assert [(o["rpc_url"], o["answer"]) for o in record["observations"]] == [
+        (A, a7), (B, a7), (C, c9)
+    ]
+
+
+def test_with_agree_3_a_balance_disagreement_keeps_the_answers_it_always_had(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO, 5), C: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B, C], agree=3)
+    assert caught.value.answers == {A: str((ONE_XNO, 5)), C: str((ONE_XNO - 1, 5))}
+    assert str(caught.value) == (
+        f"endpoints disagree: {A}: {(ONE_XNO, 5)}; {C}: {(ONE_XNO - 1, 5)}"
+    )
+
+
+def test_a_disagreement_record_never_raises_on_caller_built_observations():
+    """Hostile or odd values are written, not raised: record() feeds a dispute log."""
+
+    class Hostile:
+        def __getattr__(self, name):
+            raise RuntimeError("no attribute for you")
+
+    deep = []
+    node = deep
+    for _ in range(5000):
+        node.append([])
+        node = node[0]
+    error = Disagreement(
+        {b"raw-url": "x", A: "y"},
+        observations={A: Hostile(), B: deep},
+    )
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    by_url = {o["rpc_url"]: o for o in record["observations"]}
+    assert set(by_url) == {A, B, repr(b"raw-url")}
+    assert by_url[A]["payload"].startswith("<") and "Hostile" in by_url[A]["payload"]
+    assert by_url[repr(b"raw-url")]["answer"] == "x"
+    assert record["served"] is None
+
+
+def test_a_disagreement_built_from_non_mappings_is_a_type_error():
+    """The one refusal is structural, a TypeError, before anything is recorded."""
+    with pytest.raises(TypeError, match="observations must be a mapping"):
+        Disagreement({A: "x"}, observations=[1, 2])
+    with pytest.raises(TypeError, match="answers must be a mapping"):
+        Disagreement([(A, "x")])
+    error = Disagreement({A: "x"})
+    error.observations = "not a mapping"
+    with pytest.raises(TypeError, match="observations must be a mapping"):
+        error.record()
+
+
+def test_a_disagreement_record_keeps_seen_at_and_the_callers_keys():
+    receipt = nano_settlement_verify.Receipt(
+        settled=True, amount_raw=ONE_XNO, height=7, account=PAYEE, seen_at=1700000000
+    )
+    error = Disagreement(
+        {A: "x", B: "y"},
+        observations={A: receipt, B: {1: "int key", "1": "str key", "k": "v"}},
+    )
+    a, b = (o["payload"] for o in json.loads(json.dumps(error.record()))["observations"])
+    assert a["seen_at"] == 1700000000 and a["not_after"] is None
+    assert a["amount_raw"] == ONE_XNO and a["height"] == 7 and a["account"] == PAYEE
+    assert b == [[1, "int key"], ["1", "str key"], ["k", "v"]]
+    plain = Disagreement({A: "x"}, observations={A: {"Rpc-Url": 1, "seen_at": 2}}).record()
+    assert plain["observations"][0]["payload"] == {"Rpc-Url": 1, "seen_at": 2}
 
 
 def test_a_disagreement_is_not_resolved_by_a_third_vote(monkeypatch):
@@ -346,6 +546,16 @@ def test_two_nodes_reporting_different_confirmed_balances_disagree(monkeypatch):
     nodes(monkeypatch, {A: info(ONE_XNO), B: info(ONE_XNO - 1)})
     with pytest.raises(Disagreement):
         balance_corroborated(HOLDER, [A, B])
+
+
+def test_a_balance_disagreement_keeps_both_figures(monkeypatch):
+    nodes(monkeypatch, {A: info(ONE_XNO, 5), B: info(ONE_XNO - 1, 5)})
+    with pytest.raises(Disagreement) as caught:
+        balance_corroborated(HOLDER, [A, B])
+    assert caught.value.observations == {A: (ONE_XNO, 5), B: (ONE_XNO - 1, 5)}
+    record = json.loads(json.dumps(caught.value.record()))
+    assert record["served"] is None
+    assert [o["payload"] for o in record["observations"]] == [[ONE_XNO, 5], [ONE_XNO - 1, 5]]
 
 
 def test_an_account_neither_node_has_seen_opened_is_a_balance_of_nothing(monkeypatch):
@@ -763,7 +973,7 @@ def test_every_state_written_is_in_the_pinned_vocabulary(monkeypatch):
     nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
     with pytest.raises(Disagreement) as caught:
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
-    seen += caught.value.observations
+    seen += caught.value.node_observations
 
     nodes(monkeypatch, {A: send_block(amount=ONE_XNO - 1)})
     with pytest.raises(Mismatch) as caught:
@@ -841,10 +1051,14 @@ def test_a_confirmed_answer_whose_contents_hash_to_another_block_is_a_disagreeme
         verify_corroborated(asked, ONE_XNO, HOLDER, [A, B], clock=ticking_clock(1, 2))
     assert caught.value.answers[B] == f"contents that hash to {other}"
     assert asked in caught.value.answers["requested"]
-    assert [(o.rpc_url, o.state) for o in caught.value.observations] == [
+    assert [(o.rpc_url, o.state) for o in caught.value.node_observations] == [
         (A, "confirmed"), (B, "mismatch"),
     ]
-    assert other in caught.value.observations[1].detail
+    assert other in caught.value.node_observations[1].detail
+    # main's #37 view of the same refusal: each endpoint that answered, with what it returned.
+    assert list(caught.value.observations) == [A, B]
+    assert caught.value.observations[B] is None
+    assert caught.value.observed_answers[B] == f"contents that hash to {other}"
 
 
 def test_two_nodes_agreeing_about_another_block_do_not_settle_the_one_asked_for(monkeypatch):
@@ -1114,3 +1328,435 @@ def test_redact_url_handles_leading_whitespace_and_a_scheme_relative_url():
     assert nano_quorum.redact_url("//u:p@node.example/rpc") == "//***@node.example/rpc"
     assert nano_quorum.redact_url("\thttps://tok@node.example") == "\thttps://***@node.example"
     assert nano_quorum.redact_url("//node.example/a@b") == "//node.example/a@b"
+
+
+def test_a_disagreement_record_is_bounded_on_shared_substructures():
+    """`a = [a, a]` forty times is 2**40 leaves as a tree; record() must not walk them all."""
+    import threading
+
+    shared = []
+    for _ in range(40):
+        shared = [shared, shared]
+    error = Disagreement({A: "x"}, observations={A: shared})
+    out = {}
+    worker = threading.Thread(
+        target=lambda: out.update(text=json.dumps(error.record(), allow_nan=False)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=20)
+    assert not worker.is_alive(), "record() did not finish on a shared structure"
+    assert "<omitted" in out["text"]
+    assert len(out["text"]) < 1_000_000
+
+
+def test_a_disagreement_record_writes_an_int_too_long_for_str_as_capped_hex():
+    """Python refuses str() of an int over 4300 digits; record() writes it as hex, capped."""
+    huge = 10**5000 + 7
+    record = Disagreement({A: "x"}, observations={A: {"amount": huge}}).record()
+    text = json.dumps(record, allow_nan=False)
+    written = json.loads(text)["observations"][0]["payload"]["amount"]
+    full = "<int %s>" % hex(huge)
+    assert written == "%s...<truncated int of %d chars>" % (full[:1_000], len(full))
+    assert full.startswith(written[:1_000])
+    assert Disagreement({A: "x"}, observations={A: ONE_XNO}).record()[
+        "observations"][0]["payload"] == ONE_XNO
+
+
+def test_a_disagreement_record_survives_a_key_whose_hash_starts_raising():
+    """A key that hashed at construction but raises now is written, not raised."""
+
+    class Key:
+        broken = False
+
+        def __hash__(self):
+            if Key.broken:
+                raise TypeError("rehash refused")
+            return 1
+
+        def __eq__(self, other):
+            if Key.broken:
+                raise TypeError("compare refused")
+            return self is other
+
+    key = Key()
+    error = Disagreement({key: "x", A: "y"}, observations={key: {"p": 1}, A: 2})
+    Key.broken = True
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    entries = record["observations"]
+    assert len(entries) == 2
+    assert "Key" in entries[0]["rpc_url"]
+    assert entries[0]["answer"] == "x" and entries[0]["payload"] == {"p": 1}
+    assert entries[1] == {"rpc_url": A, "answer": "y", "payload": 2}
+
+
+def test_a_disagreement_record_does_not_merge_distinct_keys_that_share_a_text():
+    """Two str-subclass keys the mapping keeps apart stay apart in the record."""
+
+    class Tagged(str):
+        def __new__(cls, text, tag):
+            made = super().__new__(cls, text)
+            made.tag = tag
+            return made
+
+        def __eq__(self, other):
+            return isinstance(other, Tagged) and (str(self), self.tag) == (str(other), other.tag)
+
+        def __hash__(self):
+            return hash((str(self), self.tag))
+
+        def __str__(self):
+            return "shouted " + str.__str__(self).upper()
+
+    first, second = Tagged("node", 1), Tagged("node", 2)
+    payload = {first: "one", second: "two"}
+    assert len(payload) == 2
+    record = Disagreement({A: "x"}, observations={A: payload}).record()
+    written = json.loads(json.dumps(record, allow_nan=False))["observations"][0]["payload"]
+    assert written == [["node", "one"], ["node", "two"]]
+    # Keys that do not collide stay an object, keyed by their own text.
+    lone = Disagreement({A: "x"}, observations={A: {first: "one"}}).record()
+    assert lone["observations"][0]["payload"] == {"node": "one"}
+
+
+def test_a_disagreement_record_names_every_endpoint_however_large_the_first_answer():
+    """One shared budget let the first endpoint's answer omit the second's url."""
+    big = [["leaf"] * 10 for _ in range(1500)]
+    error = Disagreement({A: big, B: "different"}, observations={A: big, B: {"amount": 1}})
+    entries = error.record()["observations"]
+    assert entries[1] == {"rpc_url": B, "answer": "different", "payload": {"amount": 1}}
+
+
+def test_a_disagreement_built_from_an_int_too_long_for_str_does_not_raise():
+    """str() of an int over 4300 digits raises ValueError; the message writes it as hex."""
+    huge = 10**5000 + 7
+    error = Disagreement({A: huge, huge: "y"}, observations={A: huge})
+    message = str(error)
+    full = "<int %s>" % hex(huge)
+    capped = "%s...<truncated int of %d chars>" % (full[:1_000], len(full))
+    assert f"{A}: {capped}" in message
+    assert f"{capped}: y" in message
+    assert error.answers[A] == huge
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert record["observations"][0]["answer"] == capped
+    assert str(Disagreement({A: "1 XNO", B: "2 XNO"})) == (
+        f"endpoints disagree: {A}: 1 XNO; {B}: 2 XNO"
+    )
+
+
+class _RehashRaises:
+    """Hashes once (when the caller's dict is built), raises on every later hash."""
+
+    def __init__(self):
+        self.hashed = False
+
+    def __hash__(self):
+        if self.hashed:
+            raise TypeError("rehash refused")
+        self.hashed = True
+        return 1
+
+    def __eq__(self, other):
+        return self is other
+
+
+@pytest.mark.parametrize("field", ["answers", "observations", "observed_answers"])
+def test_a_disagreement_keeps_a_dict_key_whose_hash_raises_when_asked_again(field):
+    """dict(value.items()) rehashed every key; dict(value) reuses the stored hash."""
+    key = _RehashRaises()
+    given = {key: "x", A: "y"}
+    arguments = {"answers": {A: "y"}}
+    arguments[field] = given
+    error = Disagreement(**arguments)
+    kept = getattr(error, field)
+    assert type(kept) is dict and kept == given and kept is not given
+    assert list(kept)[0] is key
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert len(record["observations"]) >= 1
+
+
+def test_a_disagreement_from_a_non_dict_mapping_with_an_unhashable_key_uses_a_placeholder():
+    """A mapping that is not a dict is rebuilt; a key that cannot be hashed is a placeholder."""
+    from collections.abc import Mapping
+
+    class Pairs(Mapping):
+        def __init__(self, pairs):
+            self._pairs = pairs
+
+        def __getitem__(self, key):
+            for candidate, value in self._pairs:
+                if candidate is key:
+                    return value
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter([key for key, _ in self._pairs])
+
+        def __len__(self):
+            return len(self._pairs)
+
+    error = Disagreement(Pairs([([1], "x"), (A, "y")]))
+    assert error.answers == {"<unhashable list #0>": "x", A: "y"}
+    assert "<unhashable list #0>: x" in str(error)
+
+
+# --- record() stays bounded once the budget is spent -------------------------
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda n: list(range(n)),
+        lambda n: tuple(range(n)),
+        lambda n: {str(i): i for i in range(n)},
+        lambda n: {i: i for i in range(n)},
+    ],
+    ids=["list", "tuple", "str-keyed dict", "int-keyed dict"],
+)
+def test_a_huge_container_is_recorded_with_one_omitted_marker_not_one_per_element(build):
+    """3,000,000 elements once wrote 3,000,000 `<omitted int>` markers (~51 MB of JSON).
+
+    Past the 10,000-value budget the container writes ONE marker naming how many
+    it left out, so the record stays small whatever the size of the value.
+    """
+    n = 3_000_000
+    value = build(n)
+    record = Disagreement({A: "x"}, observations={A: value}).record()
+    text = json.dumps(record, allow_nan=False)
+    assert len(text) < 1_000_000
+    assert text.count("<omitted") == 1
+    payload = record["observations"][0]["payload"]
+    if isinstance(payload, dict):
+        written = len(payload) - 1
+        assert payload["<omitted>"] == "%d of %d entries" % (n - written, n)
+    else:
+        written = len(payload) - 1
+        assert payload[-1] == "<omitted %d of %d items>" % (n - written, n)
+    assert 0 < written < 10_000
+    assert record["observations"][0]["rpc_url"] == A
+
+
+def test_a_long_string_is_recorded_capped_with_its_original_length():
+    long = "x" * 1_000_000
+    record = Disagreement({A: "x"}, observations={A: {"note": long, long: 1}}).record()
+    text = json.dumps(record, allow_nan=False)
+    assert len(text) < 10_000
+    payload = record["observations"][0]["payload"]
+    capped = "x" * 1_000 + "...<truncated str of 1000000 chars>"
+    assert payload == {"note": capped, capped: 1}
+    # Under the cap a string is written exactly as it is.
+    assert Disagreement({A: "x"}, observations={A: "y" * 1_000}).record()[
+        "observations"][0]["payload"] == "y" * 1_000
+
+
+def test_a_long_repr_is_recorded_capped():
+    record = Disagreement({A: "x"}, observations={A: b"\x00" * 1_000_000}).record()
+    payload = record["observations"][0]["payload"]
+    assert payload.startswith("b'\\x00")
+    assert payload.endswith("...<truncated repr of %d chars>" % len(repr(b"\x00" * 1_000_000)))
+    assert len(payload) < 1_100
+
+
+def test_bounding_the_record_leaves_answers_message_and_decisions_unchanged(monkeypatch):
+    """Only the record is bounded: answers, the message and the verdict are as before."""
+    huge = list(range(3_000_000))
+    long = "z" * 100_000
+    error = Disagreement({A: long, B: "b"}, observations={A: huge, B: long})
+    assert error.answers == {A: long, B: "b"}
+    cut = "z" * 1_000 + "...<truncated str of 100000 chars>"
+    assert str(error) == f"endpoints disagree: {A}: {cut}; {B}: b"
+    assert error.observations[A] is huge and error.observations[B] is long
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=9)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    b9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert caught.value.answers == {A: a7, B: b9}
+    assert [o["payload"]["height"] for o in caught.value.record()["observations"]] == [7, 9]
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=7)})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled
+
+
+def test_a_record_of_many_huge_ints_stays_within_its_documented_bound():
+    """Uncapped hex let 10**200000 repeated 10,000 times make a 1.66 GB record.
+
+    Each walk is bounded by about `_MAX_NODES * _MAX_STR_CHARS` characters
+    (plus a short truncation marker per value); a huge int is now cut like a
+    string, so this smaller case shows the per-value cap holds.
+    """
+    huge = 10**200_000
+    n = 200
+    error = Disagreement({A: "x", B: "y"}, observations={A: [huge] * n})
+    text = json.dumps(error.record(), allow_nan=False)
+    per_value = nano_quorum._MAX_STR_CHARS + len("...<truncated int of 1000000 chars>") + 4
+    assert len(text) < n * per_value + 1_000
+    written = json.loads(text)["observations"][0]["payload"]
+    assert len(written) == n
+    assert all(item.startswith("<int 0x") and "<truncated int of " in item for item in written)
+    assert len(str(error)) < 3 * per_value
+
+
+def test_a_capped_int_hex_matches_capping_the_whole_hex_text():
+    """`_int_hex` computes only the leading digits, but writes what `_cap` would."""
+    for value in (0, 7, -7, 16**990 - 1, 16**995, -(10**5000), 10**5000 + 7):
+        assert nano_quorum._int_hex(value) == nano_quorum._cap("<int %s>" % hex(value), "int")
+
+
+def test_a_verify_disagreement_records_endpoints_that_answered_not_seen_or_not_yet(monkeypatch):
+    """An endpoint that answered without settling is on record with None, not dropped."""
+    NotFound = nano_quorum.NotFound
+    D = "http://127.0.0.1:7074"
+
+    def verify(block_hash, expect_raw, account, rpc_url):
+        if rpc_url == A:
+            return nano_settlement_verify.Receipt(
+                settled=True, amount_raw=expect_raw, height=7, account=account
+            )
+        if rpc_url == B:
+            raise NotFound("not seen")
+        if rpc_url == C:
+            return nano_settlement_verify.Receipt(
+                settled=False, amount_raw=0, height=0, account=""
+            )
+        return nano_settlement_verify.Receipt(
+            settled=True, amount_raw=expect_raw, height=9, account=account
+        )
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", verify)
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C, D], agree=3)
+    error = caught.value
+    a7 = str(("settled", ONE_XNO, 7, PAYEE))
+    d9 = str(("settled", ONE_XNO, 9, PAYEE))
+    assert error.answers == {A: a7, D: d9}
+    assert list(error.observations) == [A, B, C, D]
+    assert error.observations[B] is None and error.observations[C] is None
+    assert error.observed_answers == {
+        A: a7, B: str(("not-seen",)), C: str(("not-yet",)), D: d9
+    }
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    assert [o["rpc_url"] for o in record["observations"]] == [A, B, C, D]
+
+
+class _IntBadInt(int):
+    def __int__(self):
+        raise RuntimeError("no int")
+
+    def __repr__(self):
+        return "i" * 10_000_000
+
+
+class _FloatBadFloat(float):
+    def __float__(self):
+        raise RuntimeError("no float")
+
+    def __repr__(self):
+        return "f" * 10_000_000
+
+
+class _MappingBadItems(Mapping):
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def items(self):
+        raise RuntimeError("no items")
+
+    def __repr__(self):
+        return "m" * 10_000_000
+
+
+class _ReprRaises:
+    def __repr__(self):
+        raise RuntimeError("no repr")
+
+
+@pytest.mark.parametrize(
+    "value", [_IntBadInt(5), _FloatBadFloat(1.5), _MappingBadItems()],
+    ids=["int-subclass", "float-subclass", "mapping-items-raises"],
+)
+def test_a_value_whose_inspection_raises_has_its_repr_cut(value):
+    """The fallback for a value that raises while it is written is cut like any repr."""
+    record = Disagreement({A: value, B: "b"}, observations={A: value}).record()
+    entry = record["observations"][0]
+    for written in (entry["answer"], entry["payload"]):
+        assert written.endswith("...<truncated repr of 10000000 chars>")
+        assert len(written) < 1_100
+    assert len(json.dumps(record, allow_nan=False)) < 5_000
+
+
+def test_a_repr_that_raises_in_the_fallback_is_a_short_placeholder():
+    written = nano_quorum._capped_repr(_ReprRaises())
+    assert written == "<unrepresentable _ReprRaises>"
+
+
+def test_a_long_string_answer_is_cut_in_the_message():
+    error = Disagreement({A: "q" * 10**7, B: "b"})
+    assert len(str(error)) < 1_200
+    assert "...<truncated str of 10000000 chars>" in str(error)
+
+
+def test_a_non_finite_float_subclass_with_a_huge_repr_is_capped():
+    """A NaN or infinite float subclass is written by its repr, cut like any other repr."""
+
+    class LoudFloat(float):
+        def __repr__(self):
+            return "N" * 5_000_000
+
+    cap = nano_quorum._MAX_STR_CHARS
+    for value in (LoudFloat("nan"), LoudFloat("inf"), LoudFloat("-inf")):
+        written = nano_quorum._jsonable(value)
+        assert written == "N" * cap + "...<truncated repr of 5000000 chars>"
+        record = json.dumps(nano_quorum._jsonable({"a": [value, value]}))
+        assert len(record) < 3 * (cap + 100)
+    # A finite one stays a number, and a plain NaN stays its repr text.
+    assert nano_quorum._jsonable(LoudFloat("1.5")) == 1.5
+    assert nano_quorum._jsonable(float("nan")) == "nan"
+
+
+def test_a_huge_type_name_is_capped_in_every_placeholder():
+    """`<cycle T>`, `<too deep T>`, `<omitted T>`, `<unhashable T #i>`, `<unprintable T>`
+    and `<unrepresentable T>` name the type cut to `_MAX_STR_CHARS`, so a 2 MB class name
+    cannot make a 2 MB record."""
+    cap = nano_quorum._MAX_STR_CHARS
+    name = "T" * 2_000_000
+    capped = "T" * cap + "...<truncated str of 2000000 chars>"
+    Big = type(name, (list,), {})
+
+    looped = Big()
+    looped.append(looped)
+    assert nano_quorum._jsonable(looped) == ["<cycle %s>" % capped]
+
+    deep = inner = Big()
+    for _ in range(nano_quorum._MAX_DEPTH + 2):
+        nxt = Big()
+        inner.append(nxt)
+        inner = nxt
+    record = json.dumps(nano_quorum._jsonable(deep))
+    assert ("<too deep %s>" % capped) in record and len(record) < 200 * (cap + 100)
+
+    walk = nano_quorum._Walk()
+    walk.left = 0
+    assert nano_quorum._jsonable(Big(), walk) == "<omitted %s>" % capped
+
+    assert nano_quorum._type_name(Big()) == capped
+    Unhashable = type(name, (), {"__hash__": None})
+    BadText = type(name, (), {"__format__": lambda self, spec: 1 / 0,
+                              "__repr__": lambda self: 1 / 0})
+    assert nano_quorum._text(BadText()) == "<unprintable %s>" % capped
+    written = nano_quorum._capped_repr(BadText())
+    assert written.startswith("<unrepresentable TTT") and len(written) < cap + 100
+    assert nano_quorum._repr(BadText()) == "<unrepresentable %s>" % capped
+
+    class Pairs:
+        def items(self):
+            return [(Unhashable(), "x")]
+    assert nano_quorum._mapping("answers", Pairs()) == {"<unhashable %s #0>" % capped: "x"}
+    with pytest.raises(TypeError) as error:
+        nano_quorum._mapping("answers", BadText())
+    assert len(str(error.value)) < cap + 200

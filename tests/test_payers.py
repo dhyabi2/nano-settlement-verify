@@ -517,6 +517,76 @@ def test_a_node_reporting_a_different_payer_set_is_a_disagreement(monkeypatch):
     assert any(PAYER_1 in answer for answer in caught.value.answers.values())
 
 
+def test_a_payer_disagreement_keeps_both_reports(monkeypatch):
+    nodes(monkeypatch, {
+        A: history(receive(PAYER_1, CALL_PRICE, height=2), open_block(PAYER_2, CALL_PRICE)),
+        B: history(open_block(PAYER_2, CALL_PRICE)),
+    })
+    with pytest.raises(nano_quorum.Disagreement) as caught:
+        payers_corroborated(PAYEE, [A, B])
+    observed = caught.value.observations
+    assert observed[A].distinct_payers == 2 and observed[B].distinct_payers == 1
+    record = json.loads(json.dumps(caught.value.record()))
+    assert record["served"] is None
+    assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 1]
+
+
+def test_a_payer_disagreement_keeps_every_report_before_the_contradiction(monkeypatch):
+    """With agree=3, A and B agree and C contradicts: all three are observed."""
+    both = history(receive(PAYER_1, CALL_PRICE, height=2), open_block(PAYER_2, CALL_PRICE))
+    nodes(monkeypatch, {A: both, B: both, C: history(open_block(PAYER_2, CALL_PRICE))})
+    with pytest.raises(nano_quorum.Disagreement) as caught:
+        payers_corroborated(PAYEE, [A, B, C], agree=3)
+    error = caught.value
+    assert list(error.answers) == [A, C]
+    assert list(error.observations) == [A, B, C]
+    assert error.observed_answers[A] == error.observed_answers[B] != error.observed_answers[C]
+    record = json.loads(json.dumps(error.record()))
+    assert [o["payload"]["distinct_payers"] for o in record["observations"]] == [2, 2, 1]
+
+
+def _report(endpoint, accounts):
+    payer_list = tuple(
+        nano_payers.Payer(
+            account=account, payments=1, received_raw=CALL_PRICE,
+            first_timestamp=1790594630, last_timestamp=1790594630,
+        )
+        for account in accounts
+    )
+    return PayerReport(
+        account=PAYEE, distinct_payers=len(payer_list), payments=len(payer_list),
+        received_raw=CALL_PRICE * len(payer_list), payers=payer_list, self_payments=0,
+        unconfirmed_payments=0, blocks_read=len(payer_list), complete=True,
+        asked=(endpoint,),
+    )
+
+
+def test_a_long_first_answer_does_not_hide_the_endpoint_that_disagreed():
+    """1700 payers from the first node must not use up the record of the second."""
+    first = _report(A, ["nano_payer%05d" % n for n in range(1700)])
+    other = _report(B, ["nano_payer%05d" % n for n in range(1699)] + ["nano_stranger"])
+    # Built exactly as payers_corroborated builds it.
+    error = nano_quorum.Disagreement(
+        {
+            report.asked[0]: sorted(payer.account for payer in report.payers)
+            for report in (first, other)
+        },
+        observations={report.asked[0]: report for report in (first, other)},
+    )
+    record = json.loads(json.dumps(error.record(), allow_nan=False))
+    entries = record["observations"]
+    assert [entry["rpc_url"] for entry in entries] == [A, B]
+    # The contradicting endpoint's answer is all there, the stranger included.
+    assert entries[1]["answer"] == sorted(p.account for p in other.payers)
+    assert "nano_stranger" in entries[1]["answer"]
+    assert entries[0]["answer"] == sorted(p.account for p in first.payers)
+    # And each payload still carries its report's figures.
+    for entry, report in zip(entries, (first, other)):
+        assert entry["payload"]["distinct_payers"] == report.distinct_payers
+        assert entry["payload"]["received_raw"] == report.received_raw
+        assert entry["payload"]["complete"] is True
+
+
 def test_the_same_endpoint_written_twice_is_one_witness(monkeypatch):
     nodes(monkeypatch, {A: history(open_block(PAYER_1, CALL_PRICE))})
     with pytest.raises(ValueError, match="distinct endpoint"):
@@ -859,7 +929,7 @@ def test_corroboration_witnesses_a_frontier_only_when_every_node_had_it(monkeypa
 # other_rails - what the recount did not count, named rather than dropped
 # --------------------------------------------------------------------------
 
-BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C2D4f71b54bdA02913"
 USDC_PAYEE = "0x1111111111111111111111111111111111111111"
 NOT_COUNTED = (
     "nano_payers reads the Nano ledger only; this entry's payments are on "
