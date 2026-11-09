@@ -1105,6 +1105,65 @@ def test_both_spellings_of_one_payer_chain_still_agree(monkeypatch):
     assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled is True
 
 
+# --- the per-node record names the payer chain each node reported ---------------------
+
+
+def test_a_payer_chain_disagreement_names_each_nodes_own_chain(monkeypatch):
+    """Same block facts, different `block_account`: each node's own Observation,
+    not only `answers`, says which chain that node reported, as a nano_ address."""
+    from nano_five_fields import _address_of_key
+
+    first = _address_of_key(bytes(range(1, 33)))
+    second = _address_of_key(bytes(range(2, 34)))
+    one = send_block()
+    one["block_account"] = first
+    two = send_block()
+    two["block_account"] = "xrb_" + second[len("nano_"):]
+    nodes(monkeypatch, {A: one, B: two})
+    with pytest.raises(Disagreement) as raised:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    seen = {o.rpc_url: o for o in raised.value.node_observations}
+    assert seen[A].state == seen[B].state == "confirmed"
+    assert seen[A].payer_account == first
+    assert seen[B].payer_account == second
+    assert seen[A].to_dict()["payer_account"] == first
+    assert seen[B].to_dict()["payer_account"] == second
+    assert raised.value.answers[A].endswith("on payer chain " + first)
+    assert raised.value.answers[B].endswith("on payer chain " + second)
+
+
+def test_a_corroboration_records_the_payer_chain_on_every_confirmed_node(monkeypatch):
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: reply, B: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert out.receipt.settled is True
+    payer = reply["block_account"]
+    assert [o.payer_account for o in out.observations] == [payer, payer]
+    record = json.loads(out.to_json())
+    assert [entry["payer_account"] for entry in record["observations"]] == [payer, payer]
+
+
+def test_a_reply_naming_no_payer_chain_records_none(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    assert out.receipt.settled is True
+    for seen in out.observations:
+        assert seen.payer_account == ""
+        assert set(seen.to_dict()) == {"rpc_url", "state", "read_at", "detail"}
+
+
+def test_only_a_confirmed_observation_names_a_payer_chain():
+    from nano_five_fields import _address_of_key
+
+    at = "2026-11-09T12:00:00.000Z"
+    payer = _address_of_key(bytes(range(1, 33)))
+    assert nano_quorum.Observation(A, "confirmed", at, payer_account=payer).payer_account == payer
+    with pytest.raises(ValueError, match="only a confirmed one does"):
+        nano_quorum.Observation(A, "not-seen", at, payer_account=payer)
+    with pytest.raises(ValueError, match="not a Nano address"):
+        nano_quorum.Observation(A, "confirmed", at, payer_account="nano_garbage")
+
+
 # --- two "wait" incidents a postmortem can tell apart ------------------------------------
 
 

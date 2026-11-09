@@ -701,6 +701,15 @@ class Observation:
     receipt unsettled, but they are different facts about different nodes, and
     a record that folds them loses which node said which and when.
     `read_at` is UTC ISO-8601.
+
+    `payer_account` is the payer chain (`block_account`) that a "confirmed"
+    node's reply named, as a nano_ address, so the per-node record says which
+    chain each node reported - two nodes on different chains raise
+    `Disagreement`, and this is how its `node_observations` tell them apart.
+    It is empty when the reply named no valid payer chain, and to_dict()
+    writes it as "payer_account" only when it is set, so a record with no
+    payer named is unchanged. Only a "confirmed" observation carries one, and
+    it must be a valid address.
     """
 
     rpc_url: str
@@ -709,6 +718,7 @@ class Observation:
     detail: str = ""
     error_kind: str = ""
     error_message: str = ""
+    payer_account: str = ""
 
     def __post_init__(self) -> None:
         if self.state not in NODE_STATES:
@@ -717,6 +727,10 @@ class Observation:
             raise ValueError("an unreadable observation must say what the error was")
         if self.state != "unreadable" and (self.error_kind or self.error_message):
             raise ValueError(f"a {self.state!r} observation is an answer and carries no error")
+        if self.payer_account and self.state != "confirmed":
+            raise ValueError(f"a {self.state!r} observation names no payer chain; only a confirmed one does")
+        if self.payer_account and not nano_settlement_verify.is_valid_account(self.payer_account):
+            raise ValueError(f"payer_account {self.payer_account!r} is not a Nano address")
 
     def to_dict(self) -> dict:
         out = {
@@ -727,6 +741,8 @@ class Observation:
         }
         if self.state == "unreadable":
             out["error"] = {"kind": self.error_kind, "message": _redact_text(self.error_message)}
+        if self.payer_account:
+            out["payer_account"] = self.payer_account
         return out
 
 
@@ -773,8 +789,8 @@ class Corroboration:
 
     Equality and hash() are over what was decided and what each node said -
     the receipt, the endpoint tuples, and each observation's endpoint, state,
-    detail and error - and NOT over each observation's `read_at`. Two calls
-    that got the same answers from the same nodes a second apart are equal and
+    detail, error and payer chain - and NOT over each observation's `read_at`.
+    Two calls that got the same answers from the same nodes a second apart are equal and
     hash alike, as they were before `read_at` existed; `to_json()` still
     differs between them, because the record says when each answer was read.
 
@@ -797,7 +813,10 @@ class Corroboration:
             self.answered,
             self.failed,
             tuple(
-                (seen.rpc_url, seen.state, seen.detail, seen.error_kind, seen.error_message)
+                (
+                    seen.rpc_url, seen.state, seen.detail, seen.error_kind,
+                    seen.error_message, seen.payer_account,
+                )
                 for seen in self.observations
             ),
         )
@@ -917,16 +936,21 @@ def post_json_failover(rpc_urls, payload: dict):
 
 
 def _payer_of(reply: object):
-    """The chain a block sits on (`block_account`), as a comparable key, or None.
+    """The chain a block sits on (`block_account`), as its nano_ address, or None.
 
-    Two spellings of one account (`nano_`/`xrb_`) are one payer. A reply that
+    The address is rebuilt from the account's public key, so two spellings of
+    one account (`nano_`/`xrb_`) are one payer and compare equal. A reply that
     names none, or names something that is not a valid address, has named no
     payer chain at all: it is None, and None is never compared - it neither
     makes two answers disagree nor helps one settle.
     """
     named = reply.get("block_account") if isinstance(reply, dict) else None
     key = nano_settlement_verify.public_key_from_address(named)
-    return key.hex().upper() if key is not None else None
+    if key is None:
+        return None
+    from nano_five_fields import _address_of_key  # here, not at the top: it imports this module
+
+    return _address_of_key(key)
 
 
 # `verify` as this module was imported with it. `_answer` reads the reply itself
@@ -1047,7 +1071,7 @@ def verify_corroborated(
     # One `Observation` per endpoint asked, unreadable ones included, with the
     # time each answer was read.
     observations: list[Observation] = []
-    named_payer = None  # (payer key, endpoint) of the first settled answer naming one
+    named_payer = None  # (payer address, endpoint) of the first settled answer naming one
 
     def disagreement(answers: dict, rpc_url: str, said: str, payload) -> Disagreement:
         # `answers` names the two sides; `observations` / `observed_answers`
@@ -1091,6 +1115,9 @@ def verify_corroborated(
                 f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch"
                 else f"answered for block {answer[1]}, not the requested {answer[2]}"
                 if answer[0] == "other-block" else "",
+                # The payer chain this node's reply named, so the per-node
+                # record says which chain each node reported.
+                payer_account=(answer[4] or "") if answer[0] == "settled" else "",
             )
         )
         if answer[0] == "other-block":
