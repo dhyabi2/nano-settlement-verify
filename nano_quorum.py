@@ -28,6 +28,7 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,12 +42,15 @@ __all__ = [
     "Disagreement",
     "NotCorroborated",
     "NODE_STATES",
+    "NODE_STATES_SHA256",
     "Observation",
     "RECEIPT_SCHEMA",
     "balance_corroborated",
     "distinct_endpoints",
+    "node_states_sha256",
     "post_json_failover",
     "verify_corroborated",
+    "verify_receipt_vocabulary",
 ]
 
 # How many endpoints must say the same thing before it is believed. Two is the
@@ -114,6 +118,69 @@ NODE_STATES = {
     ),
     "mismatch": "the node answered: it has the block confirmed, and it does not match the expected payment",
 }
+
+
+def node_states_sha256(table: dict) -> str:
+    """SHA-256 (lowercase hex) of a node-state table, as written into a receipt.
+
+    The canonical form, which is all a stranger needs to recompute it from a
+    stored receipt alone:
+
+        json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    encoded as UTF-8, then hashed with SHA-256. Keys are sorted, there is no
+    whitespace, and non-ASCII text is kept as UTF-8 rather than escaped.
+
+    The hash covers the inline "node_states" table of the record, nothing
+    else. A reader can therefore check that the table in a record was not
+    edited after it was written (recompute and compare with the record's
+    "node_states_sha256"), and that two records carrying the same "schema"
+    string mean the same vocabulary (their hashes are equal, and equal to the
+    value pinned for that schema in `NODE_STATES_SHA256`).
+    """
+    canonical = json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
+# or its meaning changes the hash, and the check below then refuses to import
+# the module until RECEIPT_SCHEMA is bumped and this value re-pinned with it -
+# so "nano_quorum.corroboration/2" cannot quietly come to mean something else.
+NODE_STATES_SHA256 = "f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77"
+
+
+def _check_vocabulary_pin(table: dict, pinned: str) -> None:
+    """Raise unless `table` hashes to `pinned`; run on `NODE_STATES` at import."""
+    actual = node_states_sha256(table)
+    if actual != pinned:
+        raise AssertionError(
+            f"NODE_STATES hashes to {actual}, but {RECEIPT_SCHEMA} pins {pinned}: "
+            "a changed vocabulary needs a new RECEIPT_SCHEMA and a new NODE_STATES_SHA256"
+        )
+
+
+_check_vocabulary_pin(NODE_STATES, NODE_STATES_SHA256)
+
+
+def verify_receipt_vocabulary(record) -> bool:
+    """Whether a stored receipt's state vocabulary is the one its schema names.
+
+    `record` is a `to_json()` string or the dict it parses to. True only when
+    the record's inline "node_states" table hashes (see `node_states_sha256`)
+    to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, and
+    its "schema" is `RECEIPT_SCHEMA`. False for an edited table, an edited or
+    missing hash, or a record of another schema. Nothing is raised for a
+    well-formed JSON object; a string that is not JSON raises ValueError.
+    """
+    if isinstance(record, (str, bytes)):
+        record = json.loads(record)
+    if not isinstance(record, dict) or record.get("schema") != RECEIPT_SCHEMA:
+        return False
+    table = record.get("node_states")
+    if not isinstance(table, dict):
+        return False
+    actual = node_states_sha256(table)
+    return actual == record.get("node_states_sha256") == NODE_STATES_SHA256
 
 
 @dataclass(frozen=True)
@@ -218,6 +285,7 @@ class Corroboration:
                 "failed": list(self.failed),
                 "observations": [seen.to_dict() for seen in self.observations],
                 "node_states": dict(NODE_STATES),
+                "node_states_sha256": NODE_STATES_SHA256,
             }
         )
 

@@ -673,6 +673,58 @@ def test_the_json_record_pins_the_node_state_vocabulary_and_its_schema(monkeypat
     assert record["node_states"]["not-seen"] != record["node_states"]["unreadable"]
 
 
+def test_the_json_record_carries_the_hash_of_its_node_state_table(monkeypatch):
+    """The record pins its own vocabulary by hash, and a stranger can recompute
+    it from the record alone with the documented canonical form."""
+    import hashlib
+
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    text = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json()
+    record = json.loads(text)
+    canonical = json.dumps(
+        record["node_states"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    assert record["node_states_sha256"] == hashlib.sha256(canonical).hexdigest()
+    assert record["node_states_sha256"] == nano_quorum.NODE_STATES_SHA256
+    assert nano_quorum.node_states_sha256(record["node_states"]) == record["node_states_sha256"]
+    assert nano_quorum.verify_receipt_vocabulary(text) is True
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+
+
+def test_editing_one_meaning_in_a_stored_record_is_detected(monkeypatch):
+    """Rewording a single state in a stored record, with or without re-hashing
+    it, no longer matches the vocabulary the schema string names."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+
+    edited = json.loads(json.dumps(record))
+    edited["node_states"]["not-seen"] = "the node gave no answer"
+    assert nano_quorum.verify_receipt_vocabulary(edited) is False
+
+    rehashed = json.loads(json.dumps(edited))
+    rehashed["node_states_sha256"] = nano_quorum.node_states_sha256(rehashed["node_states"])
+    assert nano_quorum.verify_receipt_vocabulary(rehashed) is False
+
+    missing = json.loads(json.dumps(record))
+    del missing["node_states_sha256"]
+    assert nano_quorum.verify_receipt_vocabulary(missing) is False
+
+    other_schema = json.loads(json.dumps(record))
+    other_schema["schema"] = "nano_quorum.corroboration/1"
+    assert nano_quorum.verify_receipt_vocabulary(other_schema) is False
+
+
+def test_a_vocabulary_that_disagrees_with_the_pinned_hash_is_refused():
+    """Changing NODE_STATES without bumping the schema must fail loudly, and the
+    pinned constant is the hash of the shipped table."""
+    assert nano_quorum.node_states_sha256(nano_quorum.NODE_STATES) == nano_quorum.NODE_STATES_SHA256
+    nano_quorum._check_vocabulary_pin(nano_quorum.NODE_STATES, nano_quorum.NODE_STATES_SHA256)
+    changed = dict(nano_quorum.NODE_STATES)
+    changed["unreadable"] = "the node said nothing"
+    with pytest.raises(AssertionError, match="RECEIPT_SCHEMA"):
+        nano_quorum._check_vocabulary_pin(changed, nano_quorum.NODE_STATES_SHA256)
+
+
 def test_an_unreadable_entry_carries_its_error_and_a_not_seen_entry_does_not(monkeypatch):
     """A node that errored is a different fact from a node that answered empty,
     and the record shows it: the errored one names its error, the other has none."""

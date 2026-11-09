@@ -488,7 +488,16 @@ raised by `verify_corroborated` carry it as `.observations`; no decision depends
 `unreadable` entry carries `"error": {"kind", "message"}` that no other state has. The
 record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/2"` and
 `"node_states"`, the full state vocabulary (`nano_quorum.NODE_STATES`) with a one-line
-meaning for each, so a stored receipt can be read without this code.
+meaning for each, so a stored receipt can be read without this code. Beside them it
+writes `"node_states_sha256"`: the SHA-256 hex of
+`json.dumps(node_states, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
+encoded as UTF-8. For schema `/2` that is
+`f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77`
+(`nano_quorum.NODE_STATES_SHA256`; the module refuses to import if the table and this
+value disagree). `nano_quorum.verify_receipt_vocabulary(record)` recomputes it from a
+stored record's own table and returns True only if it matches both the record's field
+and the pinned value, so an edited table, or a `/2` record with a different vocabulary,
+is caught.
 
 Two more functions come with it:
 
@@ -556,7 +565,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-889 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+892 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -597,7 +606,7 @@ acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
 `nano_independence`, the funding chain and the independent-payer grouping; for
-`nano_quorum`, agreement, contradiction, the duplicate endpoint and every way an
+`nano_quorum`, agreement, contradiction, the node-state vocabulary pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring
