@@ -653,3 +653,82 @@ def test_read_at_without_a_clock_is_utc_iso_8601(monkeypatch):
     for seen in out.observations:
         assert seen.read_at.endswith("Z")
         assert datetime.fromisoformat(seen.read_at.replace("Z", "+00:00")).utcoffset().total_seconds() == 0
+
+
+# --- the state vocabulary is pinned in the record itself ------------------------------
+
+
+def test_the_json_record_pins_the_node_state_vocabulary_and_its_schema(monkeypatch):
+    """A stored receipt must say what its states mean without the code beside it:
+    above all that "not-seen" is an answer and "unreadable" is the lack of one."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["schema"] == nano_quorum.RECEIPT_SCHEMA
+    assert record["node_states"] == nano_quorum.NODE_STATES
+    assert list(record["node_states"]) == [
+        "confirmed", "unconfirmed", "not-seen", "unreadable", "mismatch",
+    ]
+    assert "answered" in record["node_states"]["not-seen"]
+    assert "no answer" in record["node_states"]["unreadable"]
+    assert record["node_states"]["not-seen"] != record["node_states"]["unreadable"]
+
+
+def test_an_unreadable_entry_carries_its_error_and_a_not_seen_entry_does_not(monkeypatch):
+    """A node that errored is a different fact from a node that answered empty,
+    and the record shows it: the errored one names its error, the other has none."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"),
+        B: {"error": "Block not found"},
+        C: send_block(confirmed="false"),
+    })
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=2)
+    assert out.receipt.settled is False
+    unreadable, not_seen, unconfirmed = json.loads(out.to_json())["observations"]
+    assert unreadable["state"] == "unreadable"
+    assert unreadable["error"] == {"kind": "OSError", "message": "timed out"}
+    assert not_seen["state"] == "not-seen"
+    assert "error" not in not_seen
+    assert unconfirmed["state"] == "unconfirmed"
+    assert "error" not in unconfirmed
+
+
+def test_every_state_written_is_in_the_pinned_vocabulary(monkeypatch):
+    """Whatever path ends the call - settled, unsettled, NotCorroborated,
+    Disagreement, Mismatch - each observation's state is a NODE_STATES key."""
+    seen = []
+
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block(), C: send_block()})
+    seen += verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C]).observations
+
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    seen += verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).observations
+
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block()})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    seen += caught.value.observations
+
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    seen += caught.value.observations
+
+    nodes(monkeypatch, {A: send_block(amount=ONE_XNO - 1)})
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    seen += caught.value.observations
+
+    states = {o.state for o in seen}
+    assert states == set(nano_quorum.NODE_STATES)
+    for o in seen:
+        assert (o.state == "unreadable") == ("error" in o.to_dict())
+
+
+def test_an_observation_outside_the_vocabulary_or_an_errorless_unreadable_is_refused():
+    at = "2026-11-09T12:00:00.000Z"
+    with pytest.raises(ValueError, match="unknown node state"):
+        nano_quorum.Observation(A, "empty", at)
+    with pytest.raises(ValueError, match="must say what the error was"):
+        nano_quorum.Observation(A, "unreadable", at)
+    with pytest.raises(ValueError, match="carries no error"):
+        nano_quorum.Observation(A, "not-seen", at, error_kind="OSError")

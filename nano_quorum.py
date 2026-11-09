@@ -40,7 +40,9 @@ __all__ = [
     "Corroboration",
     "Disagreement",
     "NotCorroborated",
+    "NODE_STATES",
     "Observation",
+    "RECEIPT_SCHEMA",
     "balance_corroborated",
     "distinct_endpoints",
     "post_json_failover",
@@ -92,17 +94,40 @@ class Disagreement(Exception):
         self.observations = tuple(observations)
 
 
+# The version of the `Corroboration.to_json()` record. It is written into every
+# record as "schema", so a stored receipt says which vocabulary it was written in.
+RECEIPT_SCHEMA = "nano_quorum.corroboration/2"
+
+# The only states an `Observation` can carry, in a fixed order, each with what it
+# means. This exact mapping is written into every `to_json()` record as
+# "node_states", so a reader of a stored receipt needs no code to tell the states
+# apart - above all "not-seen" (the node ANSWERED, and has no such block) from
+# "unreadable" (the node gave NO answer about the block at all).
+NODE_STATES = {
+    "confirmed": "the node answered: it has the block, confirmed, and it matches the expected payment",
+    "unconfirmed": "the node answered: it has the block, but has not confirmed it yet",
+    "not-seen": "the node answered, and its answer is that it does not have the block",
+    "unreadable": (
+        "the node gave no answer about the block: it errored, timed out, refused, or "
+        "returned something that is not a node reply; 'error' says which. "
+        "This is not an empty answer"
+    ),
+    "mismatch": "the node answered: it has the block confirmed, and it does not match the expected payment",
+}
+
+
 @dataclass(frozen=True)
 class Observation:
     """What one endpoint said about the block, and when its answer was read.
 
-    `state` is one of:
-      "confirmed"   - the node has the block, confirmed, and it matches;
-      "unconfirmed" - the node has the block but has not confirmed it yet;
-      "not-seen"    - the node answered that it has no such block;
-      "unreadable"  - no answer could be read (refused, timeout, a body that is
-                      not a node reply); `detail` says what happened instead;
-      "mismatch"    - the node has it confirmed and it does not match.
+    `state` is one of the keys of `NODE_STATES`, which says what each means;
+    any other value is refused when the `Observation` is made.
+
+    "not-seen" and "unreadable" are different facts: a node that answered "no
+    such block" told us something; a node that errored told us nothing. An
+    "unreadable" observation therefore always carries `error_kind` (the
+    exception's type name) and `error_message`, and to_dict() writes them as
+    "error"; no other state carries them.
 
     "not-seen" and "unconfirmed" are kept apart on purpose: both leave the
     receipt unsettled, but they are different facts about different nodes, and
@@ -114,14 +139,27 @@ class Observation:
     state: str
     read_at: str
     detail: str = ""
+    error_kind: str = ""
+    error_message: str = ""
+
+    def __post_init__(self) -> None:
+        if self.state not in NODE_STATES:
+            raise ValueError(f"unknown node state {self.state!r}; expected one of {tuple(NODE_STATES)}")
+        if self.state == "unreadable" and not self.error_kind:
+            raise ValueError("an unreadable observation must say what the error was")
+        if self.state != "unreadable" and (self.error_kind or self.error_message):
+            raise ValueError(f"a {self.state!r} observation is an answer and carries no error")
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "rpc_url": self.rpc_url,
             "state": self.state,
             "read_at": self.read_at,
             "detail": self.detail,
         }
+        if self.state == "unreadable":
+            out["error"] = {"kind": self.error_kind, "message": self.error_message}
+        return out
 
 
 _STATE_OF_ANSWER = {
@@ -130,6 +168,8 @@ _STATE_OF_ANSWER = {
     "not-seen": "not-seen",
     "mismatch": "mismatch",
 }
+if not set(_STATE_OF_ANSWER.values()) <= set(NODE_STATES):
+    raise AssertionError("_STATE_OF_ANSWER names a state outside NODE_STATES")
 
 
 def _utc_now() -> datetime:
@@ -168,6 +208,7 @@ class Corroboration:
     def to_json(self) -> str:
         return json.dumps(
             {
+                "schema": RECEIPT_SCHEMA,
                 "settled": self.receipt.settled,
                 "amount_raw": self.receipt.amount_raw,
                 "height": self.receipt.height,
@@ -176,6 +217,7 @@ class Corroboration:
                 "answered": list(self.answered),
                 "failed": list(self.failed),
                 "observations": [seen.to_dict() for seen in self.observations],
+                "node_states": dict(NODE_STATES),
             }
         )
 
@@ -342,7 +384,14 @@ def verify_corroborated(
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
             observations.append(
-                Observation(rpc_url, "unreadable", _iso_utc(now()), failures[rpc_url])
+                Observation(
+                    rpc_url,
+                    "unreadable",
+                    _iso_utc(now()),
+                    failures[rpc_url],
+                    error_kind=type(error).__name__,
+                    error_message=str(error),
+                )
             )
             continue
         answered.append(rpc_url)
