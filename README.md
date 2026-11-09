@@ -390,6 +390,35 @@ nodes read - with any missing field answered `unknown` and never `settled`, see
 recompute, and `nano_five_fields.five_field_verdict` for callers who want it in code.
 `settled` there means work may start; it is not buyer acceptance.
 
+## Check a block offline (the payer's own signature)
+
+A Nano block carries a signature made by the account's own key over the block hash
+(ed25519, with blake2b-512 in place of sha512). The hash is recomputed from the block's
+contents, so given the contents and the signature anyone can check, without asking any
+node, that the holder of that account's key signed exactly those contents. Change one
+digit of the balance or the destination and the check fails.
+
+It does not prove the block is on the ledger or confirmed. A key holder can sign a block
+that never lands, or one that loses a fork. Inclusion still needs nodes: `nano_quorum`.
+
+Carrying the previous block's hash adds nothing by itself, because `previous` is already
+inside the signed contents. What the previous block's full contents add is the amount: a
+state block only states the new balance, so the amount sent is the previous balance minus
+this one. Given those contents, the check also confirms they hash to this block's
+`previous` and are a state block of the same account (`previous_same_account`) before it
+reports the change (`amount_raw`, and `balance_change_raw`, negative for a send). With an
+invalid signature, a mismatched previous, another account's previous, or a legacy (non-state)
+previous block, both are null: it fails closed rather than report an amount nobody signed.
+Small-order public keys and R points (such as the identity key `nano_11a1...6iq5p4i8`, with
+which a forged signature would verify any contents) and non-canonical encodings are refused.
+
+```
+python3 nano_offline.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F
+```
+
+The node (default rpc.nano.to) is only used to fetch the two blocks; the check runs on the
+fetched bytes. In code: `nano_offline.offline_check(contents, signature, previous_contents)`.
+
 ## One node's word, or two?
 
 `verify` above asks one node. That is the right default for a seller's request path, but
@@ -512,7 +541,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-844 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+880 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
