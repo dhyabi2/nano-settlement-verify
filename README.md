@@ -358,12 +358,21 @@ slack, or pass `not_after=None` to have no deadline.
   `node_states` table (each state with its meaning) and `node_states_sha256`.
 - `"schema"` (`"nano_quorum.corroboration/2"`) is now the first key of `to_json()`. Code that
   compared the record as text, or read keys by position, sees a different string.
-- `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`. The
-  `agreed`, `answered` and `failed` tuples in memory still hold the URLs as given.
+- `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
+  the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
+  `answered` and `failed` tuples and the observations in memory still hold the text as given.
+- `observations` is part of `Corroboration` equality. A `Corroboration` built by hand from
+  the four old fields (`receipt`, `agreed`, `answered`, `failed`) has no observations, so it
+  no longer compares equal to the result of a live call. `dataclasses.asdict()` of a
+  `Corroboration` gains an `observations` key.
 - A node that answers `confirmed` with block contents that hash to a different block than the
   one asked for now raises `Disagreement`. It used to count toward agreement when its amount,
-  payee and height matched. Two confirmed answers naming different payer chains
-  (`block_account`) also raise `Disagreement` now.
+  payee and height matched. Two confirmed answers that each name a valid, different payer
+  chain (`block_account`) also raise `Disagreement` now. An answer with no `block_account`,
+  or one that is not a valid address, names no payer chain and is compared as before. When
+  `nano_settlement_verify.verify` has been replaced (stubbed or wrapped), `verify_corroborated`
+  still calls it for each endpoint, as before; it then has no reply in hand, so neither of
+  these two checks is made.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -477,9 +486,11 @@ The rules it holds to, each of which is a way of failing closed:
 - **An answer about another block is not a witness.** When a node's confirmed reply has
   contents complete enough to recompute the block hash, and that hash is not the one you
   asked for, it raises `Disagreement` at once, even if amount, payee and height all match.
-  Two confirmed answers that name different payer chains (`block_account`) also disagree.
-  Contents too sparse to hash are not a hash checked; they are compared on amount, payee,
-  height and payer as before.
+  Two confirmed answers that each name a valid payer chain (`block_account`), and name
+  different ones, also disagree; an answer that names none, or names something that is not
+  an address, is not compared on it. Contents too sparse to hash are not a hash checked;
+  they are compared on amount, payee and height as before, and on the payer chain only
+  when both answers name one.
 - **One `Mismatch` refuses at once.** A node that has the block *confirmed* and says it
   paid a different amount or a different account is reporting something a later node
   cannot overturn — a confirmed block's contents are fixed by its hash.
@@ -497,9 +508,12 @@ The rules it holds to, each of which is a way of failing closed:
 
 Every `Corroboration` also carries `observations`: one entry per endpoint asked, in the
 order asked, each with `rpc_url`, `state` and `read_at` (the UTC ISO-8601 time its answer
-was read), plus a `detail` string for an endpoint that could not be read. `state` is
+was read), and a `detail` string: what went wrong for an endpoint that could not be read,
+the two figures or two block hashes for a `mismatch`, and empty otherwise. `state` is
 `confirmed`, `unconfirmed` (the node has the block but has not confirmed it), `not-seen`
-(the node has no such block) or `unreadable`. An unsettled receipt therefore says which
+(the node has no such block), `mismatch` (the node has the block confirmed and it is not
+the expected payment, or its contents hash to another block) or `unreadable`. An
+unsettled receipt therefore says which
 node had not seen the block and which had seen it unconfirmed, rather than one "not
 settled". `to_json()` includes the list, and `NotCorroborated` and `Disagreement`
 raised by `verify_corroborated` carry it as `.observations`; no decision depends on it.
@@ -598,7 +612,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-904 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+912 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

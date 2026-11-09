@@ -185,7 +185,13 @@ def verify_receipt_vocabulary(record) -> bool:
     return actual == record.get("node_states_sha256") == NODE_STATES_SHA256
 
 
-_CREDENTIALS = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@")
+# The userinfo of a URL: after `scheme://` or a scheme-relative `//`, up to the
+# last `@` before the path. Leading whitespace is allowed, as `_endpoint_key`
+# strips it before a URL is used.
+_CREDENTIALS = re.compile(r"^(\s*(?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/?#]*@")
+# The same userinfo inside free text - an error message that quotes the URL. A
+# URL ends at whitespace there, so the userinfo does too.
+_CREDENTIALS_IN_TEXT = re.compile(r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/?#\s]*@")
 
 
 def redact_url(rpc_url: object) -> object:
@@ -193,12 +199,25 @@ def redact_url(rpc_url: object) -> object:
 
     Used wherever a receipt writes an endpoint down, so a key carried in the
     URL is not stored or shown with the record. Only the userinfo is touched;
-    a key in the path or query string is not recognised. A non-string is
-    returned as it is.
+    a key in the path or query string is not recognised. A URL with leading
+    whitespace, or a scheme-relative `//user:pass@host`, is redacted too. A
+    non-string is returned as it is.
     """
     if not isinstance(rpc_url, str):
         return rpc_url
     return _CREDENTIALS.sub(r"\1***@", rpc_url)
+
+
+def _redact_text(text: object) -> object:
+    """`text` with the userinfo of every URL in it replaced by `***@`.
+
+    For the free text a record writes beside an endpoint - an error message or
+    a detail that may quote the URL it failed on. A non-string is returned as
+    it is.
+    """
+    if not isinstance(text, str):
+        return text
+    return _CREDENTIALS_IN_TEXT.sub(r"\1***@", text)
 
 
 @dataclass(frozen=True)
@@ -240,10 +259,10 @@ class Observation:
             "rpc_url": redact_url(self.rpc_url),
             "state": self.state,
             "read_at": self.read_at,
-            "detail": self.detail,
+            "detail": _redact_text(self.detail),
         }
         if self.state == "unreadable":
-            out["error"] = {"kind": self.error_kind, "message": self.error_message}
+            out["error"] = {"kind": self.error_kind, "message": _redact_text(self.error_message)}
         return out
 
 
@@ -296,8 +315,9 @@ class Corroboration:
     differs between them, because the record says when each answer was read.
 
     `to_json()` writes every endpoint URL with any credentials (`user:pass@`)
-    replaced by `***@`; the tuples and observations in memory keep the URL
-    exactly as given.
+    replaced by `***@`, and does the same to any URL quoted in an
+    observation's `detail` or error message; the tuples and observations in
+    memory keep the text exactly as given.
     """
 
     receipt: Receipt
@@ -432,26 +452,35 @@ def post_json_failover(rpc_urls, payload: dict):
     raise NotCorroborated(answered=0, agree=1, failures=failures)
 
 
-def _payer_of(reply: dict) -> str:
-    """The chain a block sits on (`block_account`), as a comparable key, or "".
+def _payer_of(reply: object):
+    """The chain a block sits on (`block_account`), as a comparable key, or None.
 
-    Two spellings of one account (`nano_`/`xrb_`) are one payer; a reply that
-    names none, or names something that is not an address, keeps its text.
+    Two spellings of one account (`nano_`/`xrb_`) are one payer. A reply that
+    names none, or names something that is not a valid address, has named no
+    payer chain at all: it is None, and None is never compared - it neither
+    makes two answers disagree nor helps one settle.
     """
-    named = reply.get("block_account")
+    named = reply.get("block_account") if isinstance(reply, dict) else None
     key = nano_settlement_verify.public_key_from_address(named)
-    if key is not None:
-        return key.hex().upper()
-    return named if isinstance(named, str) else ""
+    return key.hex().upper() if key is not None else None
+
+
+# `verify` as this module was imported with it. `_answer` reads the reply itself
+# (to check which block it is about); when `nano_settlement_verify.verify` has
+# been replaced - stubbed in a test, or wrapped by a caller - it is called
+# instead, as it always was, so the replacement still takes effect.
+_ORIGINAL_VERIFY = nano_settlement_verify.verify
 
 
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
-    A settled receipt becomes the facts it asserts - amount, height, payee and
-    the chain the block sits on - and everything else becomes a tag. `Mismatch`
-    is carried rather than raised here so the caller can decide what one node's
-    refusal is worth.
+    A settled receipt becomes the facts it asserts - amount, height and payee -
+    plus, as a fifth element, the chain the block sits on (`_payer_of`, None
+    when the reply names none); everything else becomes a tag. Only the first
+    four are compared for agreement; the payer is compared separately, and only
+    when two answers both name one. `Mismatch` is carried rather than raised
+    here so the caller can decide what one node's refusal is worth.
 
     The reply is read once, and `verify`'s own verdict is reached on it. When
     the reply's contents are complete enough to recompute a block hash from
@@ -459,17 +488,32 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     the node has answered about a DIFFERENT block: that is tagged "other-block",
     never "settled", however well its amount and payee match. Contents too
     sparse to hash are not a hash checked, and are read as before.
+
+    If `nano_settlement_verify.verify` is no longer the original function, it
+    is called as before this module read replies itself, and the answer is
+    built from the Receipt it returns; there is then no reply in hand, so no
+    block hash and no payer are checked.
     """
-    post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
-    reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
+    verify = nano_settlement_verify.verify  # looked up per call so a stub takes effect
+    if verify is not _ORIGINAL_VERIFY:
+        reply = None
+        receipt_of = lambda: verify(block_hash, expect_raw, account, rpc_url)  # noqa: E731
+    else:
+        post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
+        reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
+        receipt_of = lambda: nano_settlement_verify._receipt_of_reply(  # noqa: E731
+            block_hash, expect_raw, account, reply
+        )
     try:
-        receipt = nano_settlement_verify._receipt_of_reply(block_hash, expect_raw, account, reply)
+        receipt = receipt_of()
     except NotFound:
         return ("not-seen",), None
     except Mismatch as error:
         return ("mismatch", repr(error.got), repr(error.expected)), error
     if not receipt.settled:
         return ("not-yet",), None
+    if reply is None:
+        return ("settled", receipt.amount_raw, receipt.height, receipt.account, None), receipt
     from nano_five_fields import block_hash_of  # here, not at the top: it imports this module
 
     answered_for = block_hash_of(reply.get("contents"))
@@ -528,6 +572,7 @@ def verify_corroborated(
     settled_by: dict[tuple, list[str]] = {}
     settled_receipt: dict[tuple, Receipt] = {}
     observations: list[Observation] = []
+    named_payer = None  # (payer key, endpoint) of the first settled answer naming one
 
     for rpc_url in endpoints:
         try:
@@ -576,18 +621,32 @@ def verify_corroborated(
             raise payload
         if answer[0] != "settled":
             continue
-        if settled_by and answer not in settled_by:
+        # The payer chain is set apart from what is compared: an answer that
+        # names no parseable payer has said nothing about it, so it can neither
+        # contradict an answer that does nor be what lets one settle.
+        facts, payer = answer[:4], answer[4]
+        if settled_by and facts not in settled_by:
             other = next(iter(settled_by))
             raise Disagreement(
-                {settled_by[other][0]: str(other), rpc_url: str(answer)},
+                {settled_by[other][0]: str(other), rpc_url: str(facts)},
                 observations=observations,
             )
-        settled_by.setdefault(answer, []).append(rpc_url)
-        settled_receipt[answer] = payload
-        if len(settled_by[answer]) >= agree:
+        if payer is not None and named_payer is not None and payer != named_payer[0]:
+            raise Disagreement(
+                {
+                    named_payer[1]: f"{facts} on payer chain {named_payer[0]}",
+                    rpc_url: f"{facts} on payer chain {payer}",
+                },
+                observations=observations,
+            )
+        if payer is not None and named_payer is None:
+            named_payer = (payer, rpc_url)
+        settled_by.setdefault(facts, []).append(rpc_url)
+        settled_receipt[facts] = payload
+        if len(settled_by[facts]) >= agree:
             return Corroboration(
-                receipt=settled_receipt[answer],
-                agreed=tuple(settled_by[answer]),
+                receipt=settled_receipt[facts],
+                agreed=tuple(settled_by[facts]),
                 answered=tuple(answered),
                 failed=tuple(failures),
                 observations=tuple(observations),

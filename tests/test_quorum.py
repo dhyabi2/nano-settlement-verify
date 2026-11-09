@@ -995,3 +995,122 @@ def test_redact_url_leaves_a_plain_url_alone_and_handles_an_at_in_the_password()
     assert nano_quorum.redact_url(A) == A
     assert nano_quorum.redact_url("https://u:p@ss@node.example/rpc?x=1") == "https://***@node.example/rpc?x=1"
     assert nano_quorum.redact_url("https://node.example/a@b") == "https://node.example/a@b"
+
+
+# --- a payer chain is compared only when both answers name one ---------------------
+
+
+def test_one_node_naming_its_payer_chain_and_one_naming_none_still_settle(monkeypatch):
+    """main settled this; a missing `block_account` is no payer named, not another payer."""
+    from nano_five_fields import _address_of_key
+
+    named = send_block()
+    named["block_account"] = _address_of_key(bytes(range(1, 33)))
+    nodes(monkeypatch, {A: named, B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    assert out.receipt.settled is True
+    assert out.agreed == (A, B)
+    nodes(monkeypatch, {A: send_block(), B: named})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled is True
+
+
+def test_a_payer_that_is_not_an_address_is_no_payer_named(monkeypatch):
+    """A valid payer beside garbage, and garbage beside garbage that differs only by
+    case, are not two payer chains: each such answer settles as it did on main."""
+    from nano_five_fields import _address_of_key
+
+    valid = send_block()
+    valid["block_account"] = _address_of_key(bytes(range(1, 33)))
+    junk = send_block()
+    junk["block_account"] = "not-an-address"
+    nodes(monkeypatch, {A: valid, B: junk})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled is True
+
+    upper = send_block()
+    upper["block_account"] = "NOT-AN-ADDRESS"
+    nodes(monkeypatch, {A: junk, B: upper})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled is True
+
+
+def test_a_node_naming_no_payer_does_not_bridge_two_different_payers(monkeypatch):
+    """X, then none, then Y: the answer naming none says nothing about the chain,
+    so X and Y are still compared, and differ."""
+    from nano_five_fields import _address_of_key
+
+    one = send_block()
+    one["block_account"] = _address_of_key(bytes(range(1, 33)))
+    two = send_block()
+    two["block_account"] = _address_of_key(bytes(range(2, 34)))
+    nodes(monkeypatch, {A: one, B: send_block(), C: two})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+    assert set(caught.value.answers) == {A, C}
+
+
+def test_a_missing_payer_does_not_make_a_different_amount_agree(monkeypatch):
+    """The payer is set apart from what is compared, not in place of it."""
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
+    with pytest.raises(Disagreement):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+
+
+# --- a replaced `verify` still takes effect, as it did on main ------------------------
+
+
+def test_a_stubbed_verify_is_still_what_each_endpoint_is_asked_through(monkeypatch):
+    """Code that stubbed `nano_settlement_verify.verify` (and not `post_json`) must
+    not be bypassed into the real network: the autouse fixture refuses a socket."""
+    from nano_settlement_verify import NotFound, Receipt
+
+    asked = []
+
+    def stub(block_hash, expect_raw, account, rpc_url, *args, **kwargs):
+        asked.append(rpc_url)
+        if rpc_url == C:
+            raise NotFound(block_hash)
+        return Receipt(settled=True, amount_raw=expect_raw, height=7, account=account)
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", stub)
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [C, A, B], clock=ticking_clock(1, 2, 3))
+    assert asked == [C, A, B]
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == ONE_XNO
+    assert out.agreed == (A, B)
+    assert [(o.rpc_url, o.state) for o in out.observations] == [
+        (C, "not-seen"), (A, "confirmed"), (B, "confirmed"),
+    ]
+
+
+def test_a_stubbed_verify_that_raises_mismatch_still_refuses(monkeypatch):
+    def stub(block_hash, expect_raw, account, rpc_url, *args, **kwargs):
+        raise Mismatch(got=1, expected=expect_raw)
+
+    monkeypatch.setattr(nano_settlement_verify, "verify", stub)
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    assert [o.state for o in caught.value.observations] == ["mismatch"]
+
+
+# --- credentials quoted in an error are not written into the record -------------------
+
+
+def test_credentials_quoted_in_an_unreadable_error_are_redacted_in_the_json_record(monkeypatch):
+    keyed = "http://agent:s3cret@127.0.0.1:7071"
+    nodes(monkeypatch, {
+        keyed: OSError(f"could not reach {keyed}/rpc: refused"),
+        B: send_block(), C: send_block(),
+    })
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [keyed, B, C])
+    assert "s3cret" in out.observations[0].error_message  # in memory, kept as given
+    text = out.to_json()
+    assert "s3cret" not in text and "agent" not in text
+    entry = json.loads(text)["observations"][0]
+    assert entry["error"]["message"] == "could not reach http://***@127.0.0.1:7071/rpc: refused"
+    assert entry["detail"] == "OSError: could not reach http://***@127.0.0.1:7071/rpc: refused"
+
+
+def test_redact_url_handles_leading_whitespace_and_a_scheme_relative_url():
+    assert nano_quorum.redact_url("  http://u:p@node.example/rpc") == "  http://***@node.example/rpc"
+    assert nano_quorum.redact_url("//u:p@node.example/rpc") == "//***@node.example/rpc"
+    assert nano_quorum.redact_url("\thttps://tok@node.example") == "\thttps://***@node.example"
+    assert nano_quorum.redact_url("//node.example/a@b") == "//node.example/a@b"
