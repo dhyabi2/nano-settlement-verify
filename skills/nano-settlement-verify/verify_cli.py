@@ -22,6 +22,9 @@ the reply, or else the error's class.
 exit 0 settled, 2 not confirmed yet, 3 mismatch, no such block or an amount that is not raw,
       4 node unreachable (nothing was checked), 5 late (seen after WHEN),
       6 unknown_time (node reports no time for the block; not on time), 64 usage
+The late (5) and unknown_time (6) verdicts carry "seen_at" (null for 6), "not_after",
+"amount_raw", "account" (the account the block paid, as on the settled receipt) and
+"time_source".
 The time is the node's own local_timestamp, not signed by the sender: read it on two nodes
 if seconds matter.
 """
@@ -549,10 +552,12 @@ def _ask_one(**arguments):
         receipt = _verify_objects_only(**arguments)
     except Late as error:
         return 5, {"verdict": "late", "seen_at": error.seen_at, "not_after": error.not_after,
-                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
+                   "amount_raw": error.receipt.amount_raw, "account": error.receipt.account,
+                   "time_source": TIME_SOURCE}, False
     except UnknownTime as error:
         return 6, {"verdict": "unknown_time", "seen_at": None, "not_after": error.not_after,
-                   "amount_raw": error.receipt.amount_raw, "time_source": TIME_SOURCE}, False
+                   "amount_raw": error.receipt.amount_raw, "account": error.receipt.account,
+                   "time_source": TIME_SOURCE}, False
     except NotFound:
         return 3, {"verdict": "no_such_block"}, False
     except Mismatch as error:
