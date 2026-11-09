@@ -350,6 +350,20 @@ slack, or pass `not_after=None` to have no deadline.
 - In `balance_corroborated`, any node error other than `"Account not found"` now counts as a
   failed endpoint, a figure that is not an ASCII digit string or a plain non-negative JSON
   integer is refused, and a malformed address raises `ValueError` before any node is asked.
+- In `verify_corroborated`, each `Corroboration` now carries `observations`, one per endpoint
+  asked, and each observation carries `read_at`, the UTC time its answer was read. Two
+  identical calls therefore write different `to_json()` text. `==` and `hash()` leave
+  `read_at` out: two calls whose nodes said the same things are still equal and hash alike.
+- `Corroboration.to_json()` is larger: it now embeds the `observations` list, the full
+  `node_states` table (each state with its meaning) and `node_states_sha256`.
+- `"schema"` (`"nano_quorum.corroboration/2"`) is now the first key of `to_json()`. Code that
+  compared the record as text, or read keys by position, sees a different string.
+- `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`. The
+  `agreed`, `answered` and `failed` tuples in memory still hold the URLs as given.
+- A node that answers `confirmed` with block contents that hash to a different block than the
+  one asked for now raises `Disagreement`. It used to count toward agreement when its amount,
+  payee and height matched. Two confirmed answers naming different payer chains
+  (`block_account`) also raise `Disagreement` now.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -460,6 +474,12 @@ The rules it holds to, each of which is a way of failing closed:
 - **It does not break ties.** Two nodes that each report the block confirmed, with
   different contents, cannot both be right, and nothing here can tell you which is
   lying. A third vote would only make a guess look like a quorum, so it raises.
+- **An answer about another block is not a witness.** When a node's confirmed reply has
+  contents complete enough to recompute the block hash, and that hash is not the one you
+  asked for, it raises `Disagreement` at once, even if amount, payee and height all match.
+  Two confirmed answers that name different payer chains (`block_account`) also disagree.
+  Contents too sparse to hash are not a hash checked; they are compared on amount, payee,
+  height and payer as before.
 - **One `Mismatch` refuses at once.** A node that has the block *confirmed* and says it
   paid a different amount or a different account is reporting something a later node
   cannot overturn — a confirmed block's contents are fixed by its hash.
@@ -498,6 +518,19 @@ value disagree). `nano_quorum.verify_receipt_vocabulary(record)` recomputes it f
 stored record's own table and returns True only if it matches both the record's field
 and the pinned value, so an edited table, or a `/2` record with a different vocabulary,
 is caught.
+
+`node_states_sha256` covers the `node_states` table and nothing else. It does not protect
+`settled`, `amount_raw`, `account`, the endpoint lists or the observations: someone who
+edits any of those in a stored record leaves the hash valid, and
+`verify_receipt_vocabulary` still returns True. It shows which vocabulary a record was
+written in. It is not a signature over the receipt.
+
+Two `Corroboration`s compare equal, and hash alike, when the receipt, the endpoint
+tuples and each node's state, detail and error are the same. `read_at` is left out, so
+two identical calls a second apart are equal, while their `to_json()` text differs.
+`to_json()` writes endpoint URLs with any `user:pass@` replaced by `***@`. It does not
+recognise a key carried in the path or query string. Exception messages still name each
+URL as given.
 
 Two more functions come with it:
 
@@ -565,7 +598,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-892 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+904 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -606,7 +639,7 @@ acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
 `nano_independence`, the funding chain and the independent-payer grouping; for
-`nano_quorum`, agreement, contradiction, the node-state vocabulary pinned by hash in the record, the duplicate endpoint and every way an
+`nano_quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring

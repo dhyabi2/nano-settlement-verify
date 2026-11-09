@@ -784,3 +784,214 @@ def test_an_observation_outside_the_vocabulary_or_an_errorless_unreadable_is_ref
         nano_quorum.Observation(A, "unreadable", at)
     with pytest.raises(ValueError, match="carries no error"):
         nano_quorum.Observation(A, "not-seen", at, error_kind="OSError")
+
+
+# --- a confirmed answer about a DIFFERENT block is a refusal, not agreement -----------
+
+
+def state_send(previous="11" * 32, payer_key=bytes(range(1, 33)), height=7, block_account=None):
+    """A real node's block_info reply for a confirmed state send of ONE_XNO to HOLDER.
+
+    Its contents are complete, so `nano_five_fields.block_hash_of` recomputes the
+    block's hash from them. Returns (reply, the hash its contents hash to).
+    """
+    from nano_five_fields import _address_of_key, block_hash_of
+
+    payer = _address_of_key(payer_key)
+    contents = {
+        "type": "state",
+        "account": payer,
+        "previous": previous,
+        "representative": payer,
+        "balance": str(5 * ONE_XNO),
+        "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
+        "link_as_account": HOLDER,
+    }
+    reply = {
+        "block_account": block_account or payer,
+        "amount": str(ONE_XNO),
+        "height": str(height),
+        "confirmed": "true",
+        "subtype": "send",
+        "contents": contents,
+    }
+    return reply, block_hash_of(contents)
+
+
+def test_two_nodes_confirming_full_contents_of_the_requested_block_settle_it(monkeypatch):
+    """The control for the laws below: honest nodes with complete contents still agree."""
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: reply, B: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert out.receipt.settled is True
+    assert out.agreed == (A, B)
+
+
+def test_a_confirmed_answer_whose_contents_hash_to_another_block_is_a_disagreement(monkeypatch):
+    """dynamo's block-hash-mismatch test. A and B both answer `confirmed`, with the
+    same amount, payee and height, but B's contents are another block (a different
+    `previous`), so they hash to something other than the hash asked for. Amount,
+    payee and height alone would count that as a second witness and settle; it
+    must refuse (case 3) instead, and say which hashes it saw."""
+    right, asked = state_send(previous="11" * 32)
+    wrong, other = state_send(previous="22" * 32)
+    assert other != asked
+    nodes(monkeypatch, {A: right, B: wrong})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B], clock=ticking_clock(1, 2))
+    assert caught.value.answers[B] == f"contents that hash to {other}"
+    assert asked in caught.value.answers["requested"]
+    assert [(o.rpc_url, o.state) for o in caught.value.observations] == [
+        (A, "confirmed"), (B, "mismatch"),
+    ]
+    assert other in caught.value.observations[1].detail
+
+
+def test_two_nodes_agreeing_about_another_block_do_not_settle_the_one_asked_for(monkeypatch):
+    """Both nodes describe the same block - just not the requested one. Their
+    agreement is about the wrong block, so the first such answer refuses and the
+    second node is not asked."""
+    wrong, other = state_send(previous="22" * 32)
+    asked = "33" * 32
+    called = nodes(monkeypatch, {A: wrong, B: wrong})
+    with pytest.raises(Disagreement):
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert called == [A]
+
+
+def test_the_requested_hash_is_compared_whatever_its_letter_case(monkeypatch):
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: reply, B: reply})
+    assert verify_corroborated(asked.lower(), ONE_XNO, HOLDER, [A, B]).receipt.settled is True
+
+
+def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):
+    """Same amount, payee and height, but the nodes name different chains the block
+    sits on: two different blocks, so not one payment seen twice."""
+    from nano_five_fields import _address_of_key
+
+    one = send_block()
+    one["block_account"] = _address_of_key(bytes(range(1, 33)))
+    two = send_block()
+    two["block_account"] = _address_of_key(bytes(range(2, 34)))
+    nodes(monkeypatch, {A: one, B: two})
+    with pytest.raises(Disagreement):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+
+
+def test_both_spellings_of_one_payer_chain_still_agree(monkeypatch):
+    from nano_five_fields import _address_of_key
+
+    payer = _address_of_key(bytes(range(1, 33)))
+    one = send_block()
+    one["block_account"] = payer
+    two = send_block()
+    two["block_account"] = "xrb_" + payer[len("nano_"):]
+    nodes(monkeypatch, {A: one, B: two})
+    assert verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).receipt.settled is True
+
+
+# --- two "wait" incidents a postmortem can tell apart ------------------------------------
+
+
+D = "http://127.0.0.1:7074"
+
+
+def test_three_nodes_behind_and_two_nodes_unreachable_are_different_records(monkeypatch):
+    """Both incidents leave the payment unsettled ("wait"), and both receipts are
+    the same empty Receipt. What tells them apart is the per-node state, which
+    each record carries in `observations` and in to_json: three nodes that
+    ANSWERED and were behind, against two that gave no answer at all."""
+    nodes(monkeypatch, {
+        A: {"error": "Block not found"},
+        B: send_block(confirmed="false"),
+        C: {"error": "Block not found"},
+    })
+    behind = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3,
+                                 clock=ticking_clock(1, 2, 3))
+    nodes(monkeypatch, {
+        A: OSError("connection refused"),
+        B: OSError("timed out"),
+        C: send_block(confirmed="false"),
+        D: send_block(confirmed="false"),
+    })
+    unreachable = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C, D],
+                                      clock=ticking_clock(1, 2, 3, 4))
+
+    assert behind.receipt == unreachable.receipt
+    assert behind.receipt.settled is False
+    assert behind != unreachable
+    assert [o.state for o in behind.observations] == ["not-seen", "unconfirmed", "not-seen"]
+    assert [o.state for o in unreachable.observations] == [
+        "unreadable", "unreadable", "unconfirmed", "unconfirmed",
+    ]
+    assert behind.failed == ()
+    assert unreachable.failed == (A, B)
+
+    behind_json = json.loads(behind.to_json())
+    unreachable_json = json.loads(unreachable.to_json())
+    assert [o["state"] for o in behind_json["observations"]] == ["not-seen", "unconfirmed", "not-seen"]
+    assert all("error" not in o for o in behind_json["observations"])
+    assert [o["state"] for o in unreachable_json["observations"]] == [
+        "unreadable", "unreadable", "unconfirmed", "unconfirmed",
+    ]
+    assert [o["error"] for o in unreachable_json["observations"][:2]] == [
+        {"kind": "OSError", "message": "connection refused"},
+        {"kind": "OSError", "message": "timed out"},
+    ]
+
+
+def test_two_unreachable_of_three_is_not_corroborated_and_still_names_each_node(monkeypatch):
+    """When the two unreachable nodes leave too few answers, the outcome is
+    NotCorroborated rather than an unsettled receipt, and it still says which
+    node was unreachable and which answered."""
+    nodes(monkeypatch, {A: OSError("refused"), B: OSError("timed out"),
+                        C: send_block(confirmed="false")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2, 3))
+    assert [(o.rpc_url, o.state) for o in caught.value.observations] == [
+        (A, "unreadable"), (B, "unreadable"), (C, "unconfirmed"),
+    ]
+
+
+# --- equality ignores when an answer was read; the record does not ---------------------
+
+
+def test_two_identical_calls_a_second_apart_are_equal_and_hash_alike(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    first = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    second = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(3, 4))
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({first, second}) == 1
+    assert first.to_json() != second.to_json()  # the record still says when each was read
+
+
+def test_calls_whose_nodes_said_different_things_are_not_equal(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    first = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    nodes(monkeypatch, {A: send_block(confirmed="false"), B: send_block(confirmed="false")})
+    second = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2))
+    assert first != second
+    assert first != "not a Corroboration"
+
+
+# --- credentials in an endpoint URL are not written into the record ------------------
+
+
+def test_credentials_in_an_endpoint_url_are_redacted_in_the_json_record(monkeypatch):
+    keyed = "http://agent:s3cret@127.0.0.1:7071"
+    nodes(monkeypatch, {keyed: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [keyed, B])
+    assert out.agreed == (keyed, B)  # in memory, the URL is kept exactly as given
+    text = out.to_json()
+    assert "s3cret" not in text and "agent" not in text
+    record = json.loads(text)
+    assert record["agreed"] == ["http://***@127.0.0.1:7071", B]
+    assert record["observations"][0]["rpc_url"] == "http://***@127.0.0.1:7071"
+
+
+def test_redact_url_leaves_a_plain_url_alone_and_handles_an_at_in_the_password():
+    assert nano_quorum.redact_url(A) == A
+    assert nano_quorum.redact_url("https://u:p@ss@node.example/rpc?x=1") == "https://***@node.example/rpc?x=1"
+    assert nano_quorum.redact_url("https://node.example/a@b") == "https://node.example/a@b"

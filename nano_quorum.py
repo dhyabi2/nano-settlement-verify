@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -49,6 +50,7 @@ __all__ = [
     "distinct_endpoints",
     "node_states_sha256",
     "post_json_failover",
+    "redact_url",
     "verify_corroborated",
     "verify_receipt_vocabulary",
 ]
@@ -183,6 +185,22 @@ def verify_receipt_vocabulary(record) -> bool:
     return actual == record.get("node_states_sha256") == NODE_STATES_SHA256
 
 
+_CREDENTIALS = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@")
+
+
+def redact_url(rpc_url: object) -> object:
+    """`rpc_url` with any `user:pass@` (or `token@`) replaced by `***@`.
+
+    Used wherever a receipt writes an endpoint down, so a key carried in the
+    URL is not stored or shown with the record. Only the userinfo is touched;
+    a key in the path or query string is not recognised. A non-string is
+    returned as it is.
+    """
+    if not isinstance(rpc_url, str):
+        return rpc_url
+    return _CREDENTIALS.sub(r"\1***@", rpc_url)
+
+
 @dataclass(frozen=True)
 class Observation:
     """What one endpoint said about the block, and when its answer was read.
@@ -219,7 +237,7 @@ class Observation:
 
     def to_dict(self) -> dict:
         out = {
-            "rpc_url": self.rpc_url,
+            "rpc_url": redact_url(self.rpc_url),
             "state": self.state,
             "read_at": self.read_at,
             "detail": self.detail,
@@ -234,6 +252,11 @@ _STATE_OF_ANSWER = {
     "not-yet": "unconfirmed",
     "not-seen": "not-seen",
     "mismatch": "mismatch",
+    # A confirmed send whose contents hash to another block than the one asked
+    # for. The vocabulary (and its pinned hash) is unchanged: it is written as
+    # "mismatch" - the node has a block confirmed and it is not the expected
+    # payment - with `detail` naming both hashes.
+    "other-block": "mismatch",
 }
 if not set(_STATE_OF_ANSWER.values()) <= set(NODE_STATES):
     raise AssertionError("_STATE_OF_ANSWER names a state outside NODE_STATES")
@@ -264,6 +287,17 @@ class Corroboration:
     `observations` has one `Observation` per endpoint asked, in the order
     asked: which node said what, and when. Endpoints after the quorum were not
     asked and are not listed.
+
+    Equality and hash() are over what was decided and what each node said -
+    the receipt, the endpoint tuples, and each observation's endpoint, state,
+    detail and error - and NOT over each observation's `read_at`. Two calls
+    that got the same answers from the same nodes a second apart are equal and
+    hash alike, as they were before `read_at` existed; `to_json()` still
+    differs between them, because the record says when each answer was read.
+
+    `to_json()` writes every endpoint URL with any credentials (`user:pass@`)
+    replaced by `***@`; the tuples and observations in memory keep the URL
+    exactly as given.
     """
 
     receipt: Receipt
@@ -271,6 +305,26 @@ class Corroboration:
     answered: tuple[str, ...]
     failed: tuple[str, ...]
     observations: tuple[Observation, ...] = ()
+
+    def _identity(self) -> tuple:
+        return (
+            self.receipt,
+            self.agreed,
+            self.answered,
+            self.failed,
+            tuple(
+                (seen.rpc_url, seen.state, seen.detail, seen.error_kind, seen.error_message)
+                for seen in self.observations
+            ),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Corroboration):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
 
     def to_json(self) -> str:
         return json.dumps(
@@ -280,9 +334,9 @@ class Corroboration:
                 "amount_raw": self.receipt.amount_raw,
                 "height": self.receipt.height,
                 "account": self.receipt.account,
-                "agreed": list(self.agreed),
-                "answered": list(self.answered),
-                "failed": list(self.failed),
+                "agreed": [redact_url(url) for url in self.agreed],
+                "answered": [redact_url(url) for url in self.answered],
+                "failed": [redact_url(url) for url in self.failed],
                 "observations": [seen.to_dict() for seen in self.observations],
                 "node_states": dict(NODE_STATES),
                 "node_states_sha256": NODE_STATES_SHA256,
@@ -378,23 +432,52 @@ def post_json_failover(rpc_urls, payload: dict):
     raise NotCorroborated(answered=0, agree=1, failures=failures)
 
 
+def _payer_of(reply: dict) -> str:
+    """The chain a block sits on (`block_account`), as a comparable key, or "".
+
+    Two spellings of one account (`nano_`/`xrb_`) are one payer; a reply that
+    names none, or names something that is not an address, keeps its text.
+    """
+    named = reply.get("block_account")
+    key = nano_settlement_verify.public_key_from_address(named)
+    if key is not None:
+        return key.hex().upper()
+    return named if isinstance(named, str) else ""
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
-    A settled receipt becomes the facts it asserts; everything else becomes a
-    tag. `Mismatch` is carried rather than raised here so the caller can decide
-    what one node's refusal is worth.
+    A settled receipt becomes the facts it asserts - amount, height, payee and
+    the chain the block sits on - and everything else becomes a tag. `Mismatch`
+    is carried rather than raised here so the caller can decide what one node's
+    refusal is worth.
+
+    The reply is read once, and `verify`'s own verdict is reached on it. When
+    the reply's contents are complete enough to recompute a block hash from
+    (`nano_five_fields.block_hash_of`) and that hash is not the one asked for,
+    the node has answered about a DIFFERENT block: that is tagged "other-block",
+    never "settled", however well its amount and payee match. Contents too
+    sparse to hash are not a hash checked, and are read as before.
     """
-    verify = nano_settlement_verify.verify  # looked up per call so a stub takes effect
+    post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
+    reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
     try:
-        receipt = verify(block_hash, expect_raw, account, rpc_url)
+        receipt = nano_settlement_verify._receipt_of_reply(block_hash, expect_raw, account, reply)
     except NotFound:
         return ("not-seen",), None
     except Mismatch as error:
         return ("mismatch", repr(error.got), repr(error.expected)), error
     if not receipt.settled:
         return ("not-yet",), None
-    return ("settled", receipt.amount_raw, receipt.height, receipt.account), receipt
+    from nano_five_fields import block_hash_of  # here, not at the top: it imports this module
+
+    answered_for = block_hash_of(reply.get("contents"))
+    if answered_for is not None and answered_for != str(block_hash).strip().upper():
+        return ("other-block", answered_for, str(block_hash)), None
+    return (
+        "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)
+    ), receipt
 
 
 def verify_corroborated(
@@ -468,9 +551,21 @@ def verify_corroborated(
                 rpc_url,
                 _STATE_OF_ANSWER[answer[0]],
                 _iso_utc(now()),
-                f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch" else "",
+                f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch"
+                else f"answered for block {answer[1]}, not the requested {answer[2]}"
+                if answer[0] == "other-block" else "",
             )
         )
+        if answer[0] == "other-block":
+            # Fail closed, immediately, as for a mismatch. The node reports a
+            # confirmed send, but the contents it sent hash to another block:
+            # whatever it says about amount and payee is about that block, not
+            # this one. Counting it toward agreement would let two nodes
+            # "corroborate" a payment by describing two different blocks.
+            raise Disagreement(
+                {"requested": f"block {answer[2]}", rpc_url: f"contents that hash to {answer[1]}"},
+                observations=observations,
+            )
         if answer[0] == "mismatch":
             # Fail closed, immediately. This endpoint has the block CONFIRMED
             # and reports it paid someone else or a different amount. Blocks do
