@@ -288,10 +288,14 @@ money and serve nothing. In order of preference:
 2. **Keep it as credit against that block hash** - for a seller that keeps state and sells
    something that cannot simply be served twice (a one-time asset, a metered run): record the
    hash and let the payer re-present it. This library only reads, so it has nowhere to keep
-   that credit; your own store has to. pursekeeper reports that its x402 door does this, in the
-   hand-back paragraph of pursekeeper.dev/api: the price is kept as credit on the hash and the
-   payer gets a represent token to present with the same payload. That is their description of
-   their door; we have not tested it.
+   that credit; your own store has to. pursekeeper's x402 door holds a hash for its payer,
+   but for a different case than lateness, and it does not call that credit (on its door
+   "credit" is an X-Nano-Payment balance whoever presents first can spend): a block the door
+   broadcast that did not confirm within eight seconds answers 402 naming the hash, nothing
+   charged, with a single-use X-Nano-Represent token; it is held for its payer for thirty days
+   and served when the payer re-presents the same payload with that token (the hand-back
+   paragraph of pursekeeper.dev/api). That is their description of their door; we
+   have not tested it.
 3. **Send it back** - the last resort. It costs you a signed send block and its work, from
    your own wallet; this library sends nothing.
 
@@ -309,10 +313,30 @@ reference client sets to the time of signing plus `maxTimeoutSeconds`.) Nor does
 for every quote bind the payer or stop a late send. What it gives you is attribution: a payment
 to that `payTo` is known to belong to that quote, so a send that arrives after the quote's
 window is still that quote's money, to be served or credited as above, not a stranger's.
-pursekeeper reports Subnano's door as built that way, a new `payTo` per GET and sixty seconds;
-that is their report, not something we have measured. Checked after the fact, `not_after` can
-only tell you that you were paid late. Pick it with that slack, or pass `not_after=None` to have no
-deadline.
+pursekeeper reports Subnano's door as built that way, a new `payTo` per GET, and quotes
+Subnano's own pages for the window: five minutes ("New Nano allocations and USDC quotes last five
+minutes for every anchor", subnano.me/llms.txt), with `maxTimeoutSeconds` 300 in a quote read on
+2026-11-06 (an earlier quote, from 2026-10-08, carried 60). The window is a duration with no start
+time on the wire: the 402 has no expires-at field. What makes it bind is the house's own rule, as
+quoted from docs.subnano.ai/v1/api/payments.md: "Once an empty expired checkout address has been
+retired, new sends receive no automatic fulfillment or refund", and an expired unbroadcast quote
+"can be re-quoted under the same spending policy". These are pursekeeper's quotes, not something
+we have measured: neither page answers from where we run.
+
+pursekeeper reports its own x402 door as the other case. Its 402 carries `maxTimeoutSeconds` 60
+and nothing else about time: a duration with no start. pursekeeper reports that its door
+measures no lateness: a block presented after sixty seconds is verified and served like any
+other. Separately, a block the door broadcast that did not confirm within eight seconds is held
+for its payer on its hash and served when the payer re-presents the same payload with the represent
+token from that 402; after thirty days the hash is marked not spendable. pursekeeper points to the
+hand-back paragraph on pursekeeper.dev/api and the live 402 on /v1/echo as the source (read by
+pursekeeper on 2026-11-07 and again on 2026-11-08). So on that door the
+window is echoed and does not bind. Unlike Subnano's, its `payTo` is fixed, one address for every quote, so there
+is no checkout address to expire; this too is pursekeeper's report, not something we have
+measured, and that page does not answer from where we run either.
+
+Checked after the fact, `not_after` can only tell you that you were paid late. Pick it with that
+slack, or pass `not_after=None` to have no deadline.
 
 **Changes from the previous release.** Code that relied on the old behaviour sees these:
 
@@ -365,6 +389,35 @@ nodes read - with any missing field answered `unknown` and never `settled`, see
 [FIVE_FIELDS.md](FIVE_FIELDS.md): the same check as two `curl` calls and a local hash
 recompute, and `nano_five_fields.five_field_verdict` for callers who want it in code.
 `settled` there means work may start; it is not buyer acceptance.
+
+## Check a block offline (the payer's own signature)
+
+A Nano block carries a signature made by the account's own key over the block hash
+(ed25519, with blake2b-512 in place of sha512). The hash is recomputed from the block's
+contents, so given the contents and the signature anyone can check, without asking any
+node, that the holder of that account's key signed exactly those contents. Change one
+digit of the balance or the destination and the check fails.
+
+It does not prove the block is on the ledger or confirmed. A key holder can sign a block
+that never lands, or one that loses a fork. Inclusion still needs nodes: `nano_quorum`.
+
+Carrying the previous block's hash adds nothing by itself, because `previous` is already
+inside the signed contents. What the previous block's full contents add is the amount: a
+state block only states the new balance, so the amount sent is the previous balance minus
+this one. Given those contents, the check also confirms they hash to this block's
+`previous` and are a state block of the same account (`previous_same_account`) before it
+reports the change (`amount_raw`, and `balance_change_raw`, negative for a send). With an
+invalid signature, a mismatched previous, another account's previous, or a legacy (non-state)
+previous block, both are null: it fails closed rather than report an amount nobody signed.
+Small-order public keys and R points (such as the identity key `nano_11a1...6iq5p4i8`, with
+which a forged signature would verify any contents) and non-canonical encodings are refused.
+
+```
+python3 nano_offline.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F
+```
+
+The node (default rpc.nano.to) is only used to fetch the two blocks; the check runs on the
+fetched bytes. In code: `nano_offline.offline_check(contents, signature, previous_contents)`.
 
 ## One node's word, or two?
 
@@ -524,7 +577,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-885 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+921 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
