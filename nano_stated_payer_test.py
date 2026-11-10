@@ -1,13 +1,16 @@
 """One verdict per payer against a stated independence test, re-runnable by anyone.
 
     python3 nano_stated_payer_test.py --payee nano_... --payer nano_... [--payer ...]
-        [--excluded nano_...]... [--exchange nano_...]... [--hop largest-receive|opening-send]
+        [--excluded nano_...]... [--exchange nano_...]...
+        [--shared-wallet nano_...=KIND=https://...]... [--hop largest-receive|opening-send]
         [--payment HASH]... [--hops 1] [--rpc URL]... [--json]
 
-The test, as the seller stated it for its Dec 8 payer count and amended on
-2026-11-10: a payer counts as independent iff "the largest receive into its
-account before the payment was funded by neither Unstuck nor us - one hop back,
-exchange hot wallets set aside". Read here as:
+The test, as the seller stated it for its Dec 8 payer count, amended on
+2026-11-10 and amended again the same day (v3): a payer counts as independent iff
+"the largest receive into its account before the payment was funded by neither
+Unstuck nor us, one hop back - where a hop ending at a publicly identified shared
+hot wallet (exchange, payment service, or custodian) is not determinable and
+never independent". Read here as:
 
   * hop rule `largest-receive` (the default, the amended test): the funder is the
     source account of the largest receive into the payer before the payment. "Before
@@ -24,16 +27,26 @@ exchange hot wallets set aside". Read here as:
   * `not-independent`: a funder within the hops is the payee or an `--excluded`
     party (or the payer is one of them itself, hop 0). The output names which and
     at which hop. The payee funding its own payer is the seller's money in a circle.
-  * `not-determinable`: the hop-1 funder is an exchange hot wallet (`--exchange`) -
-    "not determinable from funding alone". Nothing behind an exchange is walked: it
-    is the exchange's history, shared by every customer it paid.
-  * `independent`: funded within the hops by none of the above and not only by an
-    exchange.
+  * `not-determinable`: the hop-1 funder is a shared hot wallet the caller names as
+    publicly identified - `--shared-wallet ACCOUNT=KIND=SOURCE_URL`, KIND one of
+    exchange, payment-service, custodian, SOURCE_URL (https) where the service itself
+    says the wallet is its own; `--exchange ACCOUNT` is the same with kind exchange
+    and no source. "not determinable from funding alone", never independent. The
+    verdict names the wallet (`shared_wallet`: account, kind, source - null when it
+    came from `--exchange`) so the call can be argued with on the record. Nothing
+    behind a shared wallet is walked: it is the service's history, shared by every
+    customer it paid. (With `--hops` above 1 a shared wallet behind a stranger ends
+    the walk and the stranger decides, as before.)
+  * `independent`: funded within the hops by none of the above and not only by a
+    shared hot wallet.
   * `unopened`: the node has no open block for the account. `unreadable`: a block
     the verdict needs could not be read, the address is malformed, or two nodes
     told different stories. Neither is ever counted as independent.
 
-Every verdict names its `hop_rule`. Its `witness` is the deciding hop's: the
+Every verdict names its `hop_rule` and its `hop_depth`: the hop number that
+decided (0 = the payer itself is a party; the same value as `deciding_hop`, named so
+"independent at what depth?" has an answer by name; null when unopened, and for
+unreadable the hop whose read failed, null when none). Its `witness` is the deciding hop's: the
 account and its open block; under `largest-receive` also the chosen receive block,
 its height and raw amount, its source, the send it received and what it was before
 (`before`, `payment_block`); under `opening-send` the funding send and the funder.
@@ -63,7 +76,9 @@ came from fewer nodes than were asked.
 
 Exit 0: every payer got a ledger verdict. 2: any payer is `unopened` or
 `unreadable` (argparse also exits 2 on a usage error). 3: a `--payee`,
-`--excluded` or `--exchange` that is not a Nano account, a bad `--hops` or `--hop`.
+`--excluded`, `--exchange` or `--shared-wallet` account that is not a Nano account, a
+`--shared-wallet` with a kind not in SHARED_KINDS or a source that is not https, a bad
+`--hops` or `--hop`.
 """
 from __future__ import annotations
 
@@ -76,10 +91,15 @@ import nano_independence
 from nano_independence import _check_hops, _key, _utc_now
 from nano_settlement_verify import public_key_from_address
 
-STATED_TEST = ("Funded by neither us nor you, one hop back, exchange hot wallets set aside; "
-               "one hop back = the largest receive into the payer before the payment (amended 2026-11-10)")
+STATED_TEST = ("a payer counts as independent iff the largest receive into its account before the payment "
+               "was funded by neither Unstuck nor us, one hop back - where a hop ending at a publicly "
+               "identified shared hot wallet (exchange, payment service, or custodian) is not determinable "
+               "and never independent (second amendment, 2026-11-10)")
+STATED_TEST_V2 = ("Funded by neither us nor you, one hop back, exchange hot wallets set aside; "
+                  "one hop back = the largest receive into the payer before the payment (amended 2026-11-10)")
 STATED_TEST_V1 = "Funded by neither us nor you, one hop back, exchange hot wallets set aside"
 CARVE_OUT = "not determinable from funding alone"
+SHARED_KINDS = ("exchange", "payment-service", "custodian")
 VERDICTS = ("independent", "not-independent", "not-determinable", "unopened", "unreadable")
 DEFAULT_RPC = "https://rpc.nano.to"
 LARGEST_RECEIVE, OPENING_SEND = "largest-receive", "opening-send"
@@ -267,9 +287,12 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
     """The verdict for one payer from one node."""
     trail: list[dict] = []
 
-    def out(verdict, why, hop=None, step=None, party=None):
-        return {"payer": payer, "verdict": verdict, "why": why, "hop_rule": rule, "deciding_hop": hop,
-                "party": party, "witness": _witness(step, rule), "trail": trail}
+    def out(verdict, why, hop=None, step=None, party=None, wallet=None):
+        r = {"payer": payer, "verdict": verdict, "why": why, "hop_rule": rule, "deciding_hop": hop,
+             "hop_depth": hop, "party": party, "witness": _witness(step, rule), "trail": trail}
+        if wallet is not None:
+            r["shared_wallet"] = dict(wallet)
+        return r
 
     def role(account):
         k = _key(account)
@@ -304,13 +327,14 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
             return out("not-independent", f"hop {hop} funder is the {role(funder)}", hop, step, role(funder))
         if _key(funder) in exchanges:
             if hop == 1:
-                return out("not-determinable", CARVE_OUT, hop, step, "exchange")
-            break  # a non-exchange funder was already seen; nothing behind an exchange is walked
+                wallet = exchanges[_key(funder)]
+                return out("not-determinable", CARVE_OUT, hop, step, wallet["kind"], wallet)
+            break  # a stranger funder was already seen; nothing behind a shared wallet is walked
         if _key(funder) in seen:
             break  # a funding loop: every account in it has been checked
         seen.add(_key(funder))
         current, before = funder, step.get("funding_send")
-    r = out("independent", "no funder within the hops is the payee, an excluded party, or only an exchange",
+    r = out("independent", "no funder within the hops is the payee, an excluded party, or only a shared hot wallet",
             1, trail[0])
     if rule == LARGEST_RECEIVE:
         r["caveat"] = CAVEAT_LARGEST
@@ -355,17 +379,46 @@ def _opener_summary(payer: str, step: dict, rpc_url: str, post) -> dict:
 
 
 def _story(r: dict) -> str:
-    return json.dumps([r["verdict"], r["deciding_hop"], r["party"], r["witness"]], sort_keys=True)
+    return json.dumps([r["verdict"], r["deciding_hop"], r["party"], r["witness"], r.get("shared_wallet")],
+                      sort_keys=True)
 
 
 def _blank(p: str, why: str, rule: str) -> dict:
     return {"payer": p, "verdict": "unreadable", "why": why, "hop_rule": rule, "deciding_hop": None,
-            "party": None, "witness": None, "trail": []}
+            "hop_depth": None, "party": None, "witness": None, "trail": []}
+
+
+def parse_shared_wallet(text: str) -> tuple:
+    """`ACCOUNT=KIND=SOURCE_URL` -> (account, kind, source); ValueError when malformed."""
+    parts = str(text).split("=", 2)
+    if len(parts) != 3:
+        raise ValueError(f"shared wallet must be ACCOUNT=KIND=SOURCE_URL, got {text!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def _shared_wallets(exchange, shared_wallets) -> dict:
+    """key -> {account, kind, source}: each wallet checked; `exchange` accounts are kind exchange, no source."""
+    out = {}
+    for item in shared_wallets:
+        account, kind, source = item
+        if public_key_from_address(account) is None:
+            raise ValueError(f"shared wallet is not a Nano account: {account!r}")
+        if kind not in SHARED_KINDS:
+            raise ValueError(f"shared wallet kind must be one of {', '.join(SHARED_KINDS)}, got {kind!r}")
+        if not isinstance(source, str) or not source.startswith("https://") or len(source) <= len("https://"):
+            raise ValueError(f"shared wallet source must be an https:// URL, got {source!r}")
+        out.setdefault(_key(account), {"account": account, "kind": kind, "source": source})
+    for account in exchange:
+        out.setdefault(_key(account), {"account": account, "kind": "exchange", "source": None})
+    return out
 
 
 def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: int = 1, post=None,
-                hop_rule: str = DEFAULT_HOP, payments=()) -> dict:
-    """Apply the stated test to each payer. Returns a JSON-ready dict."""
+                hop_rule: str = DEFAULT_HOP, payments=(), shared_wallets=()) -> dict:
+    """Apply the stated test to each payer. Returns a JSON-ready dict.
+
+    `shared_wallets`: (account, kind, source_url) for each publicly identified shared
+    hot wallet; `exchange` accounts are the same with kind exchange and no source."""
     hops = _check_hops(hops)
     if hop_rule not in HOP_RULES:
         raise ValueError(f"hop rule must be one of {', '.join(HOP_RULES)}, got {hop_rule!r}")
@@ -382,7 +435,7 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
     excl = {}
     for a in excluded:
         excl.setdefault(_key(a), a)
-    hubs = {_key(a) for a in exchange}
+    hubs = _shared_wallets(exchange, shared_wallets)
     pays = frozenset(str(p).upper() for p in payments)
 
     unique: dict[str, str] = {}
@@ -418,7 +471,7 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
         results.append(r)
 
     return {
-        "v": "stated-payer-test-v2",
+        "v": "stated-payer-test-v3",
         "test": STATED_TEST if hop_rule == LARGEST_RECEIVE else STATED_TEST_V1,
         "hop_rule": hop_rule,
         "reading": READING[hop_rule],
@@ -427,6 +480,7 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
         "payee": payee,
         "excluded": list(excluded),
         "exchange": list(exchange),
+        "shared_wallets": list(hubs.values()),
         "payments": sorted(pays),
         "hops": hops,
         "read_at": read_at,
@@ -440,7 +494,11 @@ def to_text(report: dict) -> str:
     lines = [f"stated test: {report['test']} (hop rule {rule}, hops={report['hops']}, read {report['read_at']})"]
     for r in report["payers"]:
         w = r["witness"] or {}
-        line = f"{r['payer']}  {r['verdict']}  - {r['why']}"
+        line = f"{r['payer']}  {r['verdict']}  - {r['why']}  (hop depth {r.get('hop_depth')})"
+        sw = r.get("shared_wallet")
+        if sw:
+            line += (f"\n    shared hot wallet {sw['account']}  kind {sw['kind']}  "
+                     f"source {sw['source'] or 'none given (--exchange)'}")
         if rule == LARGEST_RECEIVE and w.get("open_block"):
             line += f"\n    open {w['open_block']}  before: {w.get('before')}"
             if w.get("receive_block"):
@@ -471,7 +529,11 @@ def main(argv=None, post=None) -> int:
     p.add_argument("--payee", required=True, help="the seller's account")
     p.add_argument("--payer", action="append", required=True)
     p.add_argument("--excluded", action="append", default=[], help="an account of either party")
-    p.add_argument("--exchange", action="append", default=[], help="an exchange hot wallet, set aside")
+    p.add_argument("--exchange", action="append", default=[],
+                   help="an exchange hot wallet, set aside (a shared wallet of kind exchange, no source)")
+    p.add_argument("--shared-wallet", action="append", default=[], metavar="ACCOUNT=KIND=SOURCE_URL",
+                   help=f"a publicly identified shared hot wallet, set aside; KIND one of {', '.join(SHARED_KINDS)}, "
+                        "SOURCE_URL (https) the service's own public statement")
     p.add_argument("--hop", default=DEFAULT_HOP,
                    help=f"what one hop back reads: {LARGEST_RECEIVE} (default, amended 2026-11-10) "
                         f"or {OPENING_SEND} (as first stated)")
@@ -482,8 +544,9 @@ def main(argv=None, post=None) -> int:
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     try:
+        wallets = [parse_shared_wallet(w) for w in a.shared_wallet]
         report = stated_test(a.payee, a.payer, a.rpc or [DEFAULT_RPC], a.excluded, a.exchange, a.hops, post,
-                             a.hop, a.payment)
+                             a.hop, a.payment, wallets)
     except (ValueError, TypeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_BAD_INPUT

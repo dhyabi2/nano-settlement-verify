@@ -509,5 +509,93 @@ class LargestReceive(NoSockets):
         self.assertIn("--hop opening-send", text)
 
 
+SOURCE = "https://example.org/service/statement#hot-wallet"
+
+
+class SharedHotWallet(NoSockets):
+    """The second amendment (2026-11-10): a hop ending at a publicly identified shared
+    hot wallet (exchange, payment service, custodian) is not determinable, never
+    independent, and the verdict names the wallet."""
+
+    def test_named_payment_service_wallet_makes_the_payer_not_determinable_and_is_named(self):
+        post, hs = chain({A: [("receive", STRANGER, 5), ("receive", F, 900)]})
+        rep = st.stated_test(PAYEE, [A], [URL], (US,), (), 1, post, st.DEFAULT_HOP, (),
+                             [(F, "payment-service", SOURCE)])
+        r = rep["payers"][0]
+        self.assertEqual((r["verdict"], r["why"], r["party"]), ("not-determinable", st.CARVE_OUT, "payment-service"))
+        self.assertEqual(r["shared_wallet"], {"account": F, "kind": "payment-service", "source": SOURCE})
+        self.assertEqual(rep["shared_wallets"], [{"account": F, "kind": "payment-service", "source": SOURCE}])
+        self.assertEqual(rep["counts"]["independent"], 0)
+        self.assertIn("publicly identified shared hot wallet", rep["test"])
+
+    def test_the_same_funder_without_the_flag_reads_independent(self):
+        post, hs = chain({A: [("receive", STRANGER, 5), ("receive", F, 900)]})
+        r = run([A], {}, post=post, exchange=())["payers"][0]
+        self.assertEqual((r["verdict"], r["witness"]["source"]), ("independent", F))
+        self.assertNotIn("shared_wallet", r)
+
+    def test_cli_shared_wallet_names_account_kind_source_in_json_and_text(self):
+        post, hs = chain({A: [("receive", F, 900)]})
+        args = ["--payee", PAYEE, "--excluded", US, "--rpc", URL, "--payer", A,
+                "--shared-wallet", F + "=custodian=" + SOURCE + "?a=b"]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(st.main(args + ["--json"], post=post), 0)
+        r = json.loads(buf.getvalue())["payers"][0]
+        self.assertEqual(r["shared_wallet"], {"account": F, "kind": "custodian", "source": SOURCE + "?a=b"})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            st.main(args, post=post)
+        text = buf.getvalue()
+        self.assertIn("not-determinable", text)
+        self.assertIn(f"shared hot wallet {F}  kind custodian  source {SOURCE}?a=b", text)
+
+    def test_exchange_flag_still_works_as_kind_exchange_with_source_null(self):
+        post, hs = chain({A: [("receive", EXCH, 900)]})
+        args = ["--payee", PAYEE, "--rpc", URL, "--payer", A, "--exchange", EXCH, "--json"]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(st.main(args, post=post), 0)
+        rep = json.loads(buf.getvalue())
+        r = rep["payers"][0]
+        self.assertEqual((r["verdict"], r["party"]), ("not-determinable", "exchange"))
+        self.assertEqual(r["shared_wallet"], {"account": EXCH, "kind": "exchange", "source": None})
+        self.assertEqual(rep["exchange"], [EXCH])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            st.main(args[:-1], post=post)
+        self.assertIn("source none given (--exchange)", buf.getvalue())
+
+    def test_bad_kind_http_source_bad_account_or_shape_exit_3(self):
+        post, hs = chain({A: [("receive", F, 900)]})
+        bad = [F + "=bank=" + SOURCE, F + "=exchange=http://example.org/x", F + "=exchange=https://",
+               F + "=exchange=ftp://example.org", PAYEE[:-1] + ("1" if PAYEE[-1] != "1" else "3") + "=exchange=" + SOURCE,
+               F + "=exchange", F]
+        for value in bad:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = st.main(["--payee", PAYEE, "--rpc", URL, "--payer", A, "--shared-wallet", value], post=post)
+            self.assertEqual(code, 3, value)
+            self.assertIn("error:", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_hop_depth_is_on_every_verdict(self):
+        post = ledger({A: STRANGER, B: US, C: EXCH, US: STRANGER})
+        rep = run([A, B, C, D, US, "nano_garbage"], {}, post=post)
+        depth = {r["payer"]: (r["verdict"], r["hop_depth"]) for r in rep["payers"]}
+        self.assertEqual(depth, {A: ("independent", 1), B: ("not-independent", 1), C: ("not-determinable", 1),
+                                 D: ("unopened", None), US: ("not-independent", 0),
+                                 "nano_garbage": ("unreadable", None)})
+        for r in rep["payers"]:
+            self.assertEqual(r["hop_depth"], r["deciding_hop"])
+        r = run([A], {A: B, B: US}, hops=2)["payers"][0]
+        self.assertEqual((r["verdict"], r["hop_depth"]), ("not-independent", 2))
+
+    def test_v1_and_v2_wordings_are_kept_for_re_derivation(self):
+        self.assertIn("exchange hot wallets set aside", st.STATED_TEST_V1)
+        self.assertIn("largest receive into the payer before the payment", st.STATED_TEST_V2)
+        self.assertIn("exchange, payment service, or custodian", st.STATED_TEST)
+
+
 if __name__ == "__main__":
     unittest.main()
