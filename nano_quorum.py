@@ -53,6 +53,7 @@ __all__ = [
     "STOP_REASONS_SHA256",
     "Stop",
     "balance_corroborated",
+    "canonical_json",
     "distinct_endpoints",
     "node_states_sha256",
     "post_json_failover",
@@ -628,8 +629,18 @@ def node_states_sha256(table: dict) -> str:
     string mean the same vocabulary (their hashes are equal, and equal to the
     value pinned for that schema in `NODE_STATES_SHA256`).
     """
-    canonical = json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json(table).encode("utf-8")).hexdigest()
+
+
+def canonical_json(value) -> str:
+    """`value` as canonical JSON text: sorted keys, no whitespace, UTF-8 kept.
+
+    `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`,
+    the form `node_states_sha256` hashes. It is also the form the per-node
+    fixtures under tests/fixtures/observations/ are written in (plus one
+    trailing newline), so the same record always serializes to the same bytes.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 # The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
@@ -896,6 +907,62 @@ class Observation:
         if self.payer_account:
             out["payer_account"] = self.payer_account
         return out
+
+    @classmethod
+    def from_dict(cls, entry) -> "Observation":
+        """The `Observation` a `to_dict()` entry was written from, read back.
+
+        The inverse of to_dict() up to redaction: a URL written with `***@` is
+        read back as that text, and writing it again redacts nothing more, so
+        `to_dict(from_dict(entry)) == entry` for any entry to_dict() wrote.
+        Every key to_dict() always writes is required, "error" exactly for an
+        "unreadable" entry and "payer_account" only when it was written;
+        anything else - an unknown key, a missing one, a value of the wrong
+        type - raises ValueError, as does any entry the constructor refuses.
+        """
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"an observation entry must be a JSON object, got {_type_name(entry)}")
+        required = {"rpc_url", "state", "read_at", "attempted_at", "returned_at", "detail"}
+        optional = {"error", "payer_account"}
+        keys = set(entry)
+        if not required <= keys or not keys <= required | optional:
+            raise ValueError(
+                f"an observation entry has the keys {sorted(required)} and optionally "
+                f"{sorted(optional)}, got {sorted(map(str, keys))}"
+            )
+
+        def text(name, nullable=False):
+            value = entry[name]
+            if value is None and nullable:
+                return ""
+            if not isinstance(value, str):
+                raise ValueError(f"observation {name} must be a string, got {_type_name(value)}")
+            return value
+
+        error_kind = error_message = ""
+        if "error" in entry:
+            error = entry["error"]
+            if not isinstance(error, Mapping) or set(error) != {"kind", "message"}:
+                raise ValueError('an observation "error" is {"kind", "message"}')
+            error_kind, error_message = error["kind"], error["message"]
+            if not isinstance(error_kind, str) or not isinstance(error_message, str):
+                raise ValueError("an observation error's kind and message are strings")
+        elif entry["state"] == "unreadable":
+            raise ValueError('an unreadable entry carries its "error"')
+        payer = text("payer_account") if "payer_account" in entry else ""
+        if "payer_account" in entry and not payer:
+            raise ValueError("payer_account is written only when it is set")
+        return cls(
+            text("rpc_url"),
+            text("state"),
+            text("read_at", nullable=True),
+            text("detail"),
+            error_kind=error_kind,
+            error_message=error_message,
+            payer_account=payer,
+            attempted_at=text("attempted_at", nullable=True),
+            returned_at=text("returned_at", nullable=True),
+        )
 
 
 @dataclass(frozen=True)
