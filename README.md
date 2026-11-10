@@ -389,6 +389,13 @@ slack, or pass `not_after=None` to have no deadline.
 - `to_json()` writes `"refusal": false` and `"ask_again"` (true exactly when the receipt is
   unsettled) after `"settled"`, so a cached unsettled receipt says in itself that it is
   "not yet, ask again" and not a rejection. A refusal is never a receipt: it raises.
+- An `Observation` in any state but `not-asked` now raises `ValueError` when its `read_at`
+  is empty or is not UTC ISO-8601 ending in `Z`, so every asked node in a stored receipt
+  says when it was read. `verify_corroborated` already wrote one for every asked node, so
+  its records and the `/3` schema are unchanged; only an `Observation` built by hand without
+  a read time is refused. `node_states_sha256` hashes the state vocabulary, not the
+  observations: two receipts read at 12:00 and at 12:30 carry the same hash, are `==`, and
+  differ in `to_json()` by each node's `read_at`.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -666,7 +673,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1033 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1045 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

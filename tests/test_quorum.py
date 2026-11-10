@@ -1901,3 +1901,86 @@ def test_a_not_asked_node_has_its_credentials_redacted_and_no_read_time():
     assert entry["read_at"] is None
     with pytest.raises(ValueError, match="never read"):
         nano_quorum.Observation(A, "not-asked", "2026-11-09T12:00:00.000Z")
+
+
+# --- every asked node's record says when it was read ----------------------------------
+
+
+def clock_at(*moments):
+    """A clock for `verify_corroborated(clock=...)` returning the given "HH:MM:SS" UTC times."""
+    from datetime import datetime, timezone
+
+    queue = [
+        datetime(2026, 11, 9, *(int(part) for part in moment.split(":")), tzinfo=timezone.utc)
+        for moment in moments
+    ]
+    return lambda: queue.pop(0)
+
+
+def test_every_asked_state_writes_its_own_read_time_into_the_json(monkeypatch):
+    """In one unsettled receipt, an unreadable, a not-seen, an unconfirmed and a
+    confirmed node each carry, in the JSON, the moment that node was read."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"), B: {"error": "Block not found"},
+        C: send_block(confirmed="false"), D: send_block(),
+    })
+    out = verify_corroborated(
+        HASH, ONE_XNO, PAYEE, [A, B, C, D], clock=clock_at("12:00:01", "12:00:02", "12:00:03", "12:00:04"),
+    )
+    assert out.receipt.settled is False
+    record = json.loads(out.to_json())
+    assert record["ask_again"] is True
+    assert [(o["state"], o["read_at"]) for o in record["observations"]] == [
+        ("unreadable", "2026-11-09T12:00:01.000Z"),
+        ("not-seen", "2026-11-09T12:00:02.000Z"),
+        ("unconfirmed", "2026-11-09T12:00:03.000Z"),
+        ("confirmed", "2026-11-09T12:00:04.000Z"),
+    ]
+
+
+def test_a_mismatch_observation_carries_its_read_time(monkeypatch):
+    nodes(monkeypatch, {A: send_block(payee="nano_1someoneelse"), B: send_block()})
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:00:05"))
+    assert [(o.state, o.to_dict()["read_at"]) for o in caught.value.observations] == [
+        ("mismatch", "2026-11-09T12:00:05.000Z"), ("not-asked", None),
+    ]
+
+
+def test_not_seen_at_12_00_and_at_12_30_are_different_records(monkeypatch):
+    """The same node, the same "not seen", read half an hour apart: the stored
+    records differ by that node's read_at. `==` ignores read_at on purpose (see
+    `Corroboration`), so the JSON, not equality, is what tells their ages apart;
+    the pinned node_states_sha256 hashes the state vocabulary only, so it is the
+    same for both and says nothing about when."""
+    replies = {A: {"error": "Block not found"}, B: {"error": "Block not found"}}
+    nodes(monkeypatch, replies)
+    early = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:00:00", "12:00:00"))
+    nodes(monkeypatch, replies)
+    late = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:30:00", "12:30:00"))
+
+    early_record, late_record = json.loads(early.to_json()), json.loads(late.to_json())
+    assert early_record["observations"][0] == {
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z", "detail": "",
+    }
+    assert late_record["observations"][0] == {
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z", "detail": "",
+    }
+    assert early.to_json() != late.to_json()
+    assert early == late and hash(early) == hash(late)
+    assert early_record["node_states_sha256"] == late_record["node_states_sha256"]
+
+
+@pytest.mark.parametrize("state", ["confirmed", "unconfirmed", "not-seen", "unreadable", "mismatch"])
+def test_an_asked_observation_with_no_read_time_is_refused(state):
+    """A node that was asked was read at some moment; a record of it with no
+    moment cannot say how old its answer is, so it cannot be made."""
+    error = {"error_kind": "OSError", "error_message": "timed out"} if state == "unreadable" else {}
+    with pytest.raises(ValueError, match="read_at"):
+        nano_quorum.Observation(A, state, "", **error)
+
+
+@pytest.mark.parametrize("read_at", ["12:00", "2026-11-09T12:00:00", "2026-11-09T14:00:00.000+02:00", "soon"])
+def test_an_asked_observation_read_time_must_be_utc_iso_8601(read_at):
+    with pytest.raises(ValueError, match="read_at"):
+        nano_quorum.Observation(A, "not-seen", read_at)

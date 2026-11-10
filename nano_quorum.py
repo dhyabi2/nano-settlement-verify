@@ -695,6 +695,17 @@ def _redact_text(text: object) -> object:
     return _CREDENTIALS_IN_TEXT.sub(r"\1***@", text)
 
 
+def _is_utc_iso(text: object) -> bool:
+    """Whether `text` is a full ISO-8601 date and time in UTC, written with a trailing Z."""
+    if not isinstance(text, str) or not text.endswith("Z") or "T" not in text:
+        return False
+    try:
+        moment = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0
+
+
 @dataclass(frozen=True)
 class Observation:
     """What one endpoint said about the block, and when its answer was read.
@@ -711,7 +722,9 @@ class Observation:
     "not-seen" and "unconfirmed" are kept apart on purpose: both leave the
     receipt unsettled, but they are different facts about different nodes, and
     a record that folds them loses which node said which and when.
-    `read_at` is UTC ISO-8601.
+    `read_at` is UTC ISO-8601 ending in Z, and every state but "not-asked"
+    must carry one: an asked node with no read time, or one that is not UTC
+    ISO-8601, is refused when the `Observation` is made.
 
     `payer_account` is the payer chain (`block_account`) that a "confirmed"
     node's reply named, as a nano_ address, so the per-node record says which
@@ -749,6 +762,14 @@ class Observation:
             raise ValueError(f"payer_account {self.payer_account!r} is not a Nano address")
         if self.state == "not-asked" and self.read_at:
             raise ValueError("a not-asked node was never read, so it has no read_at")
+        if self.state != "not-asked" and not _is_utc_iso(self.read_at):
+            # A node that was asked was read at some moment. Without it, a stored
+            # record cannot say how old the answer is: "not seen" at 12:00 and
+            # "not seen" at 12:30 would read the same.
+            raise ValueError(
+                f"a {self.state!r} observation was read, so its read_at must be the UTC "
+                f"ISO-8601 moment of that read ending in Z, got {self.read_at!r}"
+            )
 
     def to_dict(self) -> dict:
         out = {
