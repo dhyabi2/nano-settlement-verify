@@ -507,6 +507,19 @@ def verify(
     if not_after is not None:
         not_after = _deadline(not_after)
     reply = post_json(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
+    return _receipt_of_reply(block_hash, expect_raw, account, reply, not_after)
+
+
+def _receipt_of_reply(
+    block_hash: str, expect_raw: int, account: str, reply: object, not_after=None
+) -> Receipt:
+    """`verify`'s verdict on a block_info reply already in hand.
+
+    Everything `verify` decides after the node has answered, unchanged. It is
+    split out so `nano_quorum` can read the same reply once and both reach this
+    verdict and check which block the reply is about; `not_after` must already
+    have been through `_deadline`, as `verify` does before it calls the node.
+    """
     # A node's block_info answer is a JSON object. Anything else is not an answer
     # about this block, and it must not become one: the test below is `in`, which
     # on a string is a substring test and on a list a membership test, so a

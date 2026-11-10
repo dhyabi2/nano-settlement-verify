@@ -28,11 +28,14 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from datetime import datetime, timezone
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -42,10 +45,17 @@ __all__ = [
     "Corroboration",
     "Disagreement",
     "NotCorroborated",
+    "NODE_STATES",
+    "NODE_STATES_SHA256",
+    "Observation",
+    "RECEIPT_SCHEMA",
     "balance_corroborated",
     "distinct_endpoints",
+    "node_states_sha256",
     "post_json_failover",
+    "redact_url",
     "verify_corroborated",
+    "verify_receipt_vocabulary",
 ]
 
 # How many endpoints must say the same thing before it is believed. Two is the
@@ -62,7 +72,7 @@ class NotCorroborated(Exception):
     for, and XNO does not come back. Hold the call and ask again.
     """
 
-    def __init__(self, answered: int, agree: int, failures: dict) -> None:
+    def __init__(self, answered: int, agree: int, failures: dict, observations=()) -> None:
         detail = "; ".join(f"{url}: {why}" for url, why in failures.items())
         super().__init__(
             f"{answered} of {answered + len(failures)} endpoints answered, "
@@ -71,6 +81,9 @@ class NotCorroborated(Exception):
         self.answered = answered
         self.agree = agree
         self.failures = dict(failures)
+        # One `Observation` per endpoint asked, in the order asked. Empty when
+        # the caller is not `verify_corroborated` (failover, balances).
+        self.observations = tuple(observations)
 
 
 class Disagreement(Exception):
@@ -97,6 +110,14 @@ class Disagreement(Exception):
     answer and is not there. `observed_answers` maps those same endpoints to their
     answers as text. `record()` is all of it as a JSON-ready dict.
 
+    `node_observations` is the per-node record `verify_corroborated` keeps
+    everywhere else (`Corroboration.observations`, `NotCorroborated` and
+    `Mismatch` `.observations`): one `Observation` per configured endpoint,
+    unreadable ones included, each with its state and UTC `read_at`, and
+    those after the contradiction as "not-asked". It is
+    a separate attribute because `observations` here is the mapping above;
+    it is empty when the raiser is not `verify_corroborated`.
+
     Raises `TypeError` when `answers`, `observations` or `observed_answers` is
     not a mapping (`observations` and `observed_answers` may be None). This is a
     change for direct callers: before `observations` existed, an `answers`
@@ -109,6 +130,7 @@ class Disagreement(Exception):
         answers: dict,
         observations: dict | None = None,
         observed_answers: dict | None = None,
+        node_observations=(),
     ) -> None:
         answers = _mapping("answers", answers)
         detail = "; ".join(f"{_text(url)}: {_text(answer)}" for url, answer in answers.items())
@@ -116,6 +138,9 @@ class Disagreement(Exception):
         self.answers = answers
         self.observations = _mapping("observations", observations)
         self.observed_answers = _mapping("observed_answers", observed_answers)
+        # One `Observation` per endpoint asked, unreadable ones included, with
+        # the time each was read, when raised by `verify_corroborated`.
+        self.node_observations = tuple(node_observations)
 
     def record(self) -> dict:
         """Every observation as a strict-JSON dict, for a dispute log.
@@ -540,6 +565,231 @@ def _repr(value) -> str:
     except Exception:
         return "<unrepresentable %s>" % _type_name(value)
 
+# The version of the `Corroboration.to_json()` record. It is written into every
+# record as "schema", so a stored receipt says which vocabulary it was written in.
+#
+# /3 added the "not-asked" state (a configured node the check never queried) and
+# the receipt-level "refusal" / "ask_again" fields; /2 had neither, and listed only
+# the nodes it asked.
+RECEIPT_SCHEMA = "nano_quorum.corroboration/3"
+
+# The only states an `Observation` can carry, in a fixed order, each with what it
+# means. This exact mapping is written into every `to_json()` record as
+# "node_states", so a reader of a stored receipt needs no code to tell the states
+# apart - above all "not-seen" (the node ANSWERED, and has no such block) from
+# "unreadable" (the node gave NO answer about the block at all).
+NODE_STATES = {
+    "confirmed": "the node answered: it has the block, confirmed, and it matches the expected payment",
+    "unconfirmed": "the node answered: it has the block, but has not confirmed it yet",
+    "not-seen": "the node answered, and its answer is that it does not have the block",
+    "unreadable": (
+        "the node gave no answer about the block: it errored, timed out, refused, or "
+        "returned something that is not a node reply; 'error' says which. "
+        "This is not an empty answer"
+    ),
+    "mismatch": "the node answered: it has the block confirmed, and it does not match the expected payment",
+    "not-asked": (
+        "the node is in the configured set but was never queried: the check ended (quorum "
+        "reached, or a refusal) before its turn. It said nothing; this is not a no, not an "
+        "error, and not a silence"
+    ),
+}
+
+
+def node_states_sha256(table: dict) -> str:
+    """SHA-256 (lowercase hex) of a node-state table, as written into a receipt.
+
+    The canonical form, which is all a stranger needs to recompute it from a
+    stored receipt alone:
+
+        json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    encoded as UTF-8, then hashed with SHA-256. Keys are sorted, there is no
+    whitespace, and non-ASCII text is kept as UTF-8 rather than escaped.
+
+    The hash covers the inline "node_states" table of the record, nothing
+    else. A reader can therefore check that the table in a record was not
+    edited after it was written (recompute and compare with the record's
+    "node_states_sha256"), and that two records carrying the same "schema"
+    string mean the same vocabulary (their hashes are equal, and equal to the
+    value pinned for that schema in `NODE_STATES_SHA256`).
+    """
+    canonical = json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
+# or its meaning changes the hash, and the check below then refuses to import
+# the module until RECEIPT_SCHEMA is bumped and this value re-pinned with it -
+# so "nano_quorum.corroboration/3" cannot quietly come to mean something else.
+# (/2, without "not-asked", pinned f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77.)
+NODE_STATES_SHA256 = "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
+
+
+def _check_vocabulary_pin(table: dict, pinned: str) -> None:
+    """Raise unless `table` hashes to `pinned`; run on `NODE_STATES` at import."""
+    actual = node_states_sha256(table)
+    if actual != pinned:
+        raise AssertionError(
+            f"NODE_STATES hashes to {actual}, but {RECEIPT_SCHEMA} pins {pinned}: "
+            "a changed vocabulary needs a new RECEIPT_SCHEMA and a new NODE_STATES_SHA256"
+        )
+
+
+_check_vocabulary_pin(NODE_STATES, NODE_STATES_SHA256)
+
+
+def verify_receipt_vocabulary(record) -> bool:
+    """Whether a stored receipt's state vocabulary is the one its schema names.
+
+    `record` is a `to_json()` string or the dict it parses to. True only when
+    the record's inline "node_states" table hashes (see `node_states_sha256`)
+    to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, and
+    its "schema" is `RECEIPT_SCHEMA`. False for an edited table, an edited or
+    missing hash, or a record of another schema. Nothing is raised for a
+    well-formed JSON object; a string that is not JSON raises ValueError.
+    """
+    if isinstance(record, (str, bytes)):
+        record = json.loads(record)
+    if not isinstance(record, dict) or record.get("schema") != RECEIPT_SCHEMA:
+        return False
+    table = record.get("node_states")
+    if not isinstance(table, dict):
+        return False
+    actual = node_states_sha256(table)
+    return actual == record.get("node_states_sha256") == NODE_STATES_SHA256
+
+
+# The userinfo of a URL: after `scheme://` or a scheme-relative `//`, up to the
+# last `@` before the path. Leading whitespace is allowed, as `_endpoint_key`
+# strips it before a URL is used.
+_CREDENTIALS = re.compile(r"^(\s*(?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/?#]*@")
+# The same userinfo inside free text - an error message that quotes the URL. A
+# URL ends at whitespace there, so the userinfo does too.
+_CREDENTIALS_IN_TEXT = re.compile(r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/?#\s]*@")
+
+
+def redact_url(rpc_url: object) -> object:
+    """`rpc_url` with any `user:pass@` (or `token@`) replaced by `***@`.
+
+    Used wherever a receipt writes an endpoint down, so a key carried in the
+    URL is not stored or shown with the record. Only the userinfo is touched;
+    a key in the path or query string is not recognised. A URL with leading
+    whitespace, or a scheme-relative `//user:pass@host`, is redacted too. A
+    non-string is returned as it is.
+    """
+    if not isinstance(rpc_url, str):
+        return rpc_url
+    return _CREDENTIALS.sub(r"\1***@", rpc_url)
+
+
+def _redact_text(text: object) -> object:
+    """`text` with the userinfo of every URL in it replaced by `***@`.
+
+    For the free text a record writes beside an endpoint - an error message or
+    a detail that may quote the URL it failed on. A non-string is returned as
+    it is.
+    """
+    if not isinstance(text, str):
+        return text
+    return _CREDENTIALS_IN_TEXT.sub(r"\1***@", text)
+
+
+@dataclass(frozen=True)
+class Observation:
+    """What one endpoint said about the block, and when its answer was read.
+
+    `state` is one of the keys of `NODE_STATES`, which says what each means;
+    any other value is refused when the `Observation` is made.
+
+    "not-seen" and "unreadable" are different facts: a node that answered "no
+    such block" told us something; a node that errored told us nothing. An
+    "unreadable" observation therefore always carries `error_kind` (the
+    exception's type name) and `error_message`, and to_dict() writes them as
+    "error"; no other state carries them.
+
+    "not-seen" and "unconfirmed" are kept apart on purpose: both leave the
+    receipt unsettled, but they are different facts about different nodes, and
+    a record that folds them loses which node said which and when.
+    `read_at` is UTC ISO-8601.
+
+    `payer_account` is the payer chain (`block_account`) that a "confirmed"
+    node's reply named, as a nano_ address, so the per-node record says which
+    chain each node reported - two nodes on different chains raise
+    `Disagreement`, and this is how its `node_observations` tell them apart.
+    It is empty when the reply named no valid payer chain, and to_dict()
+    writes it as "payer_account" only when it is set, so a record with no
+    payer named is unchanged. Only a "confirmed" observation carries one, and
+    it must be a valid address.
+
+    "not-asked" is a node in the configured set that was never queried,
+    because the check ended (quorum reached, or a refusal) before its turn. It
+    was not read, so its `read_at` is empty in memory and null in to_dict();
+    `detail` says why it was not asked. It carries no error and no payer.
+    """
+
+    rpc_url: str
+    state: str
+    read_at: str
+    detail: str = ""
+    error_kind: str = ""
+    error_message: str = ""
+    payer_account: str = ""
+
+    def __post_init__(self) -> None:
+        if self.state not in NODE_STATES:
+            raise ValueError(f"unknown node state {self.state!r}; expected one of {tuple(NODE_STATES)}")
+        if self.state == "unreadable" and not self.error_kind:
+            raise ValueError("an unreadable observation must say what the error was")
+        if self.state != "unreadable" and (self.error_kind or self.error_message):
+            raise ValueError(f"a {self.state!r} observation is an answer and carries no error")
+        if self.payer_account and self.state != "confirmed":
+            raise ValueError(f"a {self.state!r} observation names no payer chain; only a confirmed one does")
+        if self.payer_account and not nano_settlement_verify.is_valid_account(self.payer_account):
+            raise ValueError(f"payer_account {self.payer_account!r} is not a Nano address")
+        if self.state == "not-asked" and self.read_at:
+            raise ValueError("a not-asked node was never read, so it has no read_at")
+
+    def to_dict(self) -> dict:
+        out = {
+            "rpc_url": redact_url(self.rpc_url),
+            "state": self.state,
+            "read_at": None if self.state == "not-asked" else self.read_at,
+            "detail": _redact_text(self.detail),
+        }
+        if self.state == "unreadable":
+            out["error"] = {"kind": self.error_kind, "message": _redact_text(self.error_message)}
+        if self.payer_account:
+            out["payer_account"] = self.payer_account
+        return out
+
+
+_STATE_OF_ANSWER = {
+    "settled": "confirmed",
+    "not-yet": "unconfirmed",
+    "not-seen": "not-seen",
+    "mismatch": "mismatch",
+    # A confirmed send whose contents hash to another block than the one asked
+    # for. The vocabulary (and its pinned hash) is unchanged: it is written as
+    # "mismatch" - the node has a block confirmed and it is not the expected
+    # payment - with `detail` naming both hashes.
+    "other-block": "mismatch",
+}
+if not set(_STATE_OF_ANSWER.values()) <= set(NODE_STATES):
+    raise AssertionError("_STATE_OF_ANSWER names a state outside NODE_STATES")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(moment: datetime) -> str:
+    """`moment` as UTC ISO-8601 with a trailing Z; a naive datetime is taken as UTC."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    text = moment.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return text.replace("+00:00", "Z")
+
 
 @dataclass(frozen=True)
 class Corroboration:
@@ -550,23 +800,77 @@ class Corroboration:
     answered did not get there - the block is not confirmed yet, or not enough
     of them have seen it - and, exactly as in `verify`, that is "not yet", not
     "no".
+
+    `observations` has one `Observation` per configured endpoint (after
+    `distinct_endpoints` folds duplicates), in the order given: which node said
+    what, and when. An endpoint after the quorum was not asked and is listed
+    as "not-asked", so "never contacted" is never mistaken for "silent".
+
+    A `Corroboration` is never a refusal - a refusal raises (`Mismatch`,
+    `Disagreement`). `to_json()` says so in the record itself: `"refusal":
+    false` always, and `"ask_again": true` exactly when the receipt is
+    unsettled, so a cached unsettled receipt cannot be read as "rejected".
+
+    Equality and hash() are over what was decided and what each node said -
+    the receipt, the endpoint tuples, and each observation's endpoint, state,
+    detail, error and payer chain - and NOT over each observation's `read_at`.
+    Two calls that got the same answers from the same nodes a second apart are equal and
+    hash alike, as they were before `read_at` existed; `to_json()` still
+    differs between them, because the record says when each answer was read.
+
+    `to_json()` writes every endpoint URL with any credentials (`user:pass@`)
+    replaced by `***@`, and does the same to any URL quoted in an
+    observation's `detail` or error message; the tuples and observations in
+    memory keep the text exactly as given.
     """
 
     receipt: Receipt
     agreed: tuple[str, ...]
     answered: tuple[str, ...]
     failed: tuple[str, ...]
+    observations: tuple[Observation, ...] = ()
+
+    def _identity(self) -> tuple:
+        return (
+            self.receipt,
+            self.agreed,
+            self.answered,
+            self.failed,
+            tuple(
+                (
+                    seen.rpc_url, seen.state, seen.detail, seen.error_kind,
+                    seen.error_message, seen.payer_account,
+                )
+                for seen in self.observations
+            ),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Corroboration):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
 
     def to_json(self) -> str:
         return json.dumps(
             {
+                "schema": RECEIPT_SCHEMA,
                 "settled": self.receipt.settled,
+                # Unsettled means "not yet / could not decide", never "no":
+                # whoever reads a cached record must ask again, not refuse.
+                "refusal": False,
+                "ask_again": not self.receipt.settled,
                 "amount_raw": self.receipt.amount_raw,
                 "height": self.receipt.height,
                 "account": self.receipt.account,
-                "agreed": list(self.agreed),
-                "answered": list(self.answered),
-                "failed": list(self.failed),
+                "agreed": [redact_url(url) for url in self.agreed],
+                "answered": [redact_url(url) for url in self.answered],
+                "failed": [redact_url(url) for url in self.failed],
+                "observations": [seen.to_dict() for seen in self.observations],
+                "node_states": dict(NODE_STATES),
+                "node_states_sha256": NODE_STATES_SHA256,
             }
         )
 
@@ -659,23 +963,81 @@ def post_json_failover(rpc_urls, payload: dict):
     raise NotCorroborated(answered=0, agree=1, failures=failures)
 
 
+def _payer_of(reply: object):
+    """The chain a block sits on (`block_account`), as its nano_ address, or None.
+
+    The address is rebuilt from the account's public key, so two spellings of
+    one account (`nano_`/`xrb_`) are one payer and compare equal. A reply that
+    names none, or names something that is not a valid address, has named no
+    payer chain at all: it is None, and None is never compared - it neither
+    makes two answers disagree nor helps one settle.
+    """
+    named = reply.get("block_account") if isinstance(reply, dict) else None
+    key = nano_settlement_verify.public_key_from_address(named)
+    if key is None:
+        return None
+    from nano_five_fields import _address_of_key  # here, not at the top: it imports this module
+
+    return _address_of_key(key)
+
+
+# `verify` as this module was imported with it. `_answer` reads the reply itself
+# (to check which block it is about); when `nano_settlement_verify.verify` has
+# been replaced - stubbed in a test, or wrapped by a caller - it is called
+# instead, as it always was, so the replacement still takes effect.
+_ORIGINAL_VERIFY = nano_settlement_verify.verify
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
-    A settled receipt becomes the facts it asserts; everything else becomes a
-    tag. `Mismatch` is carried rather than raised here so the caller can decide
-    what one node's refusal is worth.
+    A settled receipt becomes the facts it asserts - amount, height and payee -
+    plus, as a fifth element, the chain the block sits on (`_payer_of`, None
+    when the reply names none); everything else becomes a tag. Only the first
+    four are compared for agreement; the payer is compared separately, and only
+    when two answers both name one. `Mismatch` is carried rather than raised
+    here so the caller can decide what one node's refusal is worth.
+
+    The reply is read once, and `verify`'s own verdict is reached on it. When
+    the reply's contents are complete enough to recompute a block hash from
+    (`nano_five_fields.block_hash_of`) and that hash is not the one asked for,
+    the node has answered about a DIFFERENT block: that is tagged "other-block",
+    never "settled", however well its amount and payee match. Contents too
+    sparse to hash are not a hash checked, and are read as before.
+
+    If `nano_settlement_verify.verify` is no longer the original function, it
+    is called as before this module read replies itself, and the answer is
+    built from the Receipt it returns; there is then no reply in hand, so no
+    block hash and no payer are checked.
     """
     verify = nano_settlement_verify.verify  # looked up per call so a stub takes effect
+    if verify is not _ORIGINAL_VERIFY:
+        reply = None
+        receipt_of = lambda: verify(block_hash, expect_raw, account, rpc_url)  # noqa: E731
+    else:
+        post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
+        reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": block_hash})
+        receipt_of = lambda: nano_settlement_verify._receipt_of_reply(  # noqa: E731
+            block_hash, expect_raw, account, reply
+        )
     try:
-        receipt = verify(block_hash, expect_raw, account, rpc_url)
+        receipt = receipt_of()
     except NotFound:
         return ("not-seen",), None
     except Mismatch as error:
         return ("mismatch", repr(error.got), repr(error.expected)), error
     if not receipt.settled:
         return ("not-yet",), None
-    return ("settled", receipt.amount_raw, receipt.height, receipt.account), receipt
+    if reply is None:
+        return ("settled", receipt.amount_raw, receipt.height, receipt.account, None), receipt
+    from nano_five_fields import block_hash_of  # here, not at the top: it imports this module
+
+    answered_for = block_hash_of(reply.get("contents"))
+    if answered_for is not None and answered_for != str(block_hash).strip().upper():
+        return ("other-block", answered_for, str(block_hash)), None
+    return (
+        "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)
+    ), receipt
 
 
 def verify_corroborated(
@@ -684,6 +1046,8 @@ def verify_corroborated(
     account: str,
     rpc_urls,
     agree: int = AGREE_DEFAULT,
+    *,
+    clock=None,
 ) -> Corroboration:
     """Prove a send settled, believing it only when `agree` endpoints concur.
 
@@ -692,7 +1056,14 @@ def verify_corroborated(
     quorum is not called at all, and the list should be ordered by how much the
     caller trusts it. Endpoints that cannot be read are skipped, not retried.
 
-    Returns a `Corroboration`. Its receipt is settled only on agreement.
+    Returns a `Corroboration`. Its receipt is settled only on agreement. Its
+    `observations` name every configured endpoint, the state it reported, and
+    the UTC time its answer was read - an endpoint the check ended before is
+    there as "not-asked", with no read time; `NotCorroborated` and `Disagreement` raised
+    here carry the same list, and a `Mismatch` raised here is given it as an
+    `observations` attribute. `clock`, if given, is a no-argument callable
+    returning a datetime (naive is read as UTC); it exists so tests can fix
+    `read_at`, and changes no decision.
 
     Raises:
       `Mismatch` - an endpoint has the block confirmed and says it paid a
@@ -711,6 +1082,7 @@ def verify_corroborated(
         # expectation is the caller's bug, and no number of nodes repairs it.
         raise TypeError(f"expect_raw must be an int of raw, got {type(expect_raw).__name__}")
     endpoints = distinct_endpoints(rpc_urls, agree=agree)
+    now = _utc_now if clock is None else clock
 
     failures: dict[str, str] = {}
     answered: list[str] = []
@@ -720,51 +1092,129 @@ def verify_corroborated(
     # keyed by answer, a later agreeing node's receipt overwrote an earlier
     # one's, and a Disagreement attributed it to the wrong endpoint.
     settled: list[tuple[str, tuple, Receipt]] = []
-    # Every endpoint that answered at all, in the order asked: the settled ones
-    # with their receipts, and those that have not seen the send or not yet
-    # confirmed it with None, so a Disagreement records every answer before
-    # the contradiction, not only the settled ones.
-    heard: list[tuple[str, tuple, Receipt | None]] = []
+    # Every endpoint that answered at all, in the order asked, with its answer
+    # as text: the settled ones with their receipts, and those that have not
+    # seen the send or not yet confirmed it with None, so a Disagreement
+    # records every answer before the contradiction, not only the settled ones.
+    heard: list[tuple[str, str, Receipt | None]] = []
+    # One `Observation` per endpoint asked, unreadable ones included, with the
+    # time each answer was read.
+    observations: list[Observation] = []
+    named_payer = None  # (payer address, endpoint) of the first settled answer naming one
+
+    def not_asked(why: str) -> None:
+        # Every configured endpoint the check ends before is listed too, as
+        # "not-asked", so the record names each configured node exactly once:
+        # "never contacted" must not read as "asked and silent". Observations
+        # are appended one per endpoint in order, so the rest are not asked.
+        for rpc_url in endpoints[len(observations):]:
+            observations.append(Observation(rpc_url, "not-asked", "", f"not asked: {why}"))
+
+    def disagreement(answers: dict, rpc_url: str, said: str, payload) -> Disagreement:
+        not_asked("the check stopped on a disagreement")
+        # `answers` names the two sides; `observations` / `observed_answers`
+        # keep every endpoint that answered so far, then the one that
+        # contradicts them; `node_observations` is the per-node record, with
+        # unreadable endpoints and read times.
+        witnesses = heard + [(rpc_url, said, payload)]
+        observed = {url: text for url, text, _ in witnesses}
+        for url, text in answers.items():
+            if url in observed:
+                observed[url] = text
+        return Disagreement(
+            answers,
+            observations={url: receipt for url, _, receipt in witnesses},
+            observed_answers=observed,
+            node_observations=observations,
+        )
 
     for rpc_url in endpoints:
         try:
             answer, payload = _answer(block_hash, expect_raw, account, rpc_url)
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
+            observations.append(
+                Observation(
+                    rpc_url,
+                    "unreadable",
+                    _iso_utc(now()),
+                    failures[rpc_url],
+                    error_kind=type(error).__name__,
+                    error_message=str(error),
+                )
+            )
             continue
         answered.append(rpc_url)
+        observations.append(
+            Observation(
+                rpc_url,
+                _STATE_OF_ANSWER[answer[0]],
+                _iso_utc(now()),
+                f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch"
+                else f"answered for block {answer[1]}, not the requested {answer[2]}"
+                if answer[0] == "other-block" else "",
+                # The payer chain this node's reply named, so the per-node
+                # record says which chain each node reported.
+                payer_account=(answer[4] or "") if answer[0] == "settled" else "",
+            )
+        )
+        if answer[0] == "other-block":
+            # Fail closed, immediately, as for a mismatch. The node reports a
+            # confirmed send, but the contents it sent hash to another block:
+            # whatever it says about amount and payee is about that block, not
+            # this one. Counting it toward agreement would let two nodes
+            # "corroborate" a payment by describing two different blocks.
+            raise disagreement(
+                {"requested": f"block {answer[2]}", rpc_url: f"contents that hash to {answer[1]}"},
+                rpc_url, f"contents that hash to {answer[1]}", None,
+            )
         if answer[0] == "mismatch":
             # Fail closed, immediately. This endpoint has the block CONFIRMED
             # and reports it paid someone else or a different amount. Blocks do
             # not change after confirmation, so asking another node cannot make
             # this answer go away - it can only find a node that has not caught
             # up yet and read its silence as agreement.
+            not_asked("the check stopped on a mismatch")
+            payload.observations = tuple(observations)
             raise payload
         if answer[0] != "settled":
-            heard.append((rpc_url, answer, payload))
+            heard.append((rpc_url, str(answer), payload))
             continue
-        if settled_by and answer not in settled_by:
+        # The payer chain is set apart from what is compared: an answer that
+        # names no parseable payer has said nothing about it, so it can neither
+        # contradict an answer that does nor be what lets one settle.
+        facts, payer = answer[:4], answer[4]
+        if settled_by and facts not in settled_by:
             # `answers` is as it always was - the first endpoint to settle and
             # the one that contradicts it - and every endpoint that answered so
-            # far is kept beside it, each with what it itself said, then the
-            # one that contradicts them.
-            witnesses = heard + [(rpc_url, answer, payload)]
-            raise Disagreement(
-                {settled[0][0]: str(settled[0][1]), rpc_url: str(answer)},
-                observations={url: receipt for url, _, receipt in witnesses},
-                observed_answers={url: str(said) for url, said, _ in witnesses},
+            # far is kept beside it, each with what it itself said.
+            raise disagreement(
+                {settled[0][0]: str(settled[0][1]), rpc_url: str(facts)},
+                rpc_url, str(facts), payload,
             )
-        settled_by.setdefault(answer, []).append(rpc_url)
-        settled.append((rpc_url, answer, payload))
-        heard.append((rpc_url, answer, payload))
-        if len(settled_by[answer]) >= agree:
+        if payer is not None and named_payer is not None and payer != named_payer[0]:
+            raise disagreement(
+                {
+                    named_payer[1]: f"{facts} on payer chain {named_payer[0]}",
+                    rpc_url: f"{facts} on payer chain {payer}",
+                },
+                rpc_url, str(facts), payload,
+            )
+        if payer is not None and named_payer is None:
+            named_payer = (payer, rpc_url)
+        settled_by.setdefault(facts, []).append(rpc_url)
+        settled.append((rpc_url, facts, payload))
+        heard.append((rpc_url, str(facts), payload))
+        if len(settled_by[facts]) >= agree:
+            not_asked(f"quorum of {agree} was reached before its turn")
             return Corroboration(
                 # The receipt of the endpoint that completed the quorum, as
                 # before; every agreeing receipt asserts the same facts.
                 receipt=payload,
-                agreed=tuple(settled_by[answer]),
+                agreed=tuple(settled_by[facts]),
                 answered=tuple(answered),
                 failed=tuple(failures),
+                observations=tuple(observations),
             )
 
     if len(answered) < agree:
@@ -772,16 +1222,21 @@ def verify_corroborated(
         # "nobody could tell us" and "they told us it is not confirmed yet" are
         # different facts, and only the second one is safe to act on by waiting
         # a little and asking again.
-        raise NotCorroborated(answered=len(answered), agree=agree, failures=failures)
+        raise NotCorroborated(
+            answered=len(answered), agree=agree, failures=failures, observations=observations
+        )
 
     # Enough endpoints answered, but fewer than `agree` of them reported the
     # send confirmed - the usual reason being that confirmation has not reached
-    # all of them yet. As in `verify`, that is "not yet", not "no".
+    # all of them yet. As in `verify`, that is "not yet", not "no". Which node
+    # had not seen the block and which had seen it unconfirmed is in
+    # `observations`, each with the time it was read.
     return Corroboration(
         receipt=Receipt(settled=False, amount_raw=0, height=0, account=""),
         agreed=(),
         answered=tuple(answered),
         failed=tuple(failures),
+        observations=tuple(observations),
     )
 
 
