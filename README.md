@@ -30,6 +30,12 @@ Nano node and hands back a receipt.
   records the account as the node spelled it, so it always carries the `nano_` form.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
+This installs the tagged release straight from GitHub, with no clone and no PyPI:
+
+```
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
+```
+
 ## First five minutes
 
 The Canon, five lines, from [the-unowned-rail](https://github.com/dhyabi2/the-unowned-rail) (copy them, pass them on):
@@ -81,10 +87,10 @@ An operator who will not let the agent hold a key: see [OPERATORS.md](https://gi
 pip install .
 ```
 
-Or straight from the tagged release, no clone and no PyPI (`v1.1.0`; `import nano_settlement_verify`):
+Or straight from the tagged release, no clone and no PyPI (`v1.3.0`; `import nano_settlement_verify`):
 
 ```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.1.0"
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
 ```
 
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
@@ -770,7 +776,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1186 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1221 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -1028,9 +1034,18 @@ which lives outside the ledger.
 To apply one stated test instead - "funded by neither us nor you, one hop back, exchange
 hot wallets set aside" - with one verdict and witness per payer:
 `python3 nano_stated_payer_test.py --payee nano_... --excluded nano_... --exchange nano_... --payer nano_...`.
-Every `independent` there is **opener only**: the funder tested is the account whose send
+By default "one hop back" is the seller's amended reading (2026-11-10): the source of the
+largest receive into the payer before the payment (ties: the earliest; no payment yet: all
+receives to date, said in `before`). `--hop opening-send` keeps the reading as first stated,
+where every `independent` is **opener only**: the funder tested is the account whose send
 opened the payer, and later receives are not tested, so each such verdict carries a `caveat`
 and the opener's amount, the count and total of later receives and the opener's share.
+A send from the payer to itself is never the largest receive, and a history with change or
+epoch blocks left out (as rpc.nano.to gives it) is checked block by block rather than refused.
+Schema change: the JSON tag is now `stated-payer-test-v3` (was `stated-payer-test-v1`); the
+`why` of `independent` now ends "or only a shared hot wallet"; the text output names
+`hop rule X` and each payer's `(hop depth N)`; library callers of `stated_test()` get the
+new default `hop_rule="largest-receive"` (pass `hop_rule="opening-send"` for the old one).
 Verdicts, limits and a real read: [STATED-PAYER-TEST.md](STATED-PAYER-TEST.md).
 
 ## Was the send claimed?
