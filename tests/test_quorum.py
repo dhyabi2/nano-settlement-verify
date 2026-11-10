@@ -802,10 +802,15 @@ def test_every_endpoint_unreadable_is_not_corroborated_not_a_mismatch(monkeypatc
 
 
 def ticking_clock(*moments):
-    """A clock for `verify_corroborated(clock=...)`: one fixed UTC moment per read."""
+    """A clock for `verify_corroborated(clock=...)`: one fixed UTC moment per read.
+
+    The clock is read twice per node asked (before the request, and once it
+    returns); each moment is given for both, so a node's `attempted_at`,
+    `read_at` and `returned_at` are the same moment here.
+    """
     from datetime import datetime, timezone
 
-    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments]
+    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments for _ in (0, 1)]
     return lambda: queue.pop(0)
 
 
@@ -841,7 +846,8 @@ def test_the_json_record_carries_each_node_its_state_and_read_time(monkeypatch):
     assert record["settled"] is False
     assert record["observations"] == [o.to_dict() for o in out.observations]
     assert record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z", "detail": "",
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z",
+        "attempted_at": "2026-11-09T12:00:01.000Z", "returned_at": "2026-11-09T12:00:01.000Z", "detail": "",
     }
     assert record["observations"][1]["state"] == "unconfirmed"
 
@@ -1149,7 +1155,7 @@ def test_a_reply_naming_no_payer_chain_records_none(monkeypatch):
     assert out.receipt.settled is True
     for seen in out.observations:
         assert seen.payer_account == ""
-        assert set(seen.to_dict()) == {"rpc_url", "state", "read_at", "detail"}
+        assert set(seen.to_dict()) == {"rpc_url", "state", "read_at", "attempted_at", "returned_at", "detail"}
 
 
 def test_only_a_confirmed_observation_names_a_payer_chain():
@@ -1907,12 +1913,15 @@ def test_a_not_asked_node_has_its_credentials_redacted_and_no_read_time():
 
 
 def clock_at(*moments):
-    """A clock for `verify_corroborated(clock=...)` returning the given "HH:MM:SS" UTC times."""
+    """A clock for `verify_corroborated(clock=...)` returning the given "HH:MM:SS" UTC times.
+
+    Each moment is given twice, for a node's attempt and its return (see `ticking_clock`).
+    """
     from datetime import datetime, timezone
 
     queue = [
         datetime(2026, 11, 9, *(int(part) for part in moment.split(":")), tzinfo=timezone.utc)
-        for moment in moments
+        for moment in moments for _ in (0, 1)
     ]
     return lambda: queue.pop(0)
 
@@ -1961,10 +1970,12 @@ def test_not_seen_at_12_00_and_at_12_30_are_different_records(monkeypatch):
 
     early_record, late_record = json.loads(early.to_json()), json.loads(late.to_json())
     assert early_record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z", "detail": "",
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z",
+        "attempted_at": "2026-11-09T12:00:00.000Z", "returned_at": "2026-11-09T12:00:00.000Z", "detail": "",
     }
     assert late_record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z", "detail": "",
+        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z",
+        "attempted_at": "2026-11-09T12:30:00.000Z", "returned_at": "2026-11-09T12:30:00.000Z", "detail": "",
     }
     assert early.to_json() != late.to_json()
     assert early == late and hash(early) == hash(late)
@@ -1984,3 +1995,69 @@ def test_an_asked_observation_with_no_read_time_is_refused(state):
 def test_an_asked_observation_read_time_must_be_utc_iso_8601(read_at):
     with pytest.raises(ValueError, match="read_at"):
         nano_quorum.Observation(A, "not-seen", read_at)
+
+
+# --- each asked node says when its request started and when the answer came back -------
+
+
+def seconds_clock(*seconds):
+    """A clock returning 2026-11-09T12:00:SS UTC for each given second, one per call."""
+    from datetime import datetime, timezone
+
+    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in seconds]
+    return lambda: queue.pop(0)
+
+
+def at(second):
+    return "2026-11-09T12:00:%02d.000Z" % second
+
+
+def test_each_asked_node_records_when_it_was_attempted_and_when_it_returned(monkeypatch):
+    """A errors, B answers "no such block", C confirms, D confirms: quorum at D,
+    E never asked. Each asked node's request start and return are written; the
+    unreadable one returned nothing, the not-asked one was never attempted."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"), B: {"error": "Block not found"}, C: send_block(), D: send_block(),
+    })
+    out = verify_corroborated(
+        HASH, ONE_XNO, PAYEE, [A, B, C, D, E], clock=seconds_clock(1, 6, 7, 8, 10, 11, 12, 14),
+    )
+    record = json.loads(out.to_json())
+    assert [
+        (o["state"], o["attempted_at"], o["returned_at"], o["read_at"]) for o in record["observations"]
+    ] == [
+        ("unreadable", at(1), None, at(6)),
+        ("not-seen", at(7), at(8), at(8)),
+        ("confirmed", at(10), at(11), at(11)),
+        ("confirmed", at(12), at(14), at(14)),
+        ("not-asked", None, None, None),
+    ]
+
+
+@pytest.mark.parametrize("state, kwargs, match", [
+    ("unreadable", {"returned_at": at(2), "error_kind": "OSError"}, "returned_at"),
+    ("not-seen", {"attempted_at": at(1), "returned_at": at(3)}, "must equal read_at"),
+    ("not-seen", {"attempted_at": at(5), "returned_at": at(2)}, "after read_at"),
+    ("not-seen", {"attempted_at": at(1)}, "returned_at"),
+    ("not-seen", {"attempted_at": "12:00", "returned_at": at(2)}, "attempted_at"),
+])
+def test_attempt_and_return_times_that_contradict_the_read_are_refused(state, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        nano_quorum.Observation(A, state, at(2), **kwargs)
+
+
+def test_the_record_with_attempt_and_return_times_is_schema_4(monkeypatch):
+    """The per-node record changed shape, so the schema string says so; a /3
+    record is not read as this vocabulary."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["schema"] == "nano_quorum.corroboration/4"
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    record["schema"] = "nano_quorum.corroboration/3"
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+@pytest.mark.parametrize("name", ["attempted_at", "returned_at"])
+def test_a_not_asked_node_has_no_attempt_or_return_time(name):
+    with pytest.raises(ValueError, match="never asked"):
+        nano_quorum.Observation(A, "not-asked", "", **{name: at(1)})

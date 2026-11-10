@@ -571,7 +571,10 @@ def _repr(value) -> str:
 # /3 added the "not-asked" state (a configured node the check never queried) and
 # the receipt-level "refusal" / "ask_again" fields; /2 had neither, and listed only
 # the nodes it asked.
-RECEIPT_SCHEMA = "nano_quorum.corroboration/3"
+#
+# /4 adds, per observation, "attempted_at" and "returned_at" (null where there is
+# none). The node-state vocabulary, and so NODE_STATES_SHA256, is the one /3 pinned.
+RECEIPT_SCHEMA = "nano_quorum.corroboration/4"
 
 # The only states an `Observation` can carry, in a fixed order, each with what it
 # means. This exact mapping is written into every `to_json()` record as
@@ -621,8 +624,9 @@ def node_states_sha256(table: dict) -> str:
 # The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
 # or its meaning changes the hash, and the check below then refuses to import
 # the module until RECEIPT_SCHEMA is bumped and this value re-pinned with it -
-# so "nano_quorum.corroboration/3" cannot quietly come to mean something else.
-# (/2, without "not-asked", pinned f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77.)
+# so "nano_quorum.corroboration/4" cannot quietly come to mean something else.
+# (/2, without "not-asked", pinned f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77;
+# /3 pinned this same value.)
 NODE_STATES_SHA256 = "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
 
 
@@ -706,6 +710,11 @@ def _is_utc_iso(text: object) -> bool:
     return moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0
 
 
+def _moment(text: str) -> datetime:
+    """A UTC ISO-8601 text ending in Z (already checked by `_is_utc_iso`) as a datetime."""
+    return datetime.fromisoformat(text[:-1] + "+00:00")
+
+
 @dataclass(frozen=True)
 class Observation:
     """What one endpoint said about the block, and when its answer was read.
@@ -739,6 +748,26 @@ class Observation:
     because the check ended (quorum reached, or a refusal) before its turn. It
     was not read, so its `read_at` is empty in memory and null in to_dict();
     `detail` says why it was not asked. It carries no error and no payer.
+
+    `attempted_at` is the UTC moment the request to the node was started, and
+    `returned_at` the UTC moment its answer came back; both are written by
+    to_dict(), null when empty. How they relate to `read_at`:
+
+    - an answered node (any state but "unreadable" and "not-asked"):
+      `returned_at` IS `read_at` - the answer was read the moment it came
+      back - so when it is set it must equal `read_at`, and
+      `attempted_at <= read_at`.
+    - "unreadable": no answer came back, so `returned_at` is always empty
+      (null). `read_at` is then the moment the failure was recorded, and
+      `attempted_at <= read_at`; their difference is how long the node was
+      waited on.
+    - "not-asked": no request was made, so both are empty (null).
+
+    Both are optional for an asked node built by hand, so an `Observation`
+    made as before (`read_at` only) is still accepted and writes both as
+    null; but an answered node with an `attempted_at` must also carry its
+    `returned_at`. `verify_corroborated` fills both for every node it asks.
+    Neither is part of `Corroboration` equality, as `read_at` is not.
     """
 
     rpc_url: str
@@ -748,6 +777,8 @@ class Observation:
     error_kind: str = ""
     error_message: str = ""
     payer_account: str = ""
+    attempted_at: str = ""
+    returned_at: str = ""
 
     def __post_init__(self) -> None:
         if self.state not in NODE_STATES:
@@ -770,12 +801,45 @@ class Observation:
                 f"a {self.state!r} observation was read, so its read_at must be the UTC "
                 f"ISO-8601 moment of that read ending in Z, got {self.read_at!r}"
             )
+        self._check_timing()
+
+    def _check_timing(self) -> None:
+        """Refuse an `attempted_at` / `returned_at` that contradicts the state or `read_at`."""
+        for name in ("attempted_at", "returned_at"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+            if self.state == "not-asked" and value:
+                raise ValueError(f"a not-asked node was never asked, so it has no {name}")
+            if value and not _is_utc_iso(value):
+                raise ValueError(f"{name} must be UTC ISO-8601 ending in Z, got {value!r}")
+        if self.state == "not-asked":
+            return
+        if self.state == "unreadable" and self.returned_at:
+            raise ValueError("an unreadable node returned no answer, so it has no returned_at")
+        if self.returned_at and self.returned_at != self.read_at:
+            raise ValueError(
+                f"returned_at {self.returned_at!r} must equal read_at {self.read_at!r}: "
+                "an answer is read the moment it returns"
+            )
+        if self.attempted_at:
+            if _moment(self.attempted_at) > _moment(self.read_at):
+                raise ValueError(
+                    f"attempted_at {self.attempted_at!r} is after read_at {self.read_at!r}"
+                )
+            if self.state != "unreadable" and not self.returned_at:
+                raise ValueError(
+                    f"a {self.state!r} observation is an answer: with an attempted_at it "
+                    "must carry the returned_at of that answer"
+                )
 
     def to_dict(self) -> dict:
         out = {
             "rpc_url": redact_url(self.rpc_url),
             "state": self.state,
             "read_at": None if self.state == "not-asked" else self.read_at,
+            "attempted_at": self.attempted_at or None,
+            "returned_at": self.returned_at or None,
             "detail": _redact_text(self.detail),
         }
         if self.state == "unreadable":
@@ -1084,7 +1148,10 @@ def verify_corroborated(
     here carry the same list, and a `Mismatch` raised here is given it as an
     `observations` attribute. `clock`, if given, is a no-argument callable
     returning a datetime (naive is read as UTC); it exists so tests can fix
-    `read_at`, and changes no decision.
+    the times recorded, and changes no decision. It is called twice for each
+    endpoint asked, in order: just before the request (`attempted_at`) and
+    once it has returned or failed (`read_at`, and `returned_at` for an
+    answer).
 
     Raises:
       `Mismatch` - an endpoint has the block confirmed and says it paid a
@@ -1150,6 +1217,10 @@ def verify_corroborated(
         )
 
     for rpc_url in endpoints:
+        # The clock is read twice per node asked: before the request is made
+        # (`attempted_at`) and once it has returned or failed (`read_at`, and
+        # for an answer `returned_at`, the same moment).
+        attempted_at = _iso_utc(now())
         try:
             answer, payload = _answer(block_hash, expect_raw, account, rpc_url)
         except _UNREADABLE as error:
@@ -1162,18 +1233,24 @@ def verify_corroborated(
                     failures[rpc_url],
                     error_kind=type(error).__name__,
                     error_message=str(error),
+                    attempted_at=attempted_at,
                 )
             )
             continue
         answered.append(rpc_url)
+        returned_at = _iso_utc(now())
         observations.append(
             Observation(
                 rpc_url,
                 _STATE_OF_ANSWER[answer[0]],
-                _iso_utc(now()),
-                f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch"
-                else f"answered for block {answer[1]}, not the requested {answer[2]}"
-                if answer[0] == "other-block" else "",
+                returned_at,
+                attempted_at=attempted_at,
+                returned_at=returned_at,
+                detail=(
+                    f"got {answer[1]}, expected {answer[2]}" if answer[0] == "mismatch"
+                    else f"answered for block {answer[1]}, not the requested {answer[2]}"
+                    if answer[0] == "other-block" else ""
+                ),
                 # The payer chain this node's reply named, so the per-node
                 # record says which chain each node reported.
                 payer_account=(answer[4] or "") if answer[0] == "settled" else "",
