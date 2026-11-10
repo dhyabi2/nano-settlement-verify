@@ -112,8 +112,9 @@ class Disagreement(Exception):
 
     `node_observations` is the per-node record `verify_corroborated` keeps
     everywhere else (`Corroboration.observations`, `NotCorroborated` and
-    `Mismatch` `.observations`): one `Observation` per endpoint asked,
-    unreadable ones included, each with its state and UTC `read_at`. It is
+    `Mismatch` `.observations`): one `Observation` per configured endpoint,
+    unreadable ones included, each with its state and UTC `read_at`, and
+    those after the contradiction as "not-asked". It is
     a separate attribute because `observations` here is the mapping above;
     it is empty when the raiser is not `verify_corroborated`.
 
@@ -566,7 +567,11 @@ def _repr(value) -> str:
 
 # The version of the `Corroboration.to_json()` record. It is written into every
 # record as "schema", so a stored receipt says which vocabulary it was written in.
-RECEIPT_SCHEMA = "nano_quorum.corroboration/2"
+#
+# /3 added the "not-asked" state (a configured node the check never queried) and
+# the receipt-level "refusal" / "ask_again" fields; /2 had neither, and listed only
+# the nodes it asked.
+RECEIPT_SCHEMA = "nano_quorum.corroboration/3"
 
 # The only states an `Observation` can carry, in a fixed order, each with what it
 # means. This exact mapping is written into every `to_json()` record as
@@ -583,6 +588,11 @@ NODE_STATES = {
         "This is not an empty answer"
     ),
     "mismatch": "the node answered: it has the block confirmed, and it does not match the expected payment",
+    "not-asked": (
+        "the node is in the configured set but was never queried: the check ended (quorum "
+        "reached, or a refusal) before its turn. It said nothing; this is not a no, not an "
+        "error, and not a silence"
+    ),
 }
 
 
@@ -611,8 +621,9 @@ def node_states_sha256(table: dict) -> str:
 # The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
 # or its meaning changes the hash, and the check below then refuses to import
 # the module until RECEIPT_SCHEMA is bumped and this value re-pinned with it -
-# so "nano_quorum.corroboration/2" cannot quietly come to mean something else.
-NODE_STATES_SHA256 = "f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77"
+# so "nano_quorum.corroboration/3" cannot quietly come to mean something else.
+# (/2, without "not-asked", pinned f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77.)
+NODE_STATES_SHA256 = "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
 
 
 def _check_vocabulary_pin(table: dict, pinned: str) -> None:
@@ -710,6 +721,11 @@ class Observation:
     writes it as "payer_account" only when it is set, so a record with no
     payer named is unchanged. Only a "confirmed" observation carries one, and
     it must be a valid address.
+
+    "not-asked" is a node in the configured set that was never queried,
+    because the check ended (quorum reached, or a refusal) before its turn. It
+    was not read, so its `read_at` is empty in memory and null in to_dict();
+    `detail` says why it was not asked. It carries no error and no payer.
     """
 
     rpc_url: str
@@ -731,12 +747,14 @@ class Observation:
             raise ValueError(f"a {self.state!r} observation names no payer chain; only a confirmed one does")
         if self.payer_account and not nano_settlement_verify.is_valid_account(self.payer_account):
             raise ValueError(f"payer_account {self.payer_account!r} is not a Nano address")
+        if self.state == "not-asked" and self.read_at:
+            raise ValueError("a not-asked node was never read, so it has no read_at")
 
     def to_dict(self) -> dict:
         out = {
             "rpc_url": redact_url(self.rpc_url),
             "state": self.state,
-            "read_at": self.read_at,
+            "read_at": None if self.state == "not-asked" else self.read_at,
             "detail": _redact_text(self.detail),
         }
         if self.state == "unreadable":
@@ -783,9 +801,15 @@ class Corroboration:
     of them have seen it - and, exactly as in `verify`, that is "not yet", not
     "no".
 
-    `observations` has one `Observation` per endpoint asked, in the order
-    asked: which node said what, and when. Endpoints after the quorum were not
-    asked and are not listed.
+    `observations` has one `Observation` per configured endpoint (after
+    `distinct_endpoints` folds duplicates), in the order given: which node said
+    what, and when. An endpoint after the quorum was not asked and is listed
+    as "not-asked", so "never contacted" is never mistaken for "silent".
+
+    A `Corroboration` is never a refusal - a refusal raises (`Mismatch`,
+    `Disagreement`). `to_json()` says so in the record itself: `"refusal":
+    false` always, and `"ask_again": true` exactly when the receipt is
+    unsettled, so a cached unsettled receipt cannot be read as "rejected".
 
     Equality and hash() are over what was decided and what each node said -
     the receipt, the endpoint tuples, and each observation's endpoint, state,
@@ -834,6 +858,10 @@ class Corroboration:
             {
                 "schema": RECEIPT_SCHEMA,
                 "settled": self.receipt.settled,
+                # Unsettled means "not yet / could not decide", never "no":
+                # whoever reads a cached record must ask again, not refuse.
+                "refusal": False,
+                "ask_again": not self.receipt.settled,
                 "amount_raw": self.receipt.amount_raw,
                 "height": self.receipt.height,
                 "account": self.receipt.account,
@@ -1029,8 +1057,9 @@ def verify_corroborated(
     caller trusts it. Endpoints that cannot be read are skipped, not retried.
 
     Returns a `Corroboration`. Its receipt is settled only on agreement. Its
-    `observations` name every endpoint asked, the state it reported, and the
-    UTC time its answer was read; `NotCorroborated` and `Disagreement` raised
+    `observations` name every configured endpoint, the state it reported, and
+    the UTC time its answer was read - an endpoint the check ended before is
+    there as "not-asked", with no read time; `NotCorroborated` and `Disagreement` raised
     here carry the same list, and a `Mismatch` raised here is given it as an
     `observations` attribute. `clock`, if given, is a no-argument callable
     returning a datetime (naive is read as UTC); it exists so tests can fix
@@ -1073,7 +1102,16 @@ def verify_corroborated(
     observations: list[Observation] = []
     named_payer = None  # (payer address, endpoint) of the first settled answer naming one
 
+    def not_asked(why: str) -> None:
+        # Every configured endpoint the check ends before is listed too, as
+        # "not-asked", so the record names each configured node exactly once:
+        # "never contacted" must not read as "asked and silent". Observations
+        # are appended one per endpoint in order, so the rest are not asked.
+        for rpc_url in endpoints[len(observations):]:
+            observations.append(Observation(rpc_url, "not-asked", "", f"not asked: {why}"))
+
     def disagreement(answers: dict, rpc_url: str, said: str, payload) -> Disagreement:
+        not_asked("the check stopped on a disagreement")
         # `answers` names the two sides; `observations` / `observed_answers`
         # keep every endpoint that answered so far, then the one that
         # contradicts them; `node_observations` is the per-node record, with
@@ -1136,6 +1174,7 @@ def verify_corroborated(
             # not change after confirmation, so asking another node cannot make
             # this answer go away - it can only find a node that has not caught
             # up yet and read its silence as agreement.
+            not_asked("the check stopped on a mismatch")
             payload.observations = tuple(observations)
             raise payload
         if answer[0] != "settled":
@@ -1167,6 +1206,7 @@ def verify_corroborated(
         settled.append((rpc_url, facts, payload))
         heard.append((rpc_url, str(facts), payload))
         if len(settled_by[facts]) >= agree:
+            not_asked(f"quorum of {agree} was reached before its turn")
             return Corroboration(
                 # The receipt of the endpoint that completed the quorum, as
                 # before; every agreeing receipt asserts the same facts.

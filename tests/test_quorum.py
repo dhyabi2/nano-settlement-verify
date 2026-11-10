@@ -876,7 +876,7 @@ def test_the_json_record_pins_the_node_state_vocabulary_and_its_schema(monkeypat
     assert record["schema"] == nano_quorum.RECEIPT_SCHEMA
     assert record["node_states"] == nano_quorum.NODE_STATES
     assert list(record["node_states"]) == [
-        "confirmed", "unconfirmed", "not-seen", "unreadable", "mismatch",
+        "confirmed", "unconfirmed", "not-seen", "unreadable", "mismatch", "not-asked",
     ]
     assert "answered" in record["node_states"]["not-seen"]
     assert "no answer" in record["node_states"]["unreadable"]
@@ -1361,7 +1361,7 @@ def test_a_stubbed_verify_that_raises_mismatch_still_refuses(monkeypatch):
     monkeypatch.setattr(nano_settlement_verify, "verify", stub)
     with pytest.raises(Mismatch) as caught:
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
-    assert [o.state for o in caught.value.observations] == ["mismatch"]
+    assert [o.state for o in caught.value.observations] == ["mismatch", "not-asked"]
 
 
 # --- credentials quoted in an error are not written into the record -------------------
@@ -1819,3 +1819,85 @@ def test_a_huge_type_name_is_capped_in_every_placeholder():
     with pytest.raises(TypeError) as error:
         nano_quorum._mapping("answers", BadText())
     assert len(str(error.value)) < cap + 200
+
+
+# --- every configured node is in the record, including the ones never asked ------------
+
+E = "http://127.0.0.1:7075"
+
+
+def test_a_node_after_the_quorum_is_listed_as_not_asked_not_left_out(monkeypatch):
+    """C is configured but the quorum is reached before its turn. It is not
+    called (the stub would fail the test), and the record still names it, as
+    "not-asked" with no read time, so an audit can tell "never contacted" from
+    "asked and silent"."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2))
+    assert out.receipt.settled is True
+    assert [(o.rpc_url, o.state) for o in out.observations] == [
+        (A, "confirmed"), (B, "confirmed"), (C, "not-asked"),
+    ]
+    entry = json.loads(out.to_json())["observations"][2]
+    assert entry["rpc_url"] == C and entry["state"] == "not-asked"
+    assert entry["read_at"] is None
+    assert "quorum" in entry["detail"]
+    assert "error" not in entry and "payer_account" not in entry
+
+
+def test_not_asked_unreadable_and_not_seen_are_three_different_states(monkeypatch):
+    """One record, five configured nodes: one errored, one answered "no such
+    block", two confirmed, one was never asked. Each is listed exactly once."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"), B: {"error": "Block not found"},
+        C: send_block(), D: send_block(),
+    })
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C, D, E])
+    record = json.loads(out.to_json())
+    assert [(o["rpc_url"], o["state"]) for o in record["observations"]] == [
+        (A, "unreadable"), (B, "not-seen"), (C, "confirmed"), (D, "confirmed"), (E, "not-asked"),
+    ]
+    assert len({o["state"] for o in record["observations"]}) == 4
+    assert "not-asked" in record["node_states"]
+    assert "never queried" in record["node_states"]["not-asked"]
+
+
+def test_nodes_after_a_refusal_are_listed_as_not_asked(monkeypatch):
+    """A mismatch or a disagreement ends the check early; the nodes it never
+    reached are still in the per-node record, as not-asked."""
+    nodes(monkeypatch, {A: send_block(amount=ONE_XNO - 1)})
+    with pytest.raises(Mismatch) as mismatch:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])
+    assert [(o.rpc_url, o.state) for o in mismatch.value.observations] == [
+        (A, "mismatch"), (B, "not-asked"), (C, "not-asked"),
+    ]
+
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
+    with pytest.raises(Disagreement) as disagreement:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])
+    assert [(o.rpc_url, o.state) for o in disagreement.value.node_observations] == [
+        (A, "confirmed"), (B, "confirmed"), (C, "not-asked"),
+    ]
+
+
+def test_a_cached_unsettled_receipt_says_it_is_not_a_refusal_and_to_ask_again(monkeypatch):
+    """An unsettled receipt stored and read later must not read as "rejected"
+    by omission: the record itself says it is no refusal and to ask again."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    unsettled = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert unsettled["settled"] is False
+    assert unsettled["refusal"] is False
+    assert unsettled["ask_again"] is True
+
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    settled = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert settled["refusal"] is False
+    assert settled["ask_again"] is False
+
+
+def test_a_not_asked_node_has_its_credentials_redacted_and_no_read_time():
+    keyed = "http://user:s3cret@127.0.0.1:7079"
+    entry = nano_quorum.Observation(keyed, "not-asked", "", "not asked: quorum").to_dict()
+    assert entry["rpc_url"] == "http://***@127.0.0.1:7079"
+    assert entry["read_at"] is None
+    with pytest.raises(ValueError, match="never read"):
+        nano_quorum.Observation(A, "not-asked", "2026-11-09T12:00:00.000Z")
