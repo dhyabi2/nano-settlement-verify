@@ -35,7 +35,7 @@ import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import nano_settlement_verify
 from nano_settlement_verify import Mismatch, NotFound, Receipt
@@ -87,8 +87,10 @@ class NotCorroborated(Exception):
         # One `Observation` per endpoint asked, in the order asked. Empty when
         # the caller is not `verify_corroborated` (failover, balances).
         self.observations = tuple(observations)
-        # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None.
+        # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None,
+        # and when to ask again: `stop.at` plus the call's `retry_after`.
         self.stop = None
+        self.not_before = None
 
 
 class Disagreement(Exception):
@@ -981,6 +983,9 @@ class Corroboration:
     `Disagreement`). `to_json()` says so in the record itself: `"refusal":
     false` always, and `"ask_again": true` exactly when the receipt is
     unsettled, so a cached unsettled receipt cannot be read as "rejected".
+    Beside it, `"ask_again_not_before"` (see `not_before`) says from when, and
+    `"retry_after_s"` the delay it was computed with. `retry_after` is not
+    part of equality.
 
     `stop` is the `Stop` that ended the check: "quorum-reached" for a settled
     receipt, "exhausted" for an unsettled one, with the k of n in force and
@@ -1009,6 +1014,24 @@ class Corroboration:
     failed: tuple[str, ...]
     observations: tuple[Observation, ...] = ()
     stop: Stop | None = None
+    retry_after: int | float = 0
+
+    @property
+    def not_before(self) -> str | None:
+        """The UTC moment from which asking again makes sense, or None.
+
+        None for a settled receipt (there is nothing to ask again) and for one
+        with no `stop` recorded. Otherwise `stop.at + retry_after` seconds,
+        UTC ISO-8601 to the millisecond ending in Z: the check stopped at
+        `stop.at`, and `retry_after` is the caller's configured delay
+        (`verify_corroborated(retry_after=...)`, default 0). This module knows
+        nothing about when a node will confirm a block, so with the default the
+        earliest time is simply when this check stopped; any longer wait is the
+        caller's, stated in the record as "retry_after_s".
+        """
+        if self.receipt.settled or self.stop is None:
+            return None
+        return _not_before(self.stop.at, self.retry_after)
 
     def _identity(self) -> tuple:
         return (
@@ -1042,6 +1065,12 @@ class Corroboration:
                 # whoever reads a cached record must ask again, not refuse.
                 "refusal": False,
                 "ask_again": not self.receipt.settled,
+                # When to ask again: the moment the check stopped plus the
+                # configured delay. `ask_again` stays the boolean it was, for
+                # readers that test it; null here exactly when it is false (or
+                # when no stop was recorded).
+                "ask_again_not_before": self.not_before,
+                "retry_after_s": self.retry_after,
                 # Why the loop stopped and the k-of-n rule in force; null for a
                 # Corroboration built by hand without one.
                 "stop": self.stop.to_dict() if self.stop is not None else None,
@@ -1058,6 +1087,27 @@ class Corroboration:
                 "stop_reasons_sha256": STOP_REASONS_SHA256,
             }
         )
+
+
+# The longest `retry_after` accepted, in seconds (about 31 years): it keeps
+# `stop.at + retry_after` inside the range a datetime can hold.
+_MAX_RETRY_AFTER = 10**9
+
+
+def _retry_after(value) -> int | float:
+    """`value` as a delay in seconds, or TypeError / ValueError before any call is made."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"retry_after must be a number of seconds, got {type(value).__name__}")
+    if not math.isfinite(value) or value < 0 or value > _MAX_RETRY_AFTER:
+        raise ValueError(
+            f"retry_after must be a finite number of seconds from 0 to {_MAX_RETRY_AFTER}, got {value!r}"
+        )
+    return int(value) if isinstance(value, int) else float(value)
+
+
+def _not_before(stopped_at: str, retry_after) -> str:
+    """`stopped_at` (UTC ISO-8601 ending in Z) plus `retry_after` seconds, in the same form."""
+    return _iso_utc(_moment(stopped_at) + timedelta(seconds=retry_after))
 
 
 def _endpoint_key(rpc_url: object) -> str:
@@ -1233,6 +1283,7 @@ def verify_corroborated(
     agree: int = AGREE_DEFAULT,
     *,
     clock=None,
+    retry_after=0,
 ) -> Corroboration:
     """Prove a send settled, believing it only when `agree` endpoints concur.
 
@@ -1250,7 +1301,11 @@ def verify_corroborated(
     and the quorum rule in force, as a `Stop`: `Corroboration.stop`
     ("quorum-reached" or "exhausted"), and `.stop` on a raised `Mismatch`
     ("mismatch"), `Disagreement` ("disagreement") or `NotCorroborated`
-    ("exhausted"). `clock`, if given, is a no-argument callable
+    ("exhausted"). `retry_after` (seconds, default 0; a finite int or float
+    from 0 to 10**9, refused before any call otherwise) sets when to ask
+    again: an unsettled `Corroboration`'s `not_before`, and a raised
+    `NotCorroborated`'s `.not_before`, are the moment the check stopped plus
+    `retry_after`. Nothing here waits or retries. `clock`, if given, is a no-argument callable
     returning a datetime (naive is read as UTC); it exists so tests can fix
     the times recorded, and changes no decision. It is called twice for each
     endpoint asked, in order: just before the request (`attempted_at`) and
@@ -1274,6 +1329,7 @@ def verify_corroborated(
         # expectation is the caller's bug, and no number of nodes repairs it.
         raise TypeError(f"expect_raw must be an int of raw, got {type(expect_raw).__name__}")
     endpoints = distinct_endpoints(rpc_urls, agree=agree)
+    retry_after = _retry_after(retry_after)
     now = _utc_now if clock is None else clock
 
     failures: dict[str, str] = {}
@@ -1426,6 +1482,7 @@ def verify_corroborated(
                 failed=tuple(failures),
                 observations=tuple(observations),
                 stop=stopped("quorum-reached"),
+                retry_after=retry_after,
             )
 
     if len(answered) < agree:
@@ -1437,6 +1494,7 @@ def verify_corroborated(
             answered=len(answered), agree=agree, failures=failures, observations=observations
         )
         short.stop = stopped("exhausted")
+        short.not_before = _not_before(short.stop.at, retry_after)
         raise short
 
     # Enough endpoints answered, but fewer than `agree` of them reported the
@@ -1451,6 +1509,7 @@ def verify_corroborated(
         failed=tuple(failures),
         observations=tuple(observations),
         stop=stopped("exhausted"),
+        retry_after=retry_after,
     )
 
 

@@ -2137,3 +2137,51 @@ def test_the_stop_vocabulary_is_the_real_exit_paths_pinned_in_the_record(monkeyp
 def test_a_stop_that_is_not_a_real_exit_is_refused(args, match):
     with pytest.raises(ValueError, match=match):
         nano_quorum.Stop(*args)
+
+
+# --- ask_again says from when, not only whether ----------------------------------------
+
+
+def test_an_unsettled_receipt_says_when_to_ask_again(monkeypatch):
+    """not_before is the moment the check stopped plus the configured delay; the
+    boolean ask_again is kept beside it."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2), retry_after=30)
+    record = json.loads(out.to_json())
+    assert record["ask_again"] is True
+    assert record["stop"]["at"] == at(2)
+    assert record["ask_again_not_before"] == at(32)
+    assert record["retry_after_s"] == 30
+    assert out.not_before == at(32)
+
+
+def test_with_no_delay_configured_ask_again_is_not_before_the_stop(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2)).to_json())
+    assert record["ask_again_not_before"] == record["stop"]["at"] == at(2)
+    assert record["retry_after_s"] == 0
+
+
+def test_a_settled_receipt_has_no_time_to_ask_again(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=30).to_json())
+    assert record["ask_again"] is False
+    assert record["ask_again_not_before"] is None
+
+
+def test_not_corroborated_says_when_to_ask_again(monkeypatch):
+    nodes(monkeypatch, {A: OSError("refused"), B: OSError("refused")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2), retry_after=1.5)
+    assert caught.value.not_before == "2026-11-09T12:00:03.500Z"
+
+
+@pytest.mark.parametrize("delay, error", [
+    (-1, ValueError), (float("nan"), ValueError), (float("inf"), ValueError),
+    (10**9 + 1, ValueError), (True, TypeError), ("30", TypeError),
+])
+def test_a_retry_delay_that_is_not_a_time_is_refused_before_any_call(monkeypatch, delay, error):
+    nodes(monkeypatch, {})
+    # "seconds" is in both refusals, and not in Python's own "unexpected keyword" error.
+    with pytest.raises(error, match="retry_after must be a .*seconds"):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=delay)
