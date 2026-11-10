@@ -67,11 +67,12 @@ def _count(value: object) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def _funder(account: str, rpc_url: str):
+def _funder(account: str, rpc_url: str, post=None):
     """(funder, step) for `account`: the account whose send opened it, and the
     blocks that attribution rests on. funder is None when that cannot be read;
-    _UNOPENED (with step None) when the node has no such account."""
-    post = nano_settlement_verify.post_json  # looked up per call so a stub takes effect
+    _UNOPENED (with step None) when the node has no such account. `post` is the
+    RPC call; by default the library's, looked up per call so a stub takes effect."""
+    post = post or nano_settlement_verify.post_json
     info = post(rpc_url, {"action": "account_info", "account": account})
     if "error" in info:
         return _UNOPENED, None
