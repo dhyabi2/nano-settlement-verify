@@ -16,7 +16,7 @@ python3 nano_stated_payer_test.py --payee <seller account> \
     [--hops 1] [--rpc https://rpc.nano.to] [--rpc <second node>] [--json]
 ```
 
-Exit 0 when every payer got a ledger verdict, 2 when any is `unopened` or `unreadable`.
+Exit 0 when every payer got a ledger verdict, 2 when any is `unopened` or `unreadable` (argparse also exits 2 on a usage error), 3 when a `--payee`, `--excluded` or `--exchange` is not a Nano account or `--hops` is not a whole number of at least 1 (a one-line `error:` on stderr, no traceback).
 
 ## Verdicts
 
@@ -24,15 +24,17 @@ Exit 0 when every payer got a ledger verdict, 2 when any is `unopened` or `unrea
 |---|---|
 | `not-independent` | a funder within `--hops` is the payee or an `--excluded` party (or the payer is one, hop 0); `party` and `deciding_hop` say which and where |
 | `not-determinable` | the hop-1 funder is an `--exchange` wallet: "not determinable from funding alone" |
-| `independent` | funded within the hops by none of them, and not only by an exchange |
+| `independent` | funded within the hops by none of them, and not only by an exchange - **opener only**: later receives are not tested (see below) |
 | `unopened` | no open block on the node |
-| `unreadable` | a block the verdict needs could not be read, a malformed address, or two `--rpc` nodes disagree |
+| `unreadable` | a block the verdict needs could not be read, a malformed address (the payer's, or a funder the node names that is not a valid Nano account - bad checksum, wrong type, garbage), or two `--rpc` nodes disagree |
 
-Neither `unopened` nor `unreadable` is ever counted as independent. Every verdict carries `witness`: the account, its open block hash, the funding send hash and the funder, so it can be re-checked on any node with `block_info <open block>` (its link is the funding send) and `block_info <funding send>` (its account is the funder). `xrb_` and `nano_` spellings of one key are one account.
+Neither `unopened` nor `unreadable` is ever counted as independent. Every verdict carries `witness`: the account, its open block hash, the funding send hash and the funder, so it can be re-checked on any node with `block_info <open block>` (its link is the funding send) and `block_info <funding send>` (its account is the funder). `xrb_` and `nano_` spellings of one key are one account: they collapse to one entry in `payers`, malformed payers are listed first, and `counts` are per distinct key, so they can sum to fewer than the `--payer` arguments given.
+
+With several `--rpc`, a node that fails (refused, timed out, a cut-off reply) is listed in that payer's `nodes_failed`, and `fewer_nodes` is `true`: the verdict came from fewer nodes than were asked. The text output says `from K of N nodes; failed: ...` under that payer.
 
 ## What "one hop back" reads, and what it does not
 
-The funder is the account whose send **opened** the payer: its first receive. Later receives are not examined, because the stated test does not examine them. That matters: an account can be opened by a dust send from one account and then be funded with nearly all of its money by another. On the 2026-11-10 read below, `nano_11kh65...` was opened by 0.000123 XNO from `nano_1n35kxfu...` and then received 391 XNO from `nano_1p3uejeji...`; under the stated test it reads `independent`. For who funded a particular payment, run `nano_funding.py --block <payment hash>`, which reads every receive in a window before the payment.
+The funder is the account whose send **opened** the payer: its first receive. Later receives are not examined, because the stated test does not examine them. That matters: an account can be opened by a dust send from one account and then be funded with nearly all of its money by another. On the 2026-11-10 read below, `nano_11kh65...` was opened by 0.000123 XNO from `nano_1n35kxfu...` and then received 391 XNO from `nano_1p3uejeji...`; under the stated test it reads `independent`. So every `independent` verdict is marked **opener only**: in JSON a `caveat` field, and an `opener` object read from one `account_history` call on the payer - `amount_raw` (the opening receive), `later_receives` and `later_receives_raw` (how many receives came after it and their raw total) and `opener_share` (the opener's share of everything received, rounded down). In text, a line under the verdict: `opener only: ...: opener sent X raw, then N later receive(s) totalling Y raw; opener share Z%`. A small share says the opener is not where the money came from. If that read fails, or the account has more than 4096 blocks, or two nodes give different histories, those fields read `unreadable`; the verdict itself is unchanged. For who funded a particular payment, run `nano_funding.py --block <payment hash>`, which reads every receive in a window before the payment.
 
 The exchange list and the excluded list are the caller's: there is no built-in registry, and an unlisted exchange reads as a stranger.
 

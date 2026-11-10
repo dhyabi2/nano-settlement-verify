@@ -1,10 +1,11 @@
 """nano_stated_payer_test: one verdict per payer against a stated test, on a fake node (no network)."""
+import http.client
 import io
 import json
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -45,6 +46,10 @@ def ledger(funded_by, broken=frozenset()):
             return {"open_block": h("0", acct), "frontier": h("0", acct), "block_count": "1"}
         if payload["action"] == "block_info":
             return by_hash.get(payload["hash"], {"error": "Block not found"})
+        if payload["action"] == "account_history":
+            acct = payload["account"].replace("xrb_", "nano_", 1)
+            return {"account": acct, "history": [{"type": "receive", "hash": h("0", acct),
+                                                  "account": funded_by[acct], "amount": "1000"}]}
         raise AssertionError(payload["action"])
 
     return post
@@ -171,6 +176,140 @@ class Cli(NoSockets):
         self.assertEqual(code, 2)
         self.assertIn("unopened", buf.getvalue())
         self.assertIn("not determinable from funding alone", buf.getvalue())
+
+
+def with_funder_value(funded_by, account, value):
+    """A fake node whose funding send for `account` names `value` as its account."""
+    base = ledger(funded_by)
+
+    def post(url, payload):
+        reply = base(url, payload)
+        if payload["action"] == "block_info" and payload["hash"] == h("5", account):
+            reply = dict(reply, block_account=value)
+            reply["contents"] = dict(reply["contents"], account=value)
+        return reply
+
+    return post
+
+
+class MalformedFunder(NoSockets):
+    def test_funder_that_is_not_a_nano_account_is_unreadable(self):
+        bad_checksum = PAYEE[:-1] + ("1" if PAYEE[-1] != "1" else "3")
+        for value in ("garbage", 12345, ["x"], bad_checksum, "xrb_" + STRANGER[5:-1]):
+            rep = run([A], {}, post=with_funder_value({A: STRANGER}, A, value))
+            r = rep["payers"][0]
+            self.assertEqual(r["verdict"], "unreadable", value)
+            self.assertIn("not a Nano account", r["why"])
+            self.assertEqual(rep["counts"]["independent"], 0)
+
+    def test_malformed_funder_at_hop_two_is_unreadable(self):
+        r = run([A], {}, hops=2, post=with_funder_value({A: B, B: STRANGER}, B, "nano_garbage"))["payers"][0]
+        self.assertEqual((r["verdict"], r["deciding_hop"]), ("unreadable", 2))
+
+    def test_a_valid_xrb_funder_is_still_a_stranger(self):
+        r = run([A], {}, post=with_funder_value({A: STRANGER}, A, "xrb_" + STRANGER[5:]))["payers"][0]
+        self.assertEqual(r["verdict"], "independent")
+
+
+def with_history(funded_by, rows=None, fail=None):
+    base = ledger(funded_by)
+
+    def post(url, payload):
+        if payload["action"] == "account_history":
+            if fail is not None:
+                raise fail
+            return {"account": payload["account"], "history": rows}
+        reply = base(url, payload)
+        if payload["action"] == "account_info" and rows:
+            reply = dict(reply, block_count=str(len(rows)))
+        return reply
+
+    return post
+
+
+class OpenerOnlyCaveat(NoSockets):
+    def test_independent_carries_the_opener_only_caveat_and_share(self):
+        rows = [{"type": "receive", "hash": h("0", A), "account": STRANGER, "amount": "123"},
+                {"type": "send", "hash": "S" * 64, "account": B, "amount": "50"},
+                {"type": "receive", "hash": "R" * 64, "account": C, "amount": "391000"},
+                {"type": "receive", "hash": "Q" * 64, "account": D, "amount": "8877"}]
+        post = with_history({A: STRANGER}, rows)
+        r = run([A], {}, post=post)["payers"][0]
+        self.assertEqual(r["verdict"], "independent")
+        self.assertIn("opener only", r["caveat"])
+        self.assertEqual(r["opener"], {"amount_raw": "123", "later_receives": 2, "later_receives_raw": "399877",
+                                       "opener_share": "0.0307%"})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            st.main(["--payee", PAYEE, "--rpc", URL, "--payer", A], post=post)
+        self.assertIn("opener only", buf.getvalue())
+        self.assertIn("2 later receive(s) totalling 399877 raw; opener share 0.0307%", buf.getvalue())
+
+    def test_a_failed_history_read_gives_unreadable_fields_not_a_crash(self):
+        for fail in (http.client.IncompleteRead(b""), OSError("reset")):
+            r = run([A], {}, post=with_history({A: STRANGER}, fail=fail))["payers"][0]
+            self.assertEqual(r["verdict"], "independent")
+            self.assertEqual(r["opener"]["later_receives"], "unreadable")
+            self.assertEqual(r["opener"]["opener_share"], "unreadable")
+
+    def test_a_history_without_the_open_block_is_unreadable(self):
+        rows = [{"type": "receive", "hash": "R" * 64, "amount": "5"}]
+        r = run([A], {}, post=with_history({A: STRANGER}, rows))["payers"][0]
+        self.assertEqual(r["opener"]["amount_raw"], "unreadable")
+
+    def test_documents_name_the_caveat(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("STATED-PAYER-TEST.md", "README.md"):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                self.assertIn("opener only", f.read(), name)
+
+
+class Robustness(NoSockets):
+    def test_http_exception_makes_one_payer_unreadable_and_the_run_goes_on(self):
+        base = ledger({A: STRANGER, B: US})
+
+        def post(url, payload):
+            if payload.get("account") == A:
+                raise http.client.IncompleteRead(b"{")
+            return base(url, payload)
+
+        rep = run([A, B], {}, post=post)
+        self.assertEqual([r["verdict"] for r in rep["payers"]], ["unreadable", "not-independent"])
+
+    def test_invalid_account_arguments_exit_3_without_a_traceback(self):
+        for flag in ("--payee", "--excluded", "--exchange"):
+            args = ["--payee", PAYEE, "--payer", A, "--rpc", URL]
+            if flag == "--payee":
+                args[1] = "nano_garbage"
+            else:
+                args += [flag, PAYEE[:-1] + ("1" if PAYEE[-1] != "1" else "3")]
+            err, out = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = st.main(args, post=ledger({A: STRANGER}))
+            self.assertEqual(code, 3, flag)
+            self.assertIn("is not a Nano account", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_a_failed_node_among_several_is_said(self):
+        good = ledger({A: STRANGER})
+
+        def post(url, payload):
+            if url == "b":
+                raise OSError("connection refused")
+            return good(url, payload)
+
+        rep = run([A], {}, urls=("a", "b"), post=post)
+        r = rep["payers"][0]
+        self.assertEqual(r["verdict"], "independent")
+        self.assertIs(r.get("fewer_nodes"), True)
+        self.assertIn("from 1 of 2 nodes", st.to_text(rep))
+        self.assertIs(run([A], {A: STRANGER}, urls=("a", "b"))["payers"][0].get("fewer_nodes"), False)
+
+    def test_counts_are_per_distinct_key(self):
+        rep = run([A, "xrb_" + A[5:], B, "nano_bad"], {A: STRANGER, B: US})
+        self.assertEqual(len(rep["payers"]), 3)
+        self.assertEqual(sum(rep["counts"].values()), 3)
+        self.assertEqual(rep["payers"][0]["payer"], "nano_bad")
 
 
 if __name__ == "__main__":

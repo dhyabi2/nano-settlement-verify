@@ -26,17 +26,37 @@ Each verdict carries the deciding hop's witness - the account, its open block ha
 the funding send hash and the funder - plus the whole trail read, so the verdict can
 be re-checked on any node with `block_info`.
 
-What it does not look at: receives after the open block. The stated test is the
-first funder only; an account opened by a stranger and topped up later by a party
-reads as independent here. Run `nano_funding.py` on the payment block for that.
+What it does not test: receives after the open block. The stated test is the
+first funder only; an account opened by a dust send from a stranger and funded
+later by a party reads as independent here. So every `independent` verdict carries
+`caveat` ("opener only") and `opener`, from one `account_history` read of the
+payer: the opening amount, the number and raw total of later receives, and the
+opener's share of everything received - a small share says the opener is not where
+the money came from. Those fields are `unreadable` when that read fails; the
+verdict stands. Run `nano_funding.py` on the payment block for who funded a payment.
 
-Standard library only; reads `account_info` and `block_info` through
-`nano_independence`'s funding reader. With several `--rpc` every node that answers
-must give the same verdict and witness, or the payer is `unreadable`.
+A funder the node names must itself be a valid Nano account (prefix, length,
+alphabet, checksum); anything else is `unreadable`, never a stranger.
+
+`nano_` and `xrb_` spellings of one key are one payer: `payers` holds one entry per
+distinct key (malformed payers first), and `counts` sum to that, not to the number
+of `--payer` arguments.
+
+Standard library only; reads `account_info`, `block_info` (through
+`nano_independence`'s funding reader) and, for `independent` payers,
+`account_history`. With several `--rpc` every node that answers must give the same
+verdict and witness, or the payer is `unreadable`; a node that fails is listed in
+`nodes_failed`, and `fewer_nodes` is true when the verdict came from fewer nodes
+than were asked.
+
+Exit 0: every payer got a ledger verdict. 2: any payer is `unopened` or
+`unreadable` (argparse also exits 2 on a usage error). 3: a `--payee`,
+`--excluded` or `--exchange` that is not a Nano account, or a bad `--hops`.
 """
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 
@@ -48,6 +68,12 @@ STATED_TEST = "Funded by neither us nor you, one hop back, exchange hot wallets 
 CARVE_OUT = "not determinable from funding alone"
 VERDICTS = ("independent", "not-independent", "not-determinable", "unopened", "unreadable")
 DEFAULT_RPC = "https://rpc.nano.to"
+CAVEAT = ("opener only: the funder tested is the account whose send opened the payer; "
+          "receives after the open block were not tested")
+HISTORY_CAP = 4096  # the most blocks of a payer's history read to total its later receives
+EXIT_BAD_INPUT = 3
+# What a node read can raise; any of them makes that node's answer for that payer unreadable.
+NODE_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException)
 
 
 def _witness(step: dict | None) -> dict | None:
@@ -85,6 +111,11 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
             return out("unreadable", f"the hop-{hop - 1} funder {current} reads as unopened", hop)
         if funder is None:
             return out("unreadable", f"the funding send of {current} could not be read", hop, step)
+        if public_key_from_address(funder) is None:
+            # The node named something that is not a Nano account (wrong type, bad
+            # checksum, garbage): it can match no list, so it must not read as a stranger.
+            return out("unreadable", f"the hop-{hop} funder the node gave is not a Nano account: {funder!r}"[:200],
+                       hop, step)
         if role(funder):
             return out("not-independent", f"hop {hop} funder is the {role(funder)}", hop, step, role(funder))
         if _key(funder) in exchanges:
@@ -95,8 +126,73 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
             break  # a funding loop: every account in it has been checked
         seen.add(_key(funder))
         current = funder
-    return out("independent", "no funder within the hops is the payee, an excluded party, or only an exchange",
-               1, trail[0])
+    r = out("independent", "no funder within the hops is the payee, an excluded party, or only an exchange",
+            1, trail[0])
+    r["caveat"] = CAVEAT
+    r["opener"] = _opener_summary(payer, trail[0], rpc_url, post)
+    return r
+
+
+def _unreadable_opener(why: str) -> dict:
+    return {"amount_raw": "unreadable", "later_receives": "unreadable", "later_receives_raw": "unreadable",
+            "opener_share": "unreadable", "unreadable_why": why[:200]}
+
+
+def _raw(value) -> int | None:
+    text = str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+    return int(text) if text.isdigit() else None
+
+
+def _share(part: int, total: int) -> str:
+    """part/total as a percentage with four decimals, rounded down, in integers."""
+    if total <= 0:
+        return "unreadable"
+    q = part * 1000000 // total
+    return f"{q // 10000}.{q % 10000:04d}%"
+
+
+def _opener_summary(payer: str, step: dict, rpc_url: str, post) -> dict:
+    """What one account_history read gives cheaply about an `independent` payer: the
+    opening send's amount, how many receives came after it and their total, and the
+    opener's share of everything received. Any failure gives `unreadable` fields."""
+    post = post or nano_independence.nano_settlement_verify.post_json
+    count = step.get("block_count")
+    open_block = str(step.get("open_block") or "").upper()
+    if not isinstance(count, int) or count < 1:
+        return _unreadable_opener("account_info gave no block count")
+    if count > HISTORY_CAP:
+        return _unreadable_opener(f"{count} blocks, more than the {HISTORY_CAP} read")
+    try:
+        reply = post(rpc_url, {"action": "account_history", "account": payer, "count": str(count),
+                               "reverse": "true"})
+    except NODE_ERRORS as e:
+        return _unreadable_opener(f"account_history: {type(e).__name__}: {e}")
+    if not isinstance(reply, dict):
+        return _unreadable_opener("account_history reply is not an object")
+    history = reply.get("history")
+    if "error" in reply or not isinstance(history, list):
+        return _unreadable_opener(f"account_history: {reply.get('error', 'no history list')}")
+    if reply.get("next") or len(history) > count:
+        return _unreadable_opener("account_history did not give the whole history in one read")
+    opener, later, later_raw = None, 0, 0
+    for row in history:
+        if not isinstance(row, dict):
+            return _unreadable_opener("account_history row is not an object")
+        kind = row.get("subtype") or row.get("type")
+        if kind not in ("receive", "open"):
+            continue
+        amount = _raw(row.get("amount"))
+        if amount is None:
+            return _unreadable_opener("a receive in account_history has no raw amount")
+        if str(row.get("hash") or "").upper() == open_block:
+            opener = amount
+        else:
+            later += 1
+            later_raw += amount
+    if opener is None:
+        return _unreadable_opener("the open block is not in account_history")
+    return {"amount_raw": str(opener), "later_receives": later, "later_receives_raw": str(later_raw),
+            "opener_share": _share(opener, opener + later_raw)}
 
 
 def _story(r: dict) -> str:
@@ -138,7 +234,7 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
         for url in urls:
             try:
                 answers[url] = _read(p, url, payee_key, excl, hubs, hops, post)
-            except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            except NODE_ERRORS as e:
                 failed[url] = f"{type(e).__name__}: {e}"[:160]
         if not answers:
             r = {"payer": p, "verdict": "unreadable", "why": "no node answered", "deciding_hop": None,
@@ -149,14 +245,21 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
                  "answers": {u: [a["verdict"], a["witness"]] for u, a in answers.items()}}
         else:
             r = dict(next(iter(answers.values())))
+            openers = {json.dumps(a.get("opener"), sort_keys=True) for a in answers.values()}
+            if len(openers) > 1:
+                r["opener"] = _unreadable_opener("nodes gave different histories")
         r["nodes_read"] = list(answers)
         r["nodes_failed"] = failed
+        # A node that failed means the verdict rests on fewer nodes than were asked for.
+        r["fewer_nodes"] = bool(failed) and bool(answers)
         results.append(r)
 
     return {
         "v": "stated-payer-test-v1",
         "test": STATED_TEST,
-        "reading": "funder = the account whose send opened the payer; later receives are not examined",
+        "reading": "funder = the account whose send opened the payer; later receives are not tested",
+        "caveat": CAVEAT,
+        "rpc": urls,
         "payee": payee,
         "excluded": list(excluded),
         "exchange": list(exchange),
@@ -174,6 +277,14 @@ def to_text(report: dict) -> str:
         line = f"{r['payer']}  {r['verdict']}  - {r['why']}"
         if w.get("open_block"):
             line += f"\n    open {w['open_block']}  send {w.get('funding_send')}  funder {w.get('funder')}"
+        if r["verdict"] == "independent":
+            o = r.get("opener") or _unreadable_opener("not read")
+            line += (f"\n    {r.get('caveat', CAVEAT)}: opener sent {o['amount_raw']} raw, then "
+                     f"{o['later_receives']} later receive(s) totalling {o['later_receives_raw']} raw; "
+                     f"opener share {o['opener_share']}")
+        if r.get("fewer_nodes"):
+            line += (f"\n    from {len(r['nodes_read'])} of {len(r['nodes_read']) + len(r['nodes_failed'])} nodes; "
+                     "failed: " + "; ".join(f"{u} ({e})" for u, e in r["nodes_failed"].items()))
         lines.append(line)
     lines.append("counts: " + ", ".join(f"{k} {v}" for k, v in report["counts"].items()))
     return "\n".join(lines)
@@ -189,7 +300,11 @@ def main(argv=None, post=None) -> int:
     p.add_argument("--rpc", action="append")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
-    report = stated_test(a.payee, a.payer, a.rpc or [DEFAULT_RPC], a.excluded, a.exchange, a.hops, post)
+    try:
+        report = stated_test(a.payee, a.payer, a.rpc or [DEFAULT_RPC], a.excluded, a.exchange, a.hops, post)
+    except (ValueError, TypeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_BAD_INPUT
     print(json.dumps(report, indent=1) if a.json else to_text(report))
     return 2 if report["counts"]["unopened"] or report["counts"]["unreadable"] else 0
 
