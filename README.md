@@ -350,17 +350,21 @@ slack, or pass `not_after=None` to have no deadline.
 - In `balance_corroborated`, any node error other than `"Account not found"` now counts as a
   failed endpoint, a figure that is not an ASCII digit string or a plain non-negative JSON
   integer is refused, and a malformed address raises `ValueError` before any node is asked.
-- In `verify_corroborated`, each `Corroboration` now carries `observations`, one per endpoint
-  asked, and each observation carries `read_at`, the UTC time its answer was read. Two
+- In `verify_corroborated`, each `Corroboration` now carries `observations`, one per
+  configured endpoint (after duplicates are folded), in the order given, and each observation
+  carries `read_at`, the UTC time its answer was read. Two
   identical calls therefore write different `to_json()` text. `==` and `hash()` leave
   `read_at` out: two calls whose nodes said the same things are still equal and hash alike.
 - `Corroboration.to_json()` is larger: it now embeds the `observations` list, the full
   `node_states` table (each state with its meaning) and `node_states_sha256`.
-- `"schema"` (`"nano_quorum.corroboration/2"`) is now the first key of `to_json()`. Code that
-  compared the record as text, or read keys by position, sees a different string.
+- `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/3"`). Code
+  that compared the record as text, or read keys by position, sees a different string. (`/2`
+  existed only on an unreleased branch; `verify_receipt_vocabulary` accepts only `/3`.)
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
+  `Disagreement.record()` is not redacted: as on main, it writes each `rpc_url` as given,
+  credentials included (its `node_observations` redact only through `to_dict()`).
 - `observations` is part of `Corroboration` equality. A `Corroboration` built by hand from
   the four old fields (`receipt`, `agreed`, `answered`, `failed`) has no observations, so it
   no longer compares equal to the result of a live call. `dataclasses.asdict()` of a
@@ -376,21 +380,15 @@ slack, or pass `not_after=None` to have no deadline.
 - A `confirmed` observation whose reply named a valid payer chain now carries it as
   `payer_account` (a nano_ address, also written by `to_dict()` and part of equality), and
   a payer-chain `Disagreement`'s `answers` name the chains as nano_ addresses, not key hex.
-- `observations` now lists every configured endpoint exactly once (after duplicates are
-  folded), not only the ones asked. An endpoint the check ended before - the quorum was
-  reached, or a `Mismatch` or `Disagreement` stopped it - is there with the new state
-  `not-asked`, `read_at` null and a `detail` saying why. A settled `Corroboration` from
-  three endpoints whose first two agreed therefore has three observations, not two, and
-  `Mismatch.observations` / `Disagreement.node_observations` gain the same entries. The
-  nodes that were asked are written exactly as before, and an unsettled receipt (every
-  endpoint asked) has the same observations as before.
+- An endpoint the check ended before - the quorum was reached, or a `Mismatch` or
+  `Disagreement` stopped it - is listed in `observations` with the state `not-asked`,
+  `read_at` null and a `detail` saying why. A settled `Corroboration` from three endpoints
+  whose first two agreed therefore has three observations. `NotCorroborated` and `Mismatch`
+  raised by `verify_corroborated` gain `.observations`, and `Disagreement` gains
+  `.node_observations`, with the same per-endpoint entries; `Disagreement.observations` is unchanged.
 - `to_json()` writes `"refusal": false` and `"ask_again"` (true exactly when the receipt is
   unsettled) after `"settled"`, so a cached unsettled receipt says in itself that it is
   "not yet, ask again" and not a rejection. A refusal is never a receipt: it raises.
-- Adding `not-asked` changed the vocabulary, so `"schema"` is now
-  `"nano_quorum.corroboration/3"` and `node_states_sha256` is re-pinned. A stored `/2`
-  record makes `verify_receipt_vocabulary` return False; its `/2` hash was
-  `f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77`.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
