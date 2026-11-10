@@ -2061,3 +2061,79 @@ def test_the_record_with_attempt_and_return_times_is_schema_4(monkeypatch):
 def test_a_not_asked_node_has_no_attempt_or_return_time(name):
     with pytest.raises(ValueError, match="never asked"):
         nano_quorum.Observation(A, "not-asked", "", **{name: at(1)})
+
+
+# --- the record says why the loop stopped, and the k of n in force ---------------------
+
+
+def test_a_settled_receipt_says_the_quorum_was_reached_at_k_of_n(monkeypatch):
+    """Two of three agree; the record says so, with the rule, and a reader can
+    re-run the decision from the record alone."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2))
+    record = json.loads(out.to_json())
+    assert record["stop"] == {"reason": "quorum-reached", "quorum": {"k": 2, "n": 3}, "at": at(2)}
+    assert out.stop == nano_quorum.Stop("quorum-reached", 2, 3, at(2))
+    # The decision again, from the record alone.
+    confirmed = [o for o in record["observations"] if o["state"] == "confirmed"]
+    assert len(confirmed) >= record["stop"]["quorum"]["k"]
+    assert len(record["observations"]) == record["stop"]["quorum"]["n"]
+    assert confirmed[-1]["read_at"] == record["stop"]["at"]
+    assert [o["state"] for o in record["observations"][len(confirmed):]] == ["not-asked"]
+
+
+def test_an_unsettled_receipt_says_every_endpoint_was_asked(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false"), C: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=2, clock=ticking_clock(1, 2, 3))
+    assert out.receipt.settled is False
+    assert json.loads(out.to_json())["stop"] == {
+        "reason": "exhausted", "quorum": {"k": 2, "n": 3}, "at": at(3),
+    }
+
+
+def test_a_mismatch_says_the_check_stopped_on_it(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block(amount=ONE_XNO - 1)})
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3, clock=ticking_clock(1, 2))
+    assert caught.value.stop.to_dict() == {"reason": "mismatch", "quorum": {"k": 3, "n": 3}, "at": at(2)}
+
+
+def test_a_disagreement_says_the_check_stopped_on_it(monkeypatch):
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2))
+    assert caught.value.stop == nano_quorum.Stop("disagreement", 2, 3, at(2))
+
+
+def test_too_few_answers_says_every_endpoint_was_asked(monkeypatch):
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block(), C: OSError("timed out")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2, 3))
+    assert caught.value.stop == nano_quorum.Stop("exhausted", 2, 3, at(3))
+
+
+def test_the_stop_vocabulary_is_the_real_exit_paths_pinned_in_the_record(monkeypatch):
+    """Four ways the loop ends, no deadline or budget (the code has none), and
+    the table is pinned by hash like the node states."""
+    assert list(nano_quorum.STOP_REASONS) == ["quorum-reached", "exhausted", "mismatch", "disagreement"]
+    assert nano_quorum.node_states_sha256(nano_quorum.STOP_REASONS) == nano_quorum.STOP_REASONS_SHA256
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["stop_reasons"] == nano_quorum.STOP_REASONS
+    assert record["stop_reasons_sha256"] == nano_quorum.STOP_REASONS_SHA256
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    edited = json.loads(json.dumps(record))
+    edited["stop_reasons"]["exhausted"] = "gave up"
+    assert nano_quorum.verify_receipt_vocabulary(edited) is False
+    with pytest.raises(AssertionError, match="STOP_REASONS"):
+        nano_quorum._check_vocabulary_pin(edited["stop_reasons"], nano_quorum.STOP_REASONS_SHA256, "STOP_REASONS")
+
+
+@pytest.mark.parametrize("args, match", [
+    (("deadline", 2, 3, "2026-11-09T12:00:00.000Z"), "unknown stop reason"),
+    (("exhausted", 4, 3, "2026-11-09T12:00:00.000Z"), "cannot be met"),
+    (("exhausted", 2, 3, "12:00"), "UTC"),
+])
+def test_a_stop_that_is_not_a_real_exit_is_refused(args, match):
+    with pytest.raises(ValueError, match=match):
+        nano_quorum.Stop(*args)

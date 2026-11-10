@@ -49,6 +49,9 @@ __all__ = [
     "NODE_STATES_SHA256",
     "Observation",
     "RECEIPT_SCHEMA",
+    "STOP_REASONS",
+    "STOP_REASONS_SHA256",
+    "Stop",
     "balance_corroborated",
     "distinct_endpoints",
     "node_states_sha256",
@@ -84,6 +87,8 @@ class NotCorroborated(Exception):
         # One `Observation` per endpoint asked, in the order asked. Empty when
         # the caller is not `verify_corroborated` (failover, balances).
         self.observations = tuple(observations)
+        # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None.
+        self.stop = None
 
 
 class Disagreement(Exception):
@@ -141,6 +146,8 @@ class Disagreement(Exception):
         # One `Observation` per endpoint asked, unreadable ones included, with
         # the time each was read, when raised by `verify_corroborated`.
         self.node_observations = tuple(node_observations)
+        # The `Stop` ("disagreement") when raised by `verify_corroborated`, else None.
+        self.stop = None
 
     def record(self) -> dict:
         """Every observation as a strict-JSON dict, for a dispute log.
@@ -573,7 +580,9 @@ def _repr(value) -> str:
 # the nodes it asked.
 #
 # /4 adds, per observation, "attempted_at" and "returned_at" (null where there is
-# none). The node-state vocabulary, and so NODE_STATES_SHA256, is the one /3 pinned.
+# none), and the receipt-level "stop" (why the loop stopped, and the k of n in force)
+# with its vocabulary "stop_reasons" pinned as STOP_REASONS_SHA256. The node-state
+# vocabulary, and so NODE_STATES_SHA256, is the one /3 pinned.
 RECEIPT_SCHEMA = "nano_quorum.corroboration/4"
 
 # The only states an `Observation` can carry, in a fixed order, each with what it
@@ -630,17 +639,52 @@ def node_states_sha256(table: dict) -> str:
 NODE_STATES_SHA256 = "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
 
 
-def _check_vocabulary_pin(table: dict, pinned: str) -> None:
-    """Raise unless `table` hashes to `pinned`; run on `NODE_STATES` at import."""
+def _check_vocabulary_pin(table: dict, pinned: str, name: str = "NODE_STATES") -> None:
+    """Raise unless `table` hashes to `pinned`; run on each pinned table at import."""
     actual = node_states_sha256(table)
     if actual != pinned:
         raise AssertionError(
-            f"NODE_STATES hashes to {actual}, but {RECEIPT_SCHEMA} pins {pinned}: "
-            "a changed vocabulary needs a new RECEIPT_SCHEMA and a new NODE_STATES_SHA256"
+            f"{name} hashes to {actual}, but {RECEIPT_SCHEMA} pins {pinned}: "
+            f"a changed vocabulary needs a new RECEIPT_SCHEMA and a new {name}_SHA256"
         )
 
 
 _check_vocabulary_pin(NODE_STATES, NODE_STATES_SHA256)
+
+
+# Why `verify_corroborated` stopped asking, in a fixed order, each with what it
+# means. These are the only ways its loop over the endpoints ends; it has no
+# deadline, no time budget and no call budget, so none is listed. A
+# `Corroboration` can only carry "quorum-reached" (settled) or "exhausted"
+# (unsettled); "mismatch" and "disagreement" end in a raise, and the exception
+# carries the same `Stop` as `.stop`. Like NODE_STATES, this exact table is
+# written into every record ("stop_reasons") with its hash, computed the same
+# way (`node_states_sha256`) and pinned below.
+STOP_REASONS = {
+    "quorum-reached": (
+        "k of the n configured endpoints reported the same confirmed send: the receipt is "
+        "settled, and the endpoints after the k-th agreeing one were not asked"
+    ),
+    "exhausted": (
+        "every configured endpoint was asked and fewer than k reported the same confirmed "
+        "send: the receipt is unsettled (ask again), or NotCorroborated is raised when fewer "
+        "than k answered at all"
+    ),
+    "mismatch": (
+        "an endpoint reported the block confirmed and not the expected payment: Mismatch is "
+        "raised, and the endpoints after it were not asked"
+    ),
+    "disagreement": (
+        "two endpoints gave answers that cannot both be true (a different confirmed send, a "
+        "different payer chain, or contents that hash to another block): Disagreement is "
+        "raised, and the endpoints after it were not asked"
+    ),
+}
+
+# The hash of `STOP_REASONS` that RECEIPT_SCHEMA names, pinned as NODE_STATES_SHA256 is.
+STOP_REASONS_SHA256 = "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
+
+_check_vocabulary_pin(STOP_REASONS, STOP_REASONS_SHA256, "STOP_REASONS")
 
 
 def verify_receipt_vocabulary(record) -> bool:
@@ -648,8 +692,9 @@ def verify_receipt_vocabulary(record) -> bool:
 
     `record` is a `to_json()` string or the dict it parses to. True only when
     the record's inline "node_states" table hashes (see `node_states_sha256`)
-    to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, and
-    its "schema" is `RECEIPT_SCHEMA`. False for an edited table, an edited or
+    to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, its
+    inline "stop_reasons" table likewise hashes to its "stop_reasons_sha256"
+    AND to `STOP_REASONS_SHA256`, and its "schema" is `RECEIPT_SCHEMA`. False for an edited table, an edited or
     missing hash, or a record of another schema. Nothing is raised for a
     well-formed JSON object; a string that is not JSON raises ValueError.
     """
@@ -657,11 +702,13 @@ def verify_receipt_vocabulary(record) -> bool:
         record = json.loads(record)
     if not isinstance(record, dict) or record.get("schema") != RECEIPT_SCHEMA:
         return False
-    table = record.get("node_states")
-    if not isinstance(table, dict):
-        return False
-    actual = node_states_sha256(table)
-    return actual == record.get("node_states_sha256") == NODE_STATES_SHA256
+    for key, pinned in (("node_states", NODE_STATES_SHA256), ("stop_reasons", STOP_REASONS_SHA256)):
+        table = record.get(key)
+        if not isinstance(table, dict):
+            return False
+        if not node_states_sha256(table) == record.get(key + "_sha256") == pinned:
+            return False
+    return True
 
 
 # The userinfo of a URL: after `scheme://` or a scheme-relative `//`, up to the
@@ -849,6 +896,45 @@ class Observation:
         return out
 
 
+@dataclass(frozen=True)
+class Stop:
+    """Why `verify_corroborated` stopped asking, and the quorum rule in force.
+
+    `reason` is one of the keys of `STOP_REASONS`. `agree` is k, the number of
+    endpoints that had to report the same confirmed send, and `endpoints` is n,
+    the number of distinct endpoints configured (after `distinct_endpoints`
+    folds duplicates). `at` is the UTC moment the loop stopped: the `read_at`
+    of the last endpoint asked.
+
+    With the per-node observations beside it, this is enough to re-run the
+    decision from the record alone: count the "confirmed" observations that
+    agree, compare with k, and check that every observation after the one at
+    which the loop stopped is "not-asked".
+
+    to_dict() writes `{"reason", "quorum": {"k", "n"}, "at"}`.
+    """
+
+    reason: str
+    agree: int
+    endpoints: int
+    at: str
+
+    def __post_init__(self) -> None:
+        if self.reason not in STOP_REASONS:
+            raise ValueError(f"unknown stop reason {self.reason!r}; expected one of {tuple(STOP_REASONS)}")
+        for name in ("agree", "endpoints"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive int, got {value!r}")
+        if self.agree > self.endpoints:
+            raise ValueError(f"a quorum of {self.agree} cannot be met by {self.endpoints} endpoints")
+        if not _is_utc_iso(self.at):
+            raise ValueError(f"at must be UTC ISO-8601 ending in Z, got {self.at!r}")
+
+    def to_dict(self) -> dict:
+        return {"reason": self.reason, "quorum": {"k": self.agree, "n": self.endpoints}, "at": self.at}
+
+
 _STATE_OF_ANSWER = {
     "settled": "confirmed",
     "not-yet": "unconfirmed",
@@ -896,9 +982,17 @@ class Corroboration:
     false` always, and `"ask_again": true` exactly when the receipt is
     unsettled, so a cached unsettled receipt cannot be read as "rejected".
 
+    `stop` is the `Stop` that ended the check: "quorum-reached" for a settled
+    receipt, "exhausted" for an unsettled one, with the k of n in force and
+    the moment it stopped. `to_json()` writes it as "stop" (null when none was
+    recorded, as for one built by hand), beside the full "stop_reasons" table
+    and its pinned "stop_reasons_sha256".
+
     Equality and hash() are over what was decided and what each node said -
     the receipt, the endpoint tuples, and each observation's endpoint, state,
-    detail, error and payer chain - and NOT over each observation's `read_at`.
+    detail, error and payer chain - and NOT over each observation's `read_at`,
+    `attempted_at` or `returned_at`, nor over `stop` (which a settled or
+    unsettled receipt already implies, and whose `at` is a time).
     Two calls that got the same answers from the same nodes a second apart are equal and
     hash alike, as they were before `read_at` existed; `to_json()` still
     differs between them, because the record says when each answer was read.
@@ -914,6 +1008,7 @@ class Corroboration:
     answered: tuple[str, ...]
     failed: tuple[str, ...]
     observations: tuple[Observation, ...] = ()
+    stop: Stop | None = None
 
     def _identity(self) -> tuple:
         return (
@@ -947,6 +1042,9 @@ class Corroboration:
                 # whoever reads a cached record must ask again, not refuse.
                 "refusal": False,
                 "ask_again": not self.receipt.settled,
+                # Why the loop stopped and the k-of-n rule in force; null for a
+                # Corroboration built by hand without one.
+                "stop": self.stop.to_dict() if self.stop is not None else None,
                 "amount_raw": self.receipt.amount_raw,
                 "height": self.receipt.height,
                 "account": self.receipt.account,
@@ -956,6 +1054,8 @@ class Corroboration:
                 "observations": [seen.to_dict() for seen in self.observations],
                 "node_states": dict(NODE_STATES),
                 "node_states_sha256": NODE_STATES_SHA256,
+                "stop_reasons": dict(STOP_REASONS),
+                "stop_reasons_sha256": STOP_REASONS_SHA256,
             }
         )
 
@@ -1146,7 +1246,11 @@ def verify_corroborated(
     the UTC time its answer was read - an endpoint the check ended before is
     there as "not-asked", with no read time; `NotCorroborated` and `Disagreement` raised
     here carry the same list, and a `Mismatch` raised here is given it as an
-    `observations` attribute. `clock`, if given, is a no-argument callable
+    `observations` attribute. Each outcome also says why the check stopped
+    and the quorum rule in force, as a `Stop`: `Corroboration.stop`
+    ("quorum-reached" or "exhausted"), and `.stop` on a raised `Mismatch`
+    ("mismatch"), `Disagreement` ("disagreement") or `NotCorroborated`
+    ("exhausted"). `clock`, if given, is a no-argument callable
     returning a datetime (naive is read as UTC); it exists so tests can fix
     the times recorded, and changes no decision. It is called twice for each
     endpoint asked, in order: just before the request (`attempted_at`) and
@@ -1190,6 +1294,11 @@ def verify_corroborated(
     observations: list[Observation] = []
     named_payer = None  # (payer address, endpoint) of the first settled answer naming one
 
+    def stopped(reason: str) -> Stop:
+        # The moment the loop stopped is when the last endpoint asked was read.
+        last = [seen.read_at for seen in observations if seen.state != "not-asked"][-1]
+        return Stop(reason, agree, len(endpoints), last)
+
     def not_asked(why: str) -> None:
         # Every configured endpoint the check ends before is listed too, as
         # "not-asked", so the record names each configured node exactly once:
@@ -1209,12 +1318,14 @@ def verify_corroborated(
         for url, text in answers.items():
             if url in observed:
                 observed[url] = text
-        return Disagreement(
+        raised = Disagreement(
             answers,
             observations={url: receipt for url, _, receipt in witnesses},
             observed_answers=observed,
             node_observations=observations,
         )
+        raised.stop = stopped("disagreement")
+        return raised
 
     for rpc_url in endpoints:
         # The clock is read twice per node asked: before the request is made
@@ -1274,6 +1385,7 @@ def verify_corroborated(
             # up yet and read its silence as agreement.
             not_asked("the check stopped on a mismatch")
             payload.observations = tuple(observations)
+            payload.stop = stopped("mismatch")
             raise payload
         if answer[0] != "settled":
             heard.append((rpc_url, str(answer), payload))
@@ -1313,6 +1425,7 @@ def verify_corroborated(
                 answered=tuple(answered),
                 failed=tuple(failures),
                 observations=tuple(observations),
+                stop=stopped("quorum-reached"),
             )
 
     if len(answered) < agree:
@@ -1320,9 +1433,11 @@ def verify_corroborated(
         # "nobody could tell us" and "they told us it is not confirmed yet" are
         # different facts, and only the second one is safe to act on by waiting
         # a little and asking again.
-        raise NotCorroborated(
+        short = NotCorroborated(
             answered=len(answered), agree=agree, failures=failures, observations=observations
         )
+        short.stop = stopped("exhausted")
+        raise short
 
     # Enough endpoints answered, but fewer than `agree` of them reported the
     # send confirmed - the usual reason being that confirmation has not reached
@@ -1335,6 +1450,7 @@ def verify_corroborated(
         answered=tuple(answered),
         failed=tuple(failures),
         observations=tuple(observations),
+        stop=stopped("exhausted"),
     )
 
 
