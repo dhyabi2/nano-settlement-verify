@@ -17,7 +17,7 @@ Source = "https://github.com/dhyabi2/nano-settlement-verify"
 
 [tool.setuptools]
 packages = ["node_set", "links"]
-py-modules = ["nano_settlement_verify", "nano_terms", "nano_independence", "nano_quorum", "nano_payers", "nano_claim", "nano_five_fields", "nano_two_node", "nano_funding", "nano_recount", "nano_period_counts", "nano_offline"]
+py-modules = ["nano_settlement_verify", "nano_terms", "nano_independence", "nano_quorum", "nano_payers", "nano_claim", "nano_five_fields", "nano_two_node", "nano_funding", "nano_recount", "nano_period_counts", "nano_offline", "nano_stated_payer_test"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
