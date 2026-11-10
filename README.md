@@ -359,8 +359,14 @@ slack, or pass `not_after=None` to have no deadline.
   `node_states` table (each state with its meaning) and `node_states_sha256`.
 - `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/5"`). Code
   that compared the record as text, or read keys by position, sees a different string. (`/2`
-  existed only on an unreleased branch; `verify_receipt_vocabulary` accepts only `/5`, so a
-  stored `/3` or `/4` record now returns False.)
+  existed only on an unreleased branch.) `verify_receipt_vocabulary` accepts exactly three
+  schemas: `"nano_quorum.corroboration/3"`, `"nano_quorum.corroboration/4"` and
+  `"nano_quorum.corroboration/5"`. All three carry the same node-state vocabulary, so a stored
+  `/3` record written by main still returns True when its `"node_states"` table hashes to its
+  own `"node_states_sha256"` and to `NODE_STATES_SHA256`; a `/3` record predates
+  `"stop_reasons"`, so that table is checked only for `/4` and `/5`. Any other schema (`/2`,
+  a later `/6`, a missing or non-string `"schema"`), and any record whose table or hash
+  differs from the pinned one, still returns False.
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
@@ -416,8 +422,13 @@ slack, or pass `not_after=None` to have no deadline.
   never changes a verdict: an attempt that reads later than its return is recorded with
   `attempted_at` equal to `read_at` (clamped), so the check decides, and raises, exactly as
   with a fixed clock. An `Observation` built by hand with `attempted_at` after `read_at` is
-  still refused. A test clock must yield two times per node asked, or it runs out
-  (`StopIteration`).
+  still refused. A test clock written for one read per node (main's) still works: when the
+  clock raises `StopIteration` after it has given at least one moment, that read reuses the
+  last moment it gave - on the return read, the node's own `attempted_at`; on a later node's
+  attempt read, the previous node's last moment - so the verdict is unchanged and only the
+  recorded times repeat. A clock that raises `StopIteration` on its very first read still
+  raises, and any other exception from the clock (an `IndexError` from a list that ran dry,
+  say) propagates as before. To get a distinct time on each read, yield two per node asked.
 - Schema `/4` also writes `"stop"` after `"ask_again"`: why the loop over the endpoints
   stopped, and the quorum rule in force, as `{"reason", "quorum": {"k", "n"}, "at"}` - `k`
   the endpoints that had to agree, `n` the distinct endpoints configured, `at` the `read_at`
@@ -463,7 +474,9 @@ slack, or pass `not_after=None` to have no deadline.
   endpoint in the order it was planned to be asked, the `not-asked` ones included),
   `"order_rule"` and `"order_seed"`. Each observation gains `"ask_index"`, its 0-based place in
   `ask_order`; a `not-asked` node keeps its planned place, so it is never null in a live
-  record (null only in an `Observation` built by hand without one). Observations are listed in
+  record (null only in an `Observation` built by hand without one). `Observation.to_dict()`
+  (and so each entry of `"observations"` in `to_json()`) now puts `"ask_index"` first, before
+  `"rpc_url"`; code that read an observation's keys by position sees a different order. Observations are listed in
   ask order. The order was, and by default still is, the order the caller gave
   (`"order_rule": "as-given"`, `"order_seed": null`); nothing in the module shuffled it.
   `verify_corroborated(..., order_seed=N)` (an int from 0 to 2\*\*64 - 1) asks in
@@ -757,7 +770,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1140 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1160 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the

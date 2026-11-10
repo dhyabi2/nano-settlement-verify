@@ -748,6 +748,17 @@ def _ask_order(endpoints, seed) -> tuple:
     return tuple(sorted(endpoints, key=key))  # sorted is stable: ties keep configured order
 
 
+# The stored schemas `verify_receipt_vocabulary` reads, each with the vocabulary
+# tables a record of it carries. All three use the node-state vocabulary /3
+# pinned (NODE_STATES_SHA256 is unchanged since /3); /4 added "stop_reasons",
+# unchanged in /5. Any other schema is refused.
+_VOCABULARY_TABLES_OF_SCHEMA = {
+    "nano_quorum.corroboration/3": ("node_states",),
+    "nano_quorum.corroboration/4": ("node_states", "stop_reasons"),
+    RECEIPT_SCHEMA: ("node_states", "stop_reasons"),
+}
+
+
 def verify_receipt_vocabulary(record) -> bool:
     """Whether a stored receipt's state vocabulary is the one its schema names.
 
@@ -755,15 +766,24 @@ def verify_receipt_vocabulary(record) -> bool:
     the record's inline "node_states" table hashes (see `node_states_sha256`)
     to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, its
     inline "stop_reasons" table likewise hashes to its "stop_reasons_sha256"
-    AND to `STOP_REASONS_SHA256`, and its "schema" is `RECEIPT_SCHEMA`. False for an edited table, an edited or
-    missing hash, or a record of another schema. Nothing is raised for a
+    AND to `STOP_REASONS_SHA256`, and its "schema" is one of
+    "nano_quorum.corroboration/3", "nano_quorum.corroboration/4" or
+    `RECEIPT_SCHEMA` ("nano_quorum.corroboration/5"). All three carry the
+    node-state vocabulary /3 pinned; a /3 record predates "stop_reasons", so
+    for /3 only "node_states" and its hash are checked. False for an edited
+    table, an edited or missing hash, or a record of any other schema (/2, a
+    later /6, a missing or non-string "schema"). Nothing is raised for a
     well-formed JSON object; a string that is not JSON raises ValueError.
     """
     if isinstance(record, (str, bytes)):
         record = json.loads(record)
-    if not isinstance(record, dict) or record.get("schema") != RECEIPT_SCHEMA:
+    if not isinstance(record, dict) or not isinstance(record.get("schema"), str):
         return False
-    for key, pinned in (("node_states", NODE_STATES_SHA256), ("stop_reasons", STOP_REASONS_SHA256)):
+    tables = _VOCABULARY_TABLES_OF_SCHEMA.get(record["schema"])
+    if tables is None:
+        return False
+    pins = {"node_states": NODE_STATES_SHA256, "stop_reasons": STOP_REASONS_SHA256}
+    for key, pinned in ((name, pins[name]) for name in tables):
         table = record.get(key)
         if not isinstance(table, dict):
             return False
@@ -1549,6 +1569,23 @@ def verify_corroborated(
     # and one the check ends before keeps its place as "not-asked".
     endpoints = _ask_order(configured, order_seed)
     now = _utc_now if clock is None else clock
+    last_moment: list[str] = []  # the most recent moment the clock gave, as written
+
+    def read_clock() -> str:
+        # One clock read, as written in the record. A clock that raises
+        # StopIteration once it has given a moment - on the return read, the
+        # attempt read is reused; on a later node's attempt read, the previous
+        # node's last moment - is not an error: the times repeat, the verdict
+        # is the one a fresh clock gives. A clock that gives no moment at all
+        # still raises.
+        try:
+            moment = _iso_utc(now())
+        except StopIteration:
+            if not last_moment:
+                raise
+            return last_moment[0]
+        last_moment[:] = [moment]
+        return moment
     ordering = {"configured_order": configured, "ask_order": endpoints, "order_seed": order_seed}
 
     failures: dict[str, str] = {}
@@ -1610,13 +1647,16 @@ def verify_corroborated(
         # for an answer `returned_at`, the same moment). A wall clock can step
         # backwards between the two reads (NTP, a test clock): the attempt then
         # reads later than the return, and is clamped to it, so no clock ever
-        # changes a verdict or makes a valid payment raise.
-        attempted_at = _iso_utc(now())
+        # changes a verdict or makes a valid payment raise. A clock that runs
+        # out (raises StopIteration, as a test clock written for one read per
+        # node does) after it has given at least one moment does not raise
+        # either: each read it cannot answer reuses the last moment it gave.
+        attempted_at = read_clock()
         try:
             answer, payload = _answer(block_hash, expect_raw, account, rpc_url)
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
-            failed_at = _iso_utc(now())
+            failed_at = read_clock()
             observations.append(
                 Observation(
                     rpc_url,
@@ -1631,7 +1671,7 @@ def verify_corroborated(
             )
             continue
         answered.append(rpc_url)
-        returned_at = _iso_utc(now())
+        returned_at = read_clock()
         observations.append(
             Observation(
                 rpc_url,
