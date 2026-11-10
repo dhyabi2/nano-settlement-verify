@@ -846,7 +846,7 @@ def test_the_json_record_carries_each_node_its_state_and_read_time(monkeypatch):
     assert record["settled"] is False
     assert record["observations"] == [o.to_dict() for o in out.observations]
     assert record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z",
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z",
         "attempted_at": "2026-11-09T12:00:01.000Z", "returned_at": "2026-11-09T12:00:01.000Z", "detail": "",
     }
     assert record["observations"][1]["state"] == "unconfirmed"
@@ -1155,7 +1155,7 @@ def test_a_reply_naming_no_payer_chain_records_none(monkeypatch):
     assert out.receipt.settled is True
     for seen in out.observations:
         assert seen.payer_account == ""
-        assert set(seen.to_dict()) == {"rpc_url", "state", "read_at", "attempted_at", "returned_at", "detail"}
+        assert set(seen.to_dict()) == {"ask_index", "rpc_url", "state", "read_at", "attempted_at", "returned_at", "detail"}
 
 
 def test_only_a_confirmed_observation_names_a_payer_chain():
@@ -1970,11 +1970,11 @@ def test_not_seen_at_12_00_and_at_12_30_are_different_records(monkeypatch):
 
     early_record, late_record = json.loads(early.to_json()), json.loads(late.to_json())
     assert early_record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z",
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z",
         "attempted_at": "2026-11-09T12:00:00.000Z", "returned_at": "2026-11-09T12:00:00.000Z", "detail": "",
     }
     assert late_record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z",
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z",
         "attempted_at": "2026-11-09T12:30:00.000Z", "returned_at": "2026-11-09T12:30:00.000Z", "detail": "",
     }
     assert early.to_json() != late.to_json()
@@ -2046,15 +2046,19 @@ def test_attempt_and_return_times_that_contradict_the_read_are_refused(state, kw
         nano_quorum.Observation(A, state, at(2), **kwargs)
 
 
-def test_the_record_with_attempt_and_return_times_is_schema_4(monkeypatch):
-    """The per-node record changed shape, so the schema string says so; a /3
-    record is not read as this vocabulary."""
+def test_the_record_with_ask_order_is_schema_5(monkeypatch):
+    """The per-node record changed shape again (ask_index, and the receipt's
+    ask_order), so the schema string says so; /4 and /3 records are not read
+    as this vocabulary, and both vocabulary pins are the ones /4 pinned."""
     nodes(monkeypatch, {A: send_block(), B: send_block()})
     record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
-    assert record["schema"] == "nano_quorum.corroboration/4"
+    assert record["schema"] == "nano_quorum.corroboration/5"
     assert nano_quorum.verify_receipt_vocabulary(record) is True
-    record["schema"] = "nano_quorum.corroboration/3"
-    assert nano_quorum.verify_receipt_vocabulary(record) is False
+    assert record["node_states_sha256"] == "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
+    assert record["stop_reasons_sha256"] == "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
+    for older in ("nano_quorum.corroboration/4", "nano_quorum.corroboration/3"):
+        record["schema"] = older
+        assert nano_quorum.verify_receipt_vocabulary(record) is False
 
 
 @pytest.mark.parametrize("name", ["attempted_at", "returned_at"])

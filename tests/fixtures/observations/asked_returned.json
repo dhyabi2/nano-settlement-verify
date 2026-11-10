@@ -1,1 +1,1 @@
-{"attempted_at":"2026-11-09T12:00:01.000Z","detail":"","read_at":"2026-11-09T12:00:01.250Z","returned_at":"2026-11-09T12:00:01.250Z","rpc_url":"https://rpc-a.example/","state":"not-seen"}
+{"ask_index":0,"attempted_at":"2026-11-09T12:00:01.000Z","detail":"","read_at":"2026-11-09T12:00:01.250Z","returned_at":"2026-11-09T12:00:01.250Z","rpc_url":"https://rpc-a.example/","state":"not-seen"}

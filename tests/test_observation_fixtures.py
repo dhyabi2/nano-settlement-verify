@@ -25,9 +25,11 @@ from nano_quorum import Observation, canonical_json
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "observations"
 
 PINNED = {
-    "not_asked.json": "8a1e4e541b8929905c84d50b31ed5c60bb0141e4400b6b7e45a2bf0998e82c57",
-    "asked_returned.json": "4ddec1182376b272079daed48c5cef7544aa7a0d528bf18642e7c12eb401162b",
-    "asked_no_return.json": "67dfe938968ecdd48ce43bb96662842616f66b2b70c753760c3d73d81bd71157",
+    # Schema /5: each entry carries its "ask_index". (The /4 files, without it,
+    # were 8a1e4e54..., 4ddec118... and 67dfe938... respectively.)
+    "not_asked.json": "cc76895d3aefe7099ddfc942207de3dc42a5819f79220aa3306a7c0cd083b65c",
+    "asked_returned.json": "fff2b1d2128c6c47b3061b439a4b8ce5f3c4d874ebf28c121be15623a20cb22b",
+    "asked_no_return.json": "ac478d1cbe87ae20ecdf0429eb22d820a56358d93f25280354639588d83f9320",
 }
 
 
@@ -72,6 +74,10 @@ def test_the_three_fixtures_are_three_distinct_records():
         "asked_no_return.json": ("unreadable", False, True),
     }
     assert parsed["not_asked.json"]["read_at"] is None
+    # A not-asked node keeps its planned place in the ask order; it is not null.
+    assert {name: entry["ask_index"] for name, entry in parsed.items()} == {
+        "asked_returned.json": 0, "asked_no_return.json": 1, "not_asked.json": 2,
+    }
     assert parsed["asked_returned.json"]["returned_at"] == parsed["asked_returned.json"]["read_at"]
     assert parsed["asked_no_return.json"]["read_at"] is not None
 

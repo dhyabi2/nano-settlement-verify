@@ -1,1 +1,1 @@
-{"attempted_at":"2026-11-09T12:00:01.000Z","detail":"OSError: timed out","error":{"kind":"OSError","message":"timed out"},"read_at":"2026-11-09T12:00:06.000Z","returned_at":null,"rpc_url":"https://rpc-b.example/","state":"unreadable"}
+{"ask_index":1,"attempted_at":"2026-11-09T12:00:01.000Z","detail":"OSError: timed out","error":{"kind":"OSError","message":"timed out"},"read_at":"2026-11-09T12:00:06.000Z","returned_at":null,"rpc_url":"https://rpc-b.example/","state":"unreadable"}
