@@ -357,9 +357,16 @@ slack, or pass `not_after=None` to have no deadline.
   `read_at` out: two calls whose nodes said the same things are still equal and hash alike.
 - `Corroboration.to_json()` is larger: it now embeds the `observations` list, the full
   `node_states` table (each state with its meaning) and `node_states_sha256`.
-- `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/3"`). Code
+- `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/5"`). Code
   that compared the record as text, or read keys by position, sees a different string. (`/2`
-  existed only on an unreleased branch; `verify_receipt_vocabulary` accepts only `/3`.)
+  existed only on an unreleased branch.) `verify_receipt_vocabulary` accepts exactly three
+  schemas: `"nano_quorum.corroboration/3"`, `"nano_quorum.corroboration/4"` and
+  `"nano_quorum.corroboration/5"`. All three carry the same node-state vocabulary, so a stored
+  `/3` record written by main still returns True when its `"node_states"` table hashes to its
+  own `"node_states_sha256"` and to `NODE_STATES_SHA256`; a `/3` record predates
+  `"stop_reasons"`, so that table is checked only for `/4` and `/5`. Any other schema (`/2`,
+  a later `/6`, a missing or non-string `"schema"`), and any record whose table or hash
+  differs from the pinned one, still returns False.
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
@@ -389,6 +396,101 @@ slack, or pass `not_after=None` to have no deadline.
 - `to_json()` writes `"refusal": false` and `"ask_again"` (true exactly when the receipt is
   unsettled) after `"settled"`, so a cached unsettled receipt says in itself that it is
   "not yet, ask again" and not a rejection. A refusal is never a receipt: it raises.
+- An `Observation` in any state but `not-asked` now raises `ValueError` when its `read_at`
+  is empty or is not a UTC time of the one shape a record carries: extended date, `T`,
+  hours, minutes and seconds, an optional fraction of 1 to 6 digits, and `Z` or `+00:00`
+  (`2026-11-09T12:00:00.123Z`). A time without seconds, a week or ordinal date, the basic
+  no-separator form, a longer fraction or any other offset is refused; `attempted_at`,
+  `returned_at` and `stop.at` follow the same rule. `+00:00` is accepted because an
+  `Observation` on `main` took any text, and it is UTC; the module itself always writes `Z`.
+  So every asked node in a stored receipt says when it was read. `verify_corroborated`
+  already wrote one for every asked node, so this check changes none of its records (the
+  schema string is now `/5`, for the reasons below); only an `Observation` built by hand
+  without a read time, or with another shape of time, is refused. `node_states_sha256` hashes the state vocabulary, not the
+  observations: two receipts read at 12:00 and at 12:30 carry the same hash, are `==`, and
+  differ in `to_json()` by each node's `read_at`.
+- Schema `/4`: each observation gains `"attempted_at"` (UTC, the moment the request to that
+  node started) and `"returned_at"` (UTC, the moment its answer came back), written after
+  `"read_at"`. Both are null for `not-asked`; `returned_at` is null for `unreadable`, since
+  no answer came back, while its `read_at` is still the moment the failure was recorded. For
+  an answered node `returned_at` equals `read_at`. `verify_corroborated`'s `clock` is now
+  called twice per node asked (before the request, and after it returns or fails), not once.
+  An `Observation` built by hand with `read_at` alone is still accepted and writes both as
+  null. Neither field (nor `read_at`) is part of a `Corroboration`'s `==` or hash; all three
+  are part of an `Observation`'s own `==` and hash, as every field of that dataclass is.
+  A wall clock that steps backwards between the two reads (NTP, a resumed VM, a test clock)
+  never changes a verdict: an attempt that reads later than its return is recorded with
+  `attempted_at` equal to `read_at` (clamped), so the check decides, and raises, exactly as
+  with a fixed clock. An `Observation` built by hand with `attempted_at` after `read_at` is
+  still refused. A test clock written for one read per node (main's) still works: when the
+  clock raises `StopIteration` after it has given at least one moment, that read reuses the
+  last moment it gave - on the return read, the node's own `attempted_at`; on a later node's
+  attempt read, the previous node's last moment - so the verdict is unchanged and only the
+  recorded times repeat. A clock that raises `StopIteration` on its very first read still
+  raises, and any other exception from the clock (an `IndexError` from a list that ran dry,
+  say) propagates as before. To get a distinct time on each read, yield two per node asked.
+- Schema `/4` also writes `"stop"` after `"ask_again"`: why the loop over the endpoints
+  stopped, and the quorum rule in force, as `{"reason", "quorum": {"k", "n"}, "at"}` - `k`
+  the endpoints that had to agree, `n` the distinct endpoints configured, `at` the `read_at`
+  of the last endpoint asked. `reason` is one of the four ways the loop ends, and only those:
+  `quorum-reached` (settled), `exhausted` (every endpoint asked without a quorum: an
+  unsettled receipt, or `NotCorroborated`), `mismatch` and `disagreement` (both raise). The
+  check has no deadline and no budget, so neither is a reason. The table of reasons and their
+  meanings is written inline as `"stop_reasons"` with `"stop_reasons_sha256"` (computed like
+  `node_states_sha256`, pinned as `nano_quorum.STOP_REASONS_SHA256` =
+  `10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342`), and
+  `verify_receipt_vocabulary` now checks it too. `Corroboration.stop` holds it (null in the
+  JSON for one built by hand; not part of `==`), and a raised `Mismatch`, `Disagreement` or
+  `NotCorroborated` carries it as `.stop`.
+- `"ask_again"` keeps its boolean (true exactly when unsettled), and schema `/4` writes
+  beside it `"ask_again_not_before"`: when to ask again, as UTC ISO-8601, null when the
+  receipt is settled. The rule is `stop.at + retry_after` seconds, and the record writes the
+  delay as `"retry_after_s"`, so a reader can recompute it. `retry_after` is a new keyword of
+  `verify_corroborated` (default 0, a finite number from 0 to 10\*\*9, refused before any
+  call otherwise). The library still waits for nothing and retries nothing: it does not know
+  when a node will confirm a block, so with the default the earliest time is the moment this
+  check stopped, and any longer wait is the caller's to set. `NotCorroborated` raised by
+  `verify_corroborated` carries the same time as `.not_before`. A `Corroboration` built by
+  hand refuses the same delays (`TypeError` for a non-number or a bool, `ValueError` for NaN,
+  an infinity, a negative or one over 10\*\*9), so its `to_json()` is always strict JSON, and
+  `stop` must be a `Stop` or None (`TypeError`). `not_before` is written to the millisecond
+  and a sub-millisecond remainder rounds up, so a nonzero delay never writes the stop moment
+  itself; a sum past the year 9999 is written as `9999-12-31T23:59:59.999Z` instead of
+  raising `OverflowError`.
+- `Observation.from_dict(entry)` reads a `to_dict()` entry back (unknown or missing keys
+  are refused; so are an `"error"` on any state but `unreadable`, and `""` where `to_dict()`
+  writes null for an empty `read_at`, `attempted_at` or `returned_at` - nothing is dropped
+  silently, an entry is read only if `to_dict()` could have written it), and `nano_quorum.canonical_json` is the sorted, whitespace-free form
+  `node_states_sha256` hashes. Three per-node fixtures in `tests/fixtures/observations/` -
+  `not_asked.json`, `asked_returned.json` (asked, answer came back with its time) and
+  `asked_no_return.json` (asked, unreadable, no `returned_at`) - must round-trip
+  (bytes, parse, `from_dict`, `canonical_json` plus a newline) to the same bytes and stay
+  three distinct records; their SHA-256 are pinned in `tests/test_observation_fixtures.py`.
+  To compare with your own run:
+  `python -m pytest tests/test_observation_fixtures.py && sha256sum tests/fixtures/observations/*.json`.
+- Schema `/5` records the ask order. Once the loop stops early, who went first decides which
+  nodes made up the k and which ended up `not-asked`, so the receipt now says it:
+  `"configured_order"` (the endpoints after duplicates are folded), `"ask_order"` (every
+  endpoint in the order it was planned to be asked, the `not-asked` ones included),
+  `"order_rule"` and `"order_seed"`. Each observation gains `"ask_index"`, its 0-based place in
+  `ask_order`; a `not-asked` node keeps its planned place, so it is never null in a live
+  record (null only in an `Observation` built by hand without one). `Observation.to_dict()`
+  (and so each entry of `"observations"` in `to_json()`) now puts `"ask_index"` first, before
+  `"rpc_url"`; code that read an observation's keys by position sees a different order. Observations are listed in
+  ask order. The order was, and by default still is, the order the caller gave
+  (`"order_rule": "as-given"`, `"order_seed": null`); nothing in the module shuffled it.
+  `verify_corroborated(..., order_seed=N)` (an int from 0 to 2\*\*64 - 1) asks in
+  `"seed-sha256"` order instead: ascending SHA-256 hex of `str(N) + "\n" + url` (the URL as
+  written in the record), ties in configured order, so anyone can recompute it from the
+  record, and the same seed and nodes give the same order. `nano_quorum.replay_receipt(record)`
+  re-runs the stop from the record alone - recomputes `ask_order` from the rule, checks each
+  observation's `ask_index`, walks the answers with the k of n in `"stop"`, and checks the
+  stop reason and moment, `settled`, `agreed` and which nodes are `not-asked` - and returns
+  `{"verdict": "match" | "mismatch", "problems", "expected_stop", "expected_not_asked"}`.
+  From a shell: `python3 nano_quorum.py --replay receipt.json` (exit 0 on a match, 1 on a
+  mismatch). It checks order and stopping, not amounts and not whether a node told the truth.
+  Neither vocabulary changed, so both pinned hashes are as in `/4`; the three per-node
+  fixtures gained `ask_index` and their pinned SHA-256 changed with it.
 
 An unsettled receipt is not a failure — it means *not yet*. Ask again later; this library
 deliberately has no retry loop and no cache, so the waiting is yours to decide.
@@ -523,7 +625,9 @@ The rules it holds to, each of which is a way of failing closed:
   package.
 
 Every `Corroboration` also carries `observations`: one entry per configured endpoint, in the
-order given (an endpoint the check ended before is `not-asked`, with `read_at` null), each with `rpc_url`, `state` and `read_at` (the UTC ISO-8601 time its answer
+order asked - the order given, unless an `order_seed` was passed; the record's `ask_order`
+says which, each entry's `ask_index` is its place in it, and `replay_receipt` re-checks it
+(an endpoint the check ended before is `not-asked`, with `read_at` null), each with `rpc_url`, `state` and `read_at` (the UTC ISO-8601 time its answer
 was read), and a `detail` string: what went wrong for an endpoint that could not be read,
 the two figures or two block hashes for a `mismatch`, and empty otherwise. `state` is
 `confirmed`, `unconfirmed` (the node has the block but has not confirmed it), `not-seen`
@@ -538,17 +642,17 @@ carries it as `.observations`, and `Disagreement` as `.node_observations` (its
 `not-seen` is an answer (the node has no such block); `unreadable` is the absence of one
 (the node errored, timed out or sent something that is not a node reply), and an
 `unreadable` entry carries `"error": {"kind", "message"}` that no other state has. The
-record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/3"` and
+record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/5"` and
 `"node_states"`, the full state vocabulary (`nano_quorum.NODE_STATES`) with a one-line
 meaning for each, so a stored receipt can be read without this code. Beside them it
 writes `"node_states_sha256"`: the SHA-256 hex of
 `json.dumps(node_states, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
-encoded as UTF-8. For schema `/3` that is
+encoded as UTF-8. For schema `/5` (and `/4` and `/3` before it: the state table did not change) that is
 `3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c`
 (`nano_quorum.NODE_STATES_SHA256`; the module refuses to import if the table and this
 value disagree). `nano_quorum.verify_receipt_vocabulary(record)` recomputes it from a
 stored record's own table and returns True only if it matches both the record's field
-and the pinned value, so an edited table, or a `/3` record with a different vocabulary,
+and the pinned value, so an edited table, or a `/5` record with a different vocabulary,
 is caught.
 
 `node_states_sha256` covers the `node_states` table and nothing else. It does not protect
@@ -666,12 +770,16 @@ pip install pytest
 python -m pytest -v
 ```
 
-1094 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1221 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
-CLI and a failed endpoint in a quorum; the
-integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
+CLI and a failed endpoint in a quorum; a wall clock that steps back between the two reads
+of a node, or jitters over 600 scenarios, giving exactly the fixed-clock verdict and never
+raising; the one UTC time shape a record carries, `Observation.from_dict` refusing entries
+`to_dict()` never writes, and a hand-built `Corroboration` refusing a NaN, infinite,
+negative or out-of-range `retry_after`, with `not_before` rounded up and never overflowing;
+the integer-raw guarantee, the receipt's JSON shape, the exact request put to the node and
 the User-Agent it carries; for the skill bundle, that SKILL.md's exit table, the CLI's usage docstring and the
 codes `verify_cli.py` actually returns are the same set in all three directions, and that
 every environment variable SKILL.md declares is read by the bundle - `NANO_RPC_URL`
@@ -732,7 +840,10 @@ disagree, one node, the same node twice and a failed node all `unknown`, an amou
 under by one raw, an invoice issued at or after the block, a source that is the destination
 or on the exclusion list all `refused`, a missing field outranking a failing one, all five
 present `settled`, and FIVE_FIELDS.md's two curl bodies pinned to what `read_nodes` sends
-with nothing piped into an interpreter; and for the README itself, that the curl body in *Check it without running our
+with nothing piped into an interpreter; for the quorum's ask order, that `ask_order` is the
+sequence the nodes were called in, that on an early quorum the not-asked nodes are its tail,
+that one seed gives one order, and that `replay_receipt` passes two orders of the same answers
+and fails a receipt whose order was edited; and for the README itself, that the curl body in *Check it without running our
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
 library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
