@@ -9,6 +9,7 @@ a "no" - rather than about the happy path.
 """
 
 import json
+import pathlib
 from collections.abc import Mapping
 
 import pytest
@@ -802,10 +803,15 @@ def test_every_endpoint_unreadable_is_not_corroborated_not_a_mismatch(monkeypatc
 
 
 def ticking_clock(*moments):
-    """A clock for `verify_corroborated(clock=...)`: one fixed UTC moment per read."""
+    """A clock for `verify_corroborated(clock=...)`: one fixed UTC moment per read.
+
+    The clock is read twice per node asked (before the request, and once it
+    returns); each moment is given for both, so a node's `attempted_at`,
+    `read_at` and `returned_at` are the same moment here.
+    """
     from datetime import datetime, timezone
 
-    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments]
+    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments for _ in (0, 1)]
     return lambda: queue.pop(0)
 
 
@@ -841,7 +847,8 @@ def test_the_json_record_carries_each_node_its_state_and_read_time(monkeypatch):
     assert record["settled"] is False
     assert record["observations"] == [o.to_dict() for o in out.observations]
     assert record["observations"][0] == {
-        "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z", "detail": "",
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:01.000Z",
+        "attempted_at": "2026-11-09T12:00:01.000Z", "returned_at": "2026-11-09T12:00:01.000Z", "detail": "",
     }
     assert record["observations"][1]["state"] == "unconfirmed"
 
@@ -1149,7 +1156,7 @@ def test_a_reply_naming_no_payer_chain_records_none(monkeypatch):
     assert out.receipt.settled is True
     for seen in out.observations:
         assert seen.payer_account == ""
-        assert set(seen.to_dict()) == {"rpc_url", "state", "read_at", "detail"}
+        assert set(seen.to_dict()) == {"ask_index", "rpc_url", "state", "read_at", "attempted_at", "returned_at", "detail"}
 
 
 def test_only_a_confirmed_observation_names_a_payer_chain():
@@ -1901,3 +1908,405 @@ def test_a_not_asked_node_has_its_credentials_redacted_and_no_read_time():
     assert entry["read_at"] is None
     with pytest.raises(ValueError, match="never read"):
         nano_quorum.Observation(A, "not-asked", "2026-11-09T12:00:00.000Z")
+
+
+# --- every asked node's record says when it was read ----------------------------------
+
+
+def clock_at(*moments):
+    """A clock for `verify_corroborated(clock=...)` returning the given "HH:MM:SS" UTC times.
+
+    Each moment is given twice, for a node's attempt and its return (see `ticking_clock`).
+    """
+    from datetime import datetime, timezone
+
+    queue = [
+        datetime(2026, 11, 9, *(int(part) for part in moment.split(":")), tzinfo=timezone.utc)
+        for moment in moments for _ in (0, 1)
+    ]
+    return lambda: queue.pop(0)
+
+
+def test_every_asked_state_writes_its_own_read_time_into_the_json(monkeypatch):
+    """In one unsettled receipt, an unreadable, a not-seen, an unconfirmed and a
+    confirmed node each carry, in the JSON, the moment that node was read."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"), B: {"error": "Block not found"},
+        C: send_block(confirmed="false"), D: send_block(),
+    })
+    out = verify_corroborated(
+        HASH, ONE_XNO, PAYEE, [A, B, C, D], clock=clock_at("12:00:01", "12:00:02", "12:00:03", "12:00:04"),
+    )
+    assert out.receipt.settled is False
+    record = json.loads(out.to_json())
+    assert record["ask_again"] is True
+    assert [(o["state"], o["read_at"]) for o in record["observations"]] == [
+        ("unreadable", "2026-11-09T12:00:01.000Z"),
+        ("not-seen", "2026-11-09T12:00:02.000Z"),
+        ("unconfirmed", "2026-11-09T12:00:03.000Z"),
+        ("confirmed", "2026-11-09T12:00:04.000Z"),
+    ]
+
+
+def test_a_mismatch_observation_carries_its_read_time(monkeypatch):
+    nodes(monkeypatch, {A: send_block(payee="nano_1someoneelse"), B: send_block()})
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:00:05"))
+    assert [(o.state, o.to_dict()["read_at"]) for o in caught.value.observations] == [
+        ("mismatch", "2026-11-09T12:00:05.000Z"), ("not-asked", None),
+    ]
+
+
+def test_not_seen_at_12_00_and_at_12_30_are_different_records(monkeypatch):
+    """The same node, the same "not seen", read half an hour apart: the stored
+    records differ by that node's read_at. `==` ignores read_at on purpose (see
+    `Corroboration`), so the JSON, not equality, is what tells their ages apart;
+    the pinned node_states_sha256 hashes the state vocabulary only, so it is the
+    same for both and says nothing about when."""
+    replies = {A: {"error": "Block not found"}, B: {"error": "Block not found"}}
+    nodes(monkeypatch, replies)
+    early = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:00:00", "12:00:00"))
+    nodes(monkeypatch, replies)
+    late = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=clock_at("12:30:00", "12:30:00"))
+
+    early_record, late_record = json.loads(early.to_json()), json.loads(late.to_json())
+    assert early_record["observations"][0] == {
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:00:00.000Z",
+        "attempted_at": "2026-11-09T12:00:00.000Z", "returned_at": "2026-11-09T12:00:00.000Z", "detail": "",
+    }
+    assert late_record["observations"][0] == {
+        "ask_index": 0, "rpc_url": A, "state": "not-seen", "read_at": "2026-11-09T12:30:00.000Z",
+        "attempted_at": "2026-11-09T12:30:00.000Z", "returned_at": "2026-11-09T12:30:00.000Z", "detail": "",
+    }
+    assert early.to_json() != late.to_json()
+    assert early == late and hash(early) == hash(late)
+    assert early_record["node_states_sha256"] == late_record["node_states_sha256"]
+
+
+@pytest.mark.parametrize("state", ["confirmed", "unconfirmed", "not-seen", "unreadable", "mismatch"])
+def test_an_asked_observation_with_no_read_time_is_refused(state):
+    """A node that was asked was read at some moment; a record of it with no
+    moment cannot say how old its answer is, so it cannot be made."""
+    error = {"error_kind": "OSError", "error_message": "timed out"} if state == "unreadable" else {}
+    with pytest.raises(ValueError, match="read_at"):
+        nano_quorum.Observation(A, state, "", **error)
+
+
+@pytest.mark.parametrize("read_at", ["12:00", "2026-11-09T12:00:00", "2026-11-09T14:00:00.000+02:00", "soon"])
+def test_an_asked_observation_read_time_must_be_utc_iso_8601(read_at):
+    with pytest.raises(ValueError, match="read_at"):
+        nano_quorum.Observation(A, "not-seen", read_at)
+
+
+# --- each asked node says when its request started and when the answer came back -------
+
+
+def seconds_clock(*seconds):
+    """A clock returning 2026-11-09T12:00:SS UTC for each given second, one per call."""
+    from datetime import datetime, timezone
+
+    queue = [datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in seconds]
+    return lambda: queue.pop(0)
+
+
+def at(second):
+    return "2026-11-09T12:00:%02d.000Z" % second
+
+
+def test_each_asked_node_records_when_it_was_attempted_and_when_it_returned(monkeypatch):
+    """A errors, B answers "no such block", C confirms, D confirms: quorum at D,
+    E never asked. Each asked node's request start and return are written; the
+    unreadable one returned nothing, the not-asked one was never attempted."""
+    nodes(monkeypatch, {
+        A: OSError("timed out"), B: {"error": "Block not found"}, C: send_block(), D: send_block(),
+    })
+    out = verify_corroborated(
+        HASH, ONE_XNO, PAYEE, [A, B, C, D, E], clock=seconds_clock(1, 6, 7, 8, 10, 11, 12, 14),
+    )
+    record = json.loads(out.to_json())
+    assert [
+        (o["state"], o["attempted_at"], o["returned_at"], o["read_at"]) for o in record["observations"]
+    ] == [
+        ("unreadable", at(1), None, at(6)),
+        ("not-seen", at(7), at(8), at(8)),
+        ("confirmed", at(10), at(11), at(11)),
+        ("confirmed", at(12), at(14), at(14)),
+        ("not-asked", None, None, None),
+    ]
+
+
+@pytest.mark.parametrize("state, kwargs, match", [
+    ("unreadable", {"returned_at": at(2), "error_kind": "OSError"}, "returned_at"),
+    ("not-seen", {"attempted_at": at(1), "returned_at": at(3)}, "must equal read_at"),
+    ("not-seen", {"attempted_at": at(5), "returned_at": at(2)}, "after read_at"),
+    ("not-seen", {"attempted_at": at(1)}, "returned_at"),
+    ("not-seen", {"attempted_at": "12:00", "returned_at": at(2)}, "attempted_at"),
+])
+def test_attempt_and_return_times_that_contradict_the_read_are_refused(state, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        nano_quorum.Observation(A, state, at(2), **kwargs)
+
+
+def test_the_record_with_ask_order_is_schema_5(monkeypatch):
+    """The per-node record changed shape again (ask_index, and the receipt's
+    ask_order), so the schema string says so; both vocabulary pins are the ones
+    /4 pinned, so the same tables under /4 or /3 still read as that vocabulary,
+    and under any other schema do not."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["schema"] == "nano_quorum.corroboration/5"
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    assert record["node_states_sha256"] == "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
+    assert record["stop_reasons_sha256"] == "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
+    for older in ("nano_quorum.corroboration/4", "nano_quorum.corroboration/3"):
+        record["schema"] = older
+        assert nano_quorum.verify_receipt_vocabulary(record) is True
+    for other in ("nano_quorum.corroboration/2", "nano_quorum.corroboration/6", "", None, 5):
+        record["schema"] = other
+        assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+# A receipt exactly as main (schema /3) wrote it: verify_corroborated on main
+# 42908a4 with two confirming nodes and a one-read-per-node clock.
+MAIN_SCHEMA_3_RECORD = pathlib.Path(__file__).resolve().parent / "fixtures" / "receipt_main_schema3.json"
+
+
+def test_a_stored_schema_3_receipt_from_main_still_verifies():
+    """The node-state vocabulary and its hash are unchanged since /3, so a /3
+    receipt main wrote still validates, from its text and from its dict."""
+    text = MAIN_SCHEMA_3_RECORD.read_text()
+    record = json.loads(text)
+    assert record["schema"] == "nano_quorum.corroboration/3"
+    assert "stop_reasons" not in record
+    assert nano_quorum.verify_receipt_vocabulary(text) is True
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+
+
+@pytest.mark.parametrize("schema", [
+    "nano_quorum.corroboration/2", "nano_quorum.corroboration/6", "nano_quorum.corroboration/30",
+    "nano_quorum.corroboration/3 ", "other/3", None, 3,
+])
+def test_a_schema_3_receipt_under_an_unknown_schema_is_refused(schema):
+    record = json.loads(MAIN_SCHEMA_3_RECORD.read_text())
+    record["schema"] = schema
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+    del record["schema"]
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+@pytest.mark.parametrize("edit", ["meaning", "extra-state", "dropped-state", "hash", "no-hash", "no-table"])
+def test_a_schema_3_receipt_with_an_altered_vocabulary_is_refused(edit):
+    record = json.loads(MAIN_SCHEMA_3_RECORD.read_text())
+    table = record["node_states"]
+    if edit == "meaning":
+        table["confirmed"] += " (edited)"
+    elif edit == "extra-state":
+        table["paid-maybe"] = "the node said probably"
+    elif edit == "dropped-state":
+        del table["not-asked"]
+    elif edit == "hash":
+        record["node_states_sha256"] = "0" * 64
+    elif edit == "no-hash":
+        del record["node_states_sha256"]
+    else:
+        del record["node_states"]
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+    if edit in ("meaning", "extra-state", "dropped-state"):
+        # Re-hashing the edited table so the record agrees with itself is not enough:
+        # it must still hash to the pinned vocabulary.
+        record["node_states_sha256"] = nano_quorum.node_states_sha256(table)
+        assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/4", "nano_quorum.corroboration/5"])
+def test_a_schema_4_or_5_receipt_still_needs_its_stop_reasons_table(monkeypatch, schema):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    record["schema"] = schema
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    record["stop_reasons"]["quorum-reached"] += " (edited)"
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+    del record["stop_reasons"]
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+def one_read_per_node_clock(*moments):
+    """A main-era test clock: one moment per node asked, then StopIteration."""
+    from datetime import datetime, timezone
+
+    return iter([datetime(2026, 11, 9, 12, 0, s, tzinfo=timezone.utc) for s in moments]).__next__
+
+
+def test_a_one_read_per_node_clock_settles_as_on_main(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock(1, 2))
+    assert out.receipt.settled is True
+    assert out.agreed == (A, B)
+    # The clock ran dry on B's attempt read: B reuses the last moment given.
+    assert [(o.attempted_at, o.read_at, o.returned_at) for o in out.observations] == [
+        ("2026-11-09T12:00:01.000Z", "2026-11-09T12:00:02.000Z", "2026-11-09T12:00:02.000Z"),
+        ("2026-11-09T12:00:02.000Z", "2026-11-09T12:00:02.000Z", "2026-11-09T12:00:02.000Z"),
+    ]
+    assert nano_quorum.verify_receipt_vocabulary(out.to_json()) is True
+
+
+def test_a_clock_that_runs_out_on_the_return_read_reuses_the_attempt(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock(1, 2, 3))
+    assert out.receipt.settled is True
+    assert [(o.attempted_at, o.returned_at) for o in out.observations] == [
+        ("2026-11-09T12:00:01.000Z", "2026-11-09T12:00:02.000Z"),
+        ("2026-11-09T12:00:03.000Z", "2026-11-09T12:00:03.000Z"),
+    ]
+
+
+def test_a_one_read_per_node_clock_keeps_every_verdict(monkeypatch):
+    """Unsettled, not corroborated and a disagreement come out as with a fresh clock."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock(1, 2))
+    assert out.receipt.settled is False
+    assert [o.state for o in out.observations] == ["not-seen", "unconfirmed"]
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block()})
+    with pytest.raises(NotCorroborated):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock(1, 2))
+    nodes(monkeypatch, {A: send_block(), B: send_block(amount=ONE_XNO + 1)})
+    with pytest.raises(Mismatch):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    with pytest.raises(Mismatch):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock(1, 2))
+
+
+def test_a_clock_that_gives_no_moment_at_all_still_raises(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    with pytest.raises(StopIteration):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=one_read_per_node_clock())
+
+
+@pytest.mark.parametrize("name", ["attempted_at", "returned_at"])
+def test_a_not_asked_node_has_no_attempt_or_return_time(name):
+    with pytest.raises(ValueError, match="never asked"):
+        nano_quorum.Observation(A, "not-asked", "", **{name: at(1)})
+
+
+# --- the record says why the loop stopped, and the k of n in force ---------------------
+
+
+def test_a_settled_receipt_says_the_quorum_was_reached_at_k_of_n(monkeypatch):
+    """Two of three agree; the record says so, with the rule, and a reader can
+    re-run the decision from the record alone."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2))
+    record = json.loads(out.to_json())
+    assert record["stop"] == {"reason": "quorum-reached", "quorum": {"k": 2, "n": 3}, "at": at(2)}
+    assert out.stop == nano_quorum.Stop("quorum-reached", 2, 3, at(2))
+    # The decision again, from the record alone.
+    confirmed = [o for o in record["observations"] if o["state"] == "confirmed"]
+    assert len(confirmed) >= record["stop"]["quorum"]["k"]
+    assert len(record["observations"]) == record["stop"]["quorum"]["n"]
+    assert confirmed[-1]["read_at"] == record["stop"]["at"]
+    assert [o["state"] for o in record["observations"][len(confirmed):]] == ["not-asked"]
+
+
+def test_an_unsettled_receipt_says_every_endpoint_was_asked(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false"), C: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=2, clock=ticking_clock(1, 2, 3))
+    assert out.receipt.settled is False
+    assert json.loads(out.to_json())["stop"] == {
+        "reason": "exhausted", "quorum": {"k": 2, "n": 3}, "at": at(3),
+    }
+
+
+def test_a_mismatch_says_the_check_stopped_on_it(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block(amount=ONE_XNO - 1)})
+    with pytest.raises(Mismatch) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3, clock=ticking_clock(1, 2))
+    assert caught.value.stop.to_dict() == {"reason": "mismatch", "quorum": {"k": 3, "n": 3}, "at": at(2)}
+
+
+def test_a_disagreement_says_the_check_stopped_on_it(monkeypatch):
+    nodes(monkeypatch, {A: send_block(height=7), B: send_block(height=8)})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2))
+    assert caught.value.stop == nano_quorum.Stop("disagreement", 2, 3, at(2))
+
+
+def test_too_few_answers_says_every_endpoint_was_asked(monkeypatch):
+    nodes(monkeypatch, {A: OSError("refused"), B: send_block(), C: OSError("timed out")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], clock=ticking_clock(1, 2, 3))
+    assert caught.value.stop == nano_quorum.Stop("exhausted", 2, 3, at(3))
+
+
+def test_the_stop_vocabulary_is_the_real_exit_paths_pinned_in_the_record(monkeypatch):
+    """Four ways the loop ends, no deadline or budget (the code has none), and
+    the table is pinned by hash like the node states."""
+    assert list(nano_quorum.STOP_REASONS) == ["quorum-reached", "exhausted", "mismatch", "disagreement"]
+    assert nano_quorum.node_states_sha256(nano_quorum.STOP_REASONS) == nano_quorum.STOP_REASONS_SHA256
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["stop_reasons"] == nano_quorum.STOP_REASONS
+    assert record["stop_reasons_sha256"] == nano_quorum.STOP_REASONS_SHA256
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    edited = json.loads(json.dumps(record))
+    edited["stop_reasons"]["exhausted"] = "gave up"
+    assert nano_quorum.verify_receipt_vocabulary(edited) is False
+    with pytest.raises(AssertionError, match="STOP_REASONS"):
+        nano_quorum._check_vocabulary_pin(edited["stop_reasons"], nano_quorum.STOP_REASONS_SHA256, "STOP_REASONS")
+
+
+@pytest.mark.parametrize("args, match", [
+    (("deadline", 2, 3, "2026-11-09T12:00:00.000Z"), "unknown stop reason"),
+    (("exhausted", 4, 3, "2026-11-09T12:00:00.000Z"), "cannot be met"),
+    (("exhausted", 2, 3, "12:00"), "UTC"),
+])
+def test_a_stop_that_is_not_a_real_exit_is_refused(args, match):
+    with pytest.raises(ValueError, match=match):
+        nano_quorum.Stop(*args)
+
+
+# --- ask_again says from when, not only whether ----------------------------------------
+
+
+def test_an_unsettled_receipt_says_when_to_ask_again(monkeypatch):
+    """not_before is the moment the check stopped plus the configured delay; the
+    boolean ask_again is kept beside it."""
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2), retry_after=30)
+    record = json.loads(out.to_json())
+    assert record["ask_again"] is True
+    assert record["stop"]["at"] == at(2)
+    assert record["ask_again_not_before"] == at(32)
+    assert record["retry_after_s"] == 30
+    assert out.not_before == at(32)
+
+
+def test_with_no_delay_configured_ask_again_is_not_before_the_stop(monkeypatch):
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2)).to_json())
+    assert record["ask_again_not_before"] == record["stop"]["at"] == at(2)
+    assert record["retry_after_s"] == 0
+
+
+def test_a_settled_receipt_has_no_time_to_ask_again(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=30).to_json())
+    assert record["ask_again"] is False
+    assert record["ask_again_not_before"] is None
+
+
+def test_not_corroborated_says_when_to_ask_again(monkeypatch):
+    nodes(monkeypatch, {A: OSError("refused"), B: OSError("refused")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], clock=ticking_clock(1, 2), retry_after=1.5)
+    assert caught.value.not_before == "2026-11-09T12:00:03.500Z"
+
+
+@pytest.mark.parametrize("delay, error", [
+    (-1, ValueError), (float("nan"), ValueError), (float("inf"), ValueError),
+    (10**9 + 1, ValueError), (True, TypeError), ("30", TypeError),
+])
+def test_a_retry_delay_that_is_not_a_time_is_refused_before_any_call(monkeypatch, delay, error):
+    nodes(monkeypatch, {})
+    # "seconds" is in both refusals, and not in Python's own "unexpected keyword" error.
+    with pytest.raises(error, match="retry_after must be a .*seconds"):
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=delay)
