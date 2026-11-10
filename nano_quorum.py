@@ -807,20 +807,29 @@ def _redact_text(text: object) -> object:
     return _CREDENTIALS_IN_TEXT.sub(r"\1***@", text)
 
 
+# The one shape of UTC time a record carries: extended calendar date, "T",
+# hours, minutes and seconds, an optional fraction of 1 to 6 digits, and "Z"
+# or "+00:00". Week dates, ordinal dates, the basic (no-separator) form, a time
+# without seconds and longer fractions are refused.
+_UTC_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)", re.ASCII)
+
+
 def _is_utc_iso(text: object) -> bool:
-    """Whether `text` is a full ISO-8601 date and time in UTC, written with a trailing Z."""
-    if not isinstance(text, str) or not text.endswith("Z") or "T" not in text:
+    """Whether `text` is a full ISO-8601 UTC date and time, ending in Z or +00:00 (see `_UTC_ISO`)."""
+    if not isinstance(text, str) or not _UTC_ISO.fullmatch(text):
         return False
     try:
-        moment = datetime.fromisoformat(text[:-1] + "+00:00")
+        _moment(text)
     except ValueError:
         return False
-    return moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0
+    return True
 
 
 def _moment(text: str) -> datetime:
-    """A UTC ISO-8601 text ending in Z (already checked by `_is_utc_iso`) as a datetime."""
-    return datetime.fromisoformat(text[:-1] + "+00:00")
+    """A UTC ISO-8601 text ending in Z or +00:00 (already checked by `_is_utc_iso`) as a datetime."""
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
 
 
 @dataclass(frozen=True)
@@ -839,7 +848,7 @@ class Observation:
     "not-seen" and "unconfirmed" are kept apart on purpose: both leave the
     receipt unsettled, but they are different facts about different nodes, and
     a record that folds them loses which node said which and when.
-    `read_at` is UTC ISO-8601 ending in Z, and every state but "not-asked"
+    `read_at` is UTC ISO-8601 ending in Z or +00:00, and every state but "not-asked"
     must carry one: an asked node with no read time, or one that is not UTC
     ISO-8601, is refused when the `Observation` is made.
 
@@ -874,8 +883,12 @@ class Observation:
     Both are optional for an asked node built by hand, so an `Observation`
     made as before (`read_at` only) is still accepted and writes both as
     null; but an answered node with an `attempted_at` must also carry its
-    `returned_at`. `verify_corroborated` fills both for every node it asks.
-    Neither is part of `Corroboration` equality, as `read_at` is not.
+    `returned_at`. `verify_corroborated` fills both for every node it asks;
+    when its clock stepped backwards between the two reads it records
+    `attempted_at` as `read_at` (clamped), so a clock never makes a check raise.
+    Neither is part of `Corroboration` equality, as `read_at` is not; all
+    three are part of an `Observation`'s own `==` and hash (it is a plain
+    frozen dataclass).
 
     `ask_index` is the node's 0-based place in the order the check planned to
     ask the nodes in (the receipt's "ask_order"). A "not-asked" node keeps the
@@ -918,7 +931,7 @@ class Observation:
             # "not seen" at 12:30 would read the same.
             raise ValueError(
                 f"a {self.state!r} observation was read, so its read_at must be the UTC "
-                f"ISO-8601 moment of that read ending in Z, got {self.read_at!r}"
+                f"ISO-8601 moment of that read ending in Z (or +00:00), got {self.read_at!r}"
             )
         self._check_timing()
 
@@ -931,7 +944,7 @@ class Observation:
             if self.state == "not-asked" and value:
                 raise ValueError(f"a not-asked node was never asked, so it has no {name}")
             if value and not _is_utc_iso(value):
-                raise ValueError(f"{name} must be UTC ISO-8601 ending in Z, got {value!r}")
+                raise ValueError(f"{name} must be UTC ISO-8601 ending in Z (or +00:00), got {value!r}")
         if self.state == "not-asked":
             return
         if self.state == "unreadable" and self.returned_at:
@@ -978,7 +991,11 @@ class Observation:
         Every key to_dict() always writes is required, "error" exactly for an
         "unreadable" entry and "payer_account" only when it was written;
         anything else - an unknown key, a missing one, a value of the wrong
-        type - raises ValueError, as does any entry the constructor refuses.
+        type, an "error" on any other state, or "" where to_dict() writes null
+        for an empty time ("read_at", "attempted_at", "returned_at") - raises
+        ValueError, as does any entry the constructor refuses. Nothing is
+        dropped silently: an entry is read back only if to_dict() could have
+        written it.
         """
         if not isinstance(entry, Mapping):
             raise ValueError(f"an observation entry must be a JSON object, got {_type_name(entry)}")
@@ -997,9 +1014,14 @@ class Observation:
                 return ""
             if not isinstance(value, str):
                 raise ValueError(f"observation {name} must be a string, got {_type_name(value)}")
+            if nullable and not value:
+                # to_dict() writes an empty time as null, never as "".
+                raise ValueError(f'observation {name} is null when empty, never ""')
             return value
 
         error_kind = error_message = ""
+        if "error" in entry and entry["state"] != "unreadable":
+            raise ValueError('only an unreadable entry carries an "error"')
         if "error" in entry:
             error = entry["error"]
             if not isinstance(error, Mapping) or set(error) != {"kind", "message"}:
@@ -1062,7 +1084,7 @@ class Stop:
         if self.agree > self.endpoints:
             raise ValueError(f"a quorum of {self.agree} cannot be met by {self.endpoints} endpoints")
         if not _is_utc_iso(self.at):
-            raise ValueError(f"at must be UTC ISO-8601 ending in Z, got {self.at!r}")
+            raise ValueError(f"at must be UTC ISO-8601 ending in Z (or +00:00), got {self.at!r}")
 
     def to_dict(self) -> dict:
         return {"reason": self.reason, "quorum": {"k": self.agree, "n": self.endpoints}, "at": self.at}
@@ -1153,6 +1175,14 @@ class Corroboration:
     configured_order: tuple[str, ...] = ()
     ask_order: tuple[str, ...] = ()
     order_seed: int | None = None
+
+    def __post_init__(self) -> None:
+        # Checked here as `verify_corroborated` checks its keyword, so a receipt
+        # built by hand cannot carry a NaN, infinite, negative or out-of-range
+        # delay into `to_json()` (not strict JSON) or `not_before` (overflow).
+        _retry_after(self.retry_after)
+        if self.stop is not None and not isinstance(self.stop, Stop):
+            raise TypeError(f"stop must be a Stop or None, got {type(self.stop).__name__}")
 
     @property
     def order_rule(self) -> str | None:
@@ -1257,9 +1287,31 @@ def _retry_after(value) -> int | float:
     return int(value) if isinstance(value, int) else float(value)
 
 
+# The latest moment `_not_before` writes: the last millisecond a datetime holds.
+_LATEST = datetime.max.replace(microsecond=999000, tzinfo=timezone.utc)
+
+
 def _not_before(stopped_at: str, retry_after) -> str:
-    """`stopped_at` (UTC ISO-8601 ending in Z) plus `retry_after` seconds, in the same form."""
-    return _iso_utc(_moment(stopped_at) + timedelta(seconds=retry_after))
+    """`stopped_at` (UTC ISO-8601) plus `retry_after` seconds, to the millisecond, ending in Z.
+
+    A sub-millisecond remainder rounds UP to the next millisecond, so a nonzero
+    delay never writes a time equal to `stopped_at`. A sum past the year 9999
+    is written as the latest moment a datetime holds (9999-12-31T23:59:59.999Z)
+    instead of raising OverflowError.
+    """
+    try:
+        moment = _moment(stopped_at) + timedelta(seconds=retry_after)
+        spare = moment.microsecond % 1000
+        if spare:
+            moment += timedelta(microseconds=1000 - spare)
+    except OverflowError:
+        return _iso_utc(_LATEST)
+    return _iso_utc(moment)
+
+
+def _attempt_no_later(attempted_at: str, read_at: str) -> str:
+    """`attempted_at`, or `read_at` when a clock that stepped back put the attempt after it."""
+    return read_at if _moment(attempted_at) > _moment(read_at) else attempted_at
 
 
 def _endpoint_key(rpc_url: object) -> str:
@@ -1555,21 +1607,25 @@ def verify_corroborated(
     for index, rpc_url in enumerate(endpoints):
         # The clock is read twice per node asked: before the request is made
         # (`attempted_at`) and once it has returned or failed (`read_at`, and
-        # for an answer `returned_at`, the same moment).
+        # for an answer `returned_at`, the same moment). A wall clock can step
+        # backwards between the two reads (NTP, a test clock): the attempt then
+        # reads later than the return, and is clamped to it, so no clock ever
+        # changes a verdict or makes a valid payment raise.
         attempted_at = _iso_utc(now())
         try:
             answer, payload = _answer(block_hash, expect_raw, account, rpc_url)
         except _UNREADABLE as error:
             failures[rpc_url] = f"{type(error).__name__}: {error}"
+            failed_at = _iso_utc(now())
             observations.append(
                 Observation(
                     rpc_url,
                     "unreadable",
-                    _iso_utc(now()),
+                    failed_at,
                     failures[rpc_url],
                     error_kind=type(error).__name__,
                     error_message=str(error),
-                    attempted_at=attempted_at,
+                    attempted_at=_attempt_no_later(attempted_at, failed_at),
                     ask_index=index,
                 )
             )
@@ -1581,7 +1637,7 @@ def verify_corroborated(
                 rpc_url,
                 _STATE_OF_ANSWER[answer[0]],
                 returned_at,
-                attempted_at=attempted_at,
+                attempted_at=_attempt_no_later(attempted_at, returned_at),
                 returned_at=returned_at,
                 ask_index=index,
                 detail=(
