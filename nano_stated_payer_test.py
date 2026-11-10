@@ -20,7 +20,13 @@ never independent". Read here as:
     receives to date count and the verdict says so (`before`: "no payment yet - all
     receives to date"). Of equal largest receives, the earliest is taken. `--hops N`
     walks the rule N times: behind a funder, its largest receive below the send
-    that funded the account before it.
+    that funded the account before it. A receive from the account itself (a send
+    to itself) is skipped: the money came from elsewhere in the same account. The
+    history must be shown complete: heights strictly upward from 1 to block_count,
+    and each height the node left out (rpc.nano.to leaves change and epoch blocks out
+    of account_history) read with block_info and found to be a change or epoch block.
+    `--payment` hashes are stripped; none of them in the payer's history is
+    `unreadable`; `--payment` with `--hop opening-send` is refused (exit 3).
   * hop rule `opening-send` (the test as first stated, kept so verdicts given under
     it stay re-derivable): the funder is the account whose send opened the payer
     (its open block's link or source); `--hops N` walks that link N times.
@@ -173,13 +179,97 @@ def _history(account: str, count, rpc_url: str, post, exact: bool = False):
     return history, None
 
 
+def _block(rpc_url: str, post, block_hash) -> dict | None:
+    reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": str(block_hash)})
+    return reply if isinstance(reply, dict) and "error" not in reply else None
+
+
+def _moves_no_funds(block: dict) -> bool:
+    """A change or epoch block: it neither sends nor receives."""
+    contents = nano_independence._contents(block)
+    return block.get("subtype") in ("change", "epoch") or (
+        not block.get("subtype") and contents.get("type") == "change")
+
+
+def _left_out(account: str, top: str, top_left_out: bool, n: int, below: str, rpc_url: str, post):
+    """None when the `n` blocks account_history left out, walked down from `top` by
+    `previous` (`top` itself one of them when `top_left_out`), are all change or epoch
+    blocks of `account` and the walk joins the row `below`; else why not."""
+    current, left_out = str(top), top_left_out
+    for _ in range(n + 1):
+        block = _block(rpc_url, post, current)
+        if block is None:
+            return f"block_info {current} could not be read (checking blocks account_history left out)"
+        contents = nano_independence._contents(block)
+        owner = block.get("block_account") or contents.get("account")
+        if _key(owner) is None or _key(owner) != _key(account):
+            return f"block {current} is not a block of {account}"
+        if left_out:
+            if not _moves_no_funds(block):
+                return f"account_history left out block {current}, which is not a change or epoch block"
+            n -= 1
+        previous = contents.get("previous")
+        if not previous:
+            return f"block {current} names no previous block"
+        if n == 0:
+            if str(previous).upper() != str(below).upper():
+                return "the blocks account_history left out do not join its rows"
+            return None
+        current, left_out = str(previous), True
+    return "the blocks account_history left out could not be walked"
+
+
+def _complete(account: str, step: dict, rows: list, rpc_url: str, post):
+    """(heights, None) when `rows` is provably the whole history of `account`, else
+    (None, why). With heights given they must run strictly upward from 1 to
+    block_count (the last row the frontier); a height the node left out - rpc.nano.to
+    leaves change and epoch blocks out of account_history - is read with block_info
+    and must be a change or epoch block of the account. Without heights, the rows
+    must number exactly block_count."""
+    count = step["block_count"]
+    given = [_raw(row.get("height")) for row in rows]
+    if all(g is None for g in given):
+        if len(rows) != count:
+            return None, "account_history gave no heights and not block_count rows"
+        heights = list(range(1, len(rows) + 1))
+    elif any(g is None for g in given):
+        return None, "account_history gave heights for some rows only"
+    else:
+        heights = given
+        if heights[0] != 1 or any(b <= a for a, b in zip(heights, heights[1:])):
+            return None, "account_history heights do not run strictly upward from 1"
+        if heights[-1] > count:
+            return None, "account_history runs past the block count account_info gave"
+    if str(rows[0].get("hash") or "").upper() != str(step["open_block"]).upper():
+        return None, "the first block in account_history is not the open block"
+    frontier = str(step.get("checked_at_frontier") or "").upper()
+    for i in range(1, len(rows)):
+        gap = heights[i] - heights[i - 1] - 1
+        if gap:
+            why = _left_out(account, rows[i].get("hash"), False, gap, rows[i - 1].get("hash"), rpc_url, post)
+            if why:
+                return None, why
+    last = str(rows[-1].get("hash") or "").upper()
+    if heights[-1] < count:
+        if not frontier:
+            return None, "account_history stops below the block count and account_info names no frontier"
+        why = _left_out(account, frontier, True, count - heights[-1], last, rpc_url, post)
+        if why:
+            return None, why
+    elif frontier and last != frontier:
+        return None, "the last block in account_history is not the frontier account_info gave"
+    return heights, None
+
+
 def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=None, payments=frozenset()):
     """(funder, step, why) for `account` under the largest-receive rule.
 
     Hop 1 (before_send None): only receives below the payment count - a `payments`
     hash found in the history, else the first send to the payee, else all receives.
-    Behind a funder (before_send given): only receives below that send. funder is
-    _UNOPENED (step None) for an unknown account and None when it cannot be read."""
+    Behind a funder (before_send given): only receives below that send. A receive
+    from the account itself (a send to itself) is skipped: that money came from
+    somewhere else in the same account. funder is _UNOPENED (step None) for an
+    unknown account and None when it cannot be read."""
     post = post or nano_independence.nano_settlement_verify.post_json
     info = post(rpc_url, {"action": "account_info", "account": account})
     if "error" in info:
@@ -192,17 +282,14 @@ def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=No
             "funding_send": None, "funder": None, "before": None, "payment_block": None}
     if not step["open_block"]:
         return None, step, f"account_info for {account} names no open block"
-    rows, why = _history(account, step["block_count"], rpc_url, post, exact=True)
+    rows, why = _history(account, step["block_count"], rpc_url, post)
     if rows is None:
         return None, step, why
-    heights = []
-    for i, row in enumerate(rows):
-        given = _raw(row.get("height"))
-        if given is not None and given != i + 1:
-            return None, step, "account_history heights are not in order from 1"
-        heights.append(i + 1)
-    if str(rows[0].get("hash") or "").upper() != str(step["open_block"]).upper():
-        return None, step, "the first block in account_history is not the open block"
+    if not rows:
+        return None, step, "account_history is empty"
+    heights, why = _complete(account, step, rows, rpc_url, post)
+    if heights is None:
+        return None, step, why
 
     limit = None  # rows at index >= limit are not before the payment
     if before_send is not None:
@@ -217,14 +304,21 @@ def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=No
         if limit is None:
             return None, step, f"the funding send {before_send} is not in the history of {account}"
     else:
-        wanted = {str(p).upper() for p in payments}
+        for row in rows:
+            # A send whose recipient cannot be read could be the payment: the cut
+            # would be unknown, so nothing after it may decide.
+            if _kind(row) == "send" and not _account(row.get("account")):
+                return None, step, f"the send {row.get('hash')} in account_history names no readable account"
+        wanted = {str(p).strip().upper() for p in payments}
         given = [i for i, row in enumerate(rows) if str(row.get("hash") or "").upper() in wanted]
+        if wanted and not given:
+            return None, step, ("no --payment hash given is in the history of this payer: "
+                                + ", ".join(sorted(wanted)))
         for i in given:
             row = rows[i]
             if _kind(row) != "send" or _key(row.get("account")) != payee_key:
                 return None, step, f"the --payment block {row.get('hash')} is not a send from the payer to the payee"
         to_payee = [i for i, row in enumerate(rows) if _kind(row) == "send"
-                    and public_key_from_address(row.get("account")) is not None
                     and _key(row.get("account")) == payee_key]
         pick = min(given) if given else (min(to_payee) if to_payee else None)
         if pick is None:
@@ -236,7 +330,7 @@ def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=No
             how = "the --payment given" if given else "the payer's first send to the payee"
             step["before"] = f"below height {heights[pick]}, the payment {step['payment_block']} ({how})"
 
-    best, best_amount, total, n = None, -1, 0, 0
+    best, best_amount, total, n, selves = None, -1, 0, 0, []
     for i in range(limit):
         row = rows[i]
         if _kind(row) not in ("receive", "open"):
@@ -244,18 +338,28 @@ def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=No
         amount = _raw(row.get("amount"))
         if amount is None:
             return None, step, "a receive in account_history has no raw amount"
+        if _key(row.get("account")) is not None and _key(row.get("account")) == _key(account):
+            selves.append((i, amount))  # a send to itself: not a source, checked below
+            continue
         n += 1
         total += amount
         if amount > best_amount:  # strictly larger: of equal amounts the earliest stays
             best, best_amount = i, amount
     if best is None:
-        return None, step, "no receive before the payment in account_history"
+        return None, step, "no receive from another account before the payment in account_history"
+    # A skipped self-receive that would have been chosen must really be one: its send
+    # is read and must be the account's own.
+    for i, amount in selves:
+        if amount >= best_amount:
+            funder, why = _send_of(rows[i], rpc_url, post)
+            if why or _key(funder) != _key(account):
+                return None, step, why or f"the receive {rows[i].get('hash')} is named a self-send but is not one"
     row = rows[best]
     step["receive_block"] = str(row.get("hash") or "").upper()
     step["receive_height"] = heights[best]
     step["amount_raw"] = str(best_amount)
     step["receives"] = {"before_payment": n, "before_payment_raw": str(total),
-                        "chosen_share": _share(best_amount, total)}
+                        "chosen_share": _share(best_amount, total), "self_receives_skipped": len(selves)}
 
     # The source the history names is checked against the blocks themselves.
     received = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": step["receive_block"]})
@@ -279,7 +383,29 @@ def _largest_receive(account: str, rpc_url: str, post, payee_key, before_send=No
     named = row.get("account")
     if named and public_key_from_address(funder) is not None and _key(named) != _key(funder):
         return None, step, "account_history and block_info disagree on the receive's source"
+    if public_key_from_address(funder) is not None and _key(funder) == _key(account):
+        return None, step, f"the chosen receive {step['receive_block']} is a send from the account to itself"
     return funder, step, None
+
+
+def _account(value) -> bool:
+    return isinstance(value, str) and public_key_from_address(value) is not None
+
+
+def _send_of(row: dict, rpc_url: str, post):
+    """(account that sent what `row` received, None) or (None, why), from block_info."""
+    received = _block(rpc_url, post, row.get("hash"))
+    if received is None:
+        return None, f"block_info {row.get('hash')} could not be read"
+    contents = nano_independence._contents(received)
+    send_hash = contents.get("source") or contents.get("link")
+    send = _block(rpc_url, post, send_hash) if send_hash else None
+    if send is None:
+        return None, f"the send received by {row.get('hash')} could not be read"
+    funder = send.get("block_account") or nano_independence._contents(send).get("account")
+    if not _account(funder):
+        return None, f"the send {send_hash} names no Nano account"
+    return funder, None
 
 
 def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: set, hops: int, post,
@@ -436,7 +562,10 @@ def stated_test(payee: str, payers, rpc_urls, excluded=(), exchange=(), hops: in
     for a in excluded:
         excl.setdefault(_key(a), a)
     hubs = _shared_wallets(exchange, shared_wallets)
-    pays = frozenset(str(p).upper() for p in payments)
+    pays = frozenset(str(p).strip().upper() for p in payments)
+    if pays and hop_rule != LARGEST_RECEIVE:
+        raise ValueError(f"--payment applies only to --hop {LARGEST_RECEIVE}; {hop_rule} reads the opening send "
+                         "and has no payment to cut at")
 
     unique: dict[str, str] = {}
     results = []

@@ -666,7 +666,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1080 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1094 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -923,6 +923,12 @@ receives to date, said in `before`). `--hop opening-send` keeps the reading as f
 where every `independent` is **opener only**: the funder tested is the account whose send
 opened the payer, and later receives are not tested, so each such verdict carries a `caveat`
 and the opener's amount, the count and total of later receives and the opener's share.
+A send from the payer to itself is never the largest receive, and a history with change or
+epoch blocks left out (as rpc.nano.to gives it) is checked block by block rather than refused.
+Schema change: the JSON tag is now `stated-payer-test-v3` (was `stated-payer-test-v1`); the
+`why` of `independent` now ends "or only a shared hot wallet"; the text output names
+`hop rule X` and each payer's `(hop depth N)`; library callers of `stated_test()` get the
+new default `hop_rule="largest-receive"` (pass `hop_rule="opening-send"` for the old one).
 Verdicts, limits and a real read: [STATED-PAYER-TEST.md](STATED-PAYER-TEST.md).
 
 ## Was the send claimed?
