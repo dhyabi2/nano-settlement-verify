@@ -1080,6 +1080,41 @@ def test_two_nodes_agreeing_about_another_block_do_not_settle_the_one_asked_for(
     assert called == [A]
 
 
+def test_an_unrelated_block_asked_first_is_never_a_witness_for_the_one_requested(monkeypatch):
+    """The witness check runs before agreement, whatever the ask order. Here the
+    node asked first returns a valid, confirmed, unrelated block with the same
+    amount, payee and height; its contents hash to another block. With agree=2
+    and two honest nodes after it, counting it would settle on the first honest
+    answer. It must refuse instead, name both hashes, and never list the
+    unrelated node as agreeing."""
+    honest, asked = state_send(previous="11" * 32)
+    unrelated, other = state_send(previous="44" * 32)
+    assert other != asked
+    called = nodes(monkeypatch, {A: unrelated, B: honest, C: honest})
+    with pytest.raises(Disagreement) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C], agree=2,
+                            clock=ticking_clock(1, 2, 3))
+    assert called == [A]
+    assert caught.value.answers[A] == f"contents that hash to {other}"
+    assert asked in caught.value.answers["requested"]
+    states = [(o.rpc_url, o.state) for o in caught.value.node_observations]
+    assert states[0] == (A, "mismatch")
+    assert all(state != "confirmed" for _, state in states)
+    assert other in caught.value.node_observations[0].detail
+    assert asked in caught.value.node_observations[0].detail
+
+
+def test_honest_nodes_whose_contents_hash_to_the_requested_block_still_agree(monkeypatch):
+    """The control for the test above: the same three nodes, all honest, with
+    contents that hash to the requested block, settle at agree=2 on A and B."""
+    honest, asked = state_send(previous="11" * 32)
+    called = nodes(monkeypatch, {A: honest, B: honest, C: honest})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C], agree=2)
+    assert out.receipt.settled is True
+    assert out.agreed == (A, B)
+    assert called == [A, B]
+
+
 def test_the_requested_hash_is_compared_whatever_its_letter_case(monkeypatch):
     reply, asked = state_send()
     nodes(monkeypatch, {A: reply, B: reply})
