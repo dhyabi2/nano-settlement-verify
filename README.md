@@ -33,7 +33,7 @@ Nano node and hands back a receipt.
 This installs the tagged release straight from GitHub, with no clone and no PyPI:
 
 ```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.2.1"
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
 ```
 
 ## First five minutes
@@ -87,10 +87,10 @@ An operator who will not let the agent hold a key: see [OPERATORS.md](https://gi
 pip install .
 ```
 
-Or straight from the tagged release, no clone and no PyPI (`v1.2.1`; `import nano_settlement_verify`):
+Or straight from the tagged release, no clone and no PyPI (`v1.3.0`; `import nano_settlement_verify`):
 
 ```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.2.1"
+pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
 ```
 
 Or just copy `nano_settlement_verify.py` into your project — it is one file with no
