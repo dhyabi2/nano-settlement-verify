@@ -412,10 +412,14 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
           rule: str = DEFAULT_HOP, payments=frozenset()) -> dict:
     """The verdict for one payer from one node."""
     trail: list[dict] = []
+    walk = {"read": 0, "stopped": "verdict"}
 
     def out(verdict, why, hop=None, step=None, party=None, wallet=None):
+        # hops_asked / hops_read / trail_length: a reader can check hops_read == hops_asked
+        # instead of trusting hop_depth, which names only the hop that decided.
         r = {"payer": payer, "verdict": verdict, "why": why, "hop_rule": rule, "deciding_hop": hop,
-             "hop_depth": hop, "party": party, "witness": _witness(step, rule), "trail": trail}
+             "hop_depth": hop, "hops_asked": hops, "hops_read": walk["read"], "trail_length": len(trail),
+             "walk_stopped": walk["stopped"], "party": party, "witness": _witness(step, rule), "trail": trail}
         if wallet is not None:
             r["shared_wallet"] = dict(wallet)
         return r
@@ -449,17 +453,22 @@ def _read(payer: str, rpc_url: str, payee_key: str, excluded: dict, exchanges: s
             # checksum, garbage): it can match no list, so it must not read as a stranger.
             return out("unreadable", f"the hop-{hop} funder the node gave is not a Nano account: {funder!r}"[:200],
                        hop, step)
+        walk["read"] = hop
         if role(funder):
             return out("not-independent", f"hop {hop} funder is the {role(funder)}", hop, step, role(funder))
         if _key(funder) in exchanges:
             if hop == 1:
                 wallet = exchanges[_key(funder)]
                 return out("not-determinable", CARVE_OUT, hop, step, wallet["kind"], wallet)
+            walk["stopped"] = "shared-wallet"
             break  # a stranger funder was already seen; nothing behind a shared wallet is walked
         if _key(funder) in seen:
+            walk["stopped"] = "funding-loop"
             break  # a funding loop: every account in it has been checked
         seen.add(_key(funder))
         current, before = funder, step.get("funding_send")
+    else:
+        walk["stopped"] = "hops-asked"
     r = out("independent", "no funder within the hops is the payee, an excluded party, or only a shared hot wallet",
             1, trail[0])
     if rule == LARGEST_RECEIVE:
@@ -511,7 +520,8 @@ def _story(r: dict) -> str:
 
 def _blank(p: str, why: str, rule: str) -> dict:
     return {"payer": p, "verdict": "unreadable", "why": why, "hop_rule": rule, "deciding_hop": None,
-            "hop_depth": None, "party": None, "witness": None, "trail": []}
+            "hop_depth": None, "hops_asked": None, "hops_read": 0, "trail_length": 0, "walk_stopped": "verdict",
+            "party": None, "witness": None, "trail": []}
 
 
 def parse_shared_wallet(text: str) -> tuple:
@@ -623,7 +633,9 @@ def to_text(report: dict) -> str:
     lines = [f"stated test: {report['test']} (hop rule {rule}, hops={report['hops']}, read {report['read_at']})"]
     for r in report["payers"]:
         w = r["witness"] or {}
-        line = f"{r['payer']}  {r['verdict']}  - {r['why']}  (hop depth {r.get('hop_depth')})"
+        line = (f"{r['payer']}  {r['verdict']}  - {r['why']}  (hop depth {r.get('hop_depth')}; "
+                f"hops asked {r.get('hops_asked')}, read {r.get('hops_read')}, trail {r.get('trail_length')}, "
+                f"stopped: {r.get('walk_stopped')})")
         sw = r.get("shared_wallet")
         if sw:
             line += (f"\n    shared hot wallet {sw['account']}  kind {sw['kind']}  "

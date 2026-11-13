@@ -153,6 +153,24 @@ class Hops(NoSockets):
         r = run([A], {A: B, B: EXCH, EXCH: US}, hops=3)["payers"][0]
         self.assertEqual(r["verdict"], "independent")
 
+    def test_a_walk_that_stops_early_shows_hops_read_below_hops_asked(self):
+        # merktop 473e5f66: print hops asked, hops read and the trail length;
+        # the checkable claim is hops read == hops asked.
+        r = run([A], {A: B, B: EXCH, EXCH: US}, hops=3)["payers"][0]
+        self.assertEqual((r["hops_asked"], r["hops_read"], r["trail_length"], r["walk_stopped"]),
+                         (3, 2, 2, "shared-wallet"))
+        self.assertEqual(r["hop_depth"], 1)
+        full = run([A], {A: B, B: C}, hops=2)["payers"][0]
+        self.assertEqual((full["verdict"], full["hops_asked"], full["hops_read"], full["walk_stopped"]),
+                         ("independent", 2, 2, "hops-asked"))
+        self.assertIn("hops asked 3, read 2, trail 2, stopped: shared-wallet",
+                      st.to_text(run([A], {A: B, B: EXCH, EXCH: US}, hops=3)))
+
+    def test_a_funding_loop_stops_the_walk_and_says_so(self):
+        r = run([A], {A: B, B: A}, hops=4)["payers"][0]
+        self.assertEqual((r["verdict"], r["hops_asked"], r["hops_read"], r["walk_stopped"]),
+                         ("independent", 4, 2, "funding-loop"))
+
 
 class Nodes(NoSockets):
     def test_two_nodes_that_disagree_give_unreadable(self):
