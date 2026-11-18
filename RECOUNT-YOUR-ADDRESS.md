@@ -16,5 +16,5 @@ Yes, but it is a heavier read, so say what it costs. On Base the payee's balance
 
 ## What a count does NOT prove (both rails)
 1. **Merchant binding**: the address must be provably the seller's (published in the seller's own x402 document or signed by it). A count of an address nobody ties to the seller counts nothing about the seller.
-2. **Payer independence**: distinct payers who share one funder are one customer. Run `nano_settlement_verify/funding.py` (FUNDING-PROVENANCE.md) on the payers.
+2. **Payer independence**: distinct payers who share one funder are one customer. Run `python3 -m nano_settlement_verify.funding` (FUNDING-PROVENANCE.md) on the payers.
 3. A payer is a sending account, not a person.

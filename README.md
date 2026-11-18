@@ -165,7 +165,7 @@ Failover is not agreement: to need two nodes to agree, use `nano_settlement_veri
 
 **Two-node usage from the pinned list.** `nano_settlement_verify/node_set/NODES.json` is the measured list (5 usable, 1 unusable on 2026-11-02; re-measure with `nano_settlement_verify/node_set/probe.py`). Build the CLI argument from it, first two usable nodes, and run (checked on 2026-11-02, exit 0, `"settled": true`, `"rpc_index": 0`):
 `python3 skills/nano-settlement-verify/verify_cli.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 "$(python3 -c 'from nano_settlement_verify.node_set import fallback_urls;print(",".join(fallback_urls()[:2]))')"`
-That is failover (the second node is asked only if the first cannot be reached). For both nodes to agree before you ship, use `nano_settlement_verify/two_node.py` or `nano_settlement_verify.quorum`. Some listed RPCs may sit in front of the same node, so two URLs are not proof of two operators.
+That is failover (the second node is asked only if the first cannot be reached). For both nodes to agree before you ship, use `python3 -m nano_settlement_verify.two_node` or `nano_settlement_verify.quorum`. Some listed RPCs may sit in front of the same node, so two URLs are not proof of two operators.
 
 When the node cannot be reached or read, the detail is chosen by the error's class alone,
 from parts of it that cannot hold the URL - the URL itself is never consulted:
