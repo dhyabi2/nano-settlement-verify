@@ -3,4 +3,4 @@ graft tests
 graft skills
 graft web
 graft audits
-global-exclude __pycache__ *.py[cod]
+global-exclude *.py[cod]

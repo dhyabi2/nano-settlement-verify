@@ -37,6 +37,9 @@ __all__ = [
     "public_key_from_address",
 ]
 
+# The distribution's version (pyproject.toml says the same).
+__version__ = "2.0.0"
+
 # Seconds to wait on the node before giving up. Verification sits on a seller's
 # request path; an unbounded wait there is an outage, not patience.
 RPC_TIMEOUT_S = 30

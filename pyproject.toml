@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-settlement-verify"
-version = "1.3.0"
+version = "2.0.0"
 description = "Verify that a Nano (XNO) send block really settled, without running a node client."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = []
 keywords = ["nano", "xno", "x402", "payments", "settlement", "receipt", "audit"]
