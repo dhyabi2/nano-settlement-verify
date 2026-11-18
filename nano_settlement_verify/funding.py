@@ -196,7 +196,7 @@ def provenance(block_hash, rpc_urls, sponsors=(), selfs=(), window_hours=720, fe
 
 
 def main(argv=None, fetch=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.funding", description=__doc__.split("\n")[0])
     p.add_argument("--block", required=True)
     p.add_argument("--rpc", action="append")
     p.add_argument("--sponsor", action="append", default=[])

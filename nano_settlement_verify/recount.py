@@ -225,7 +225,7 @@ def recount(address, network=None, asset=None, nodes=None, from_block=None, excl
 
 
 def main(argv=None, fetch=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.recount", description=__doc__.split("\n")[0])
     p.add_argument("--address", required=True)
     p.add_argument("--network")
     p.add_argument("--asset")

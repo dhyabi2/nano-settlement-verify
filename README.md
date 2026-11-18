@@ -93,13 +93,17 @@ installs the same package.
 Or copy `nano_settlement_verify/__init__.py` into your project as `nano_settlement_verify.py`:
 `verify` and everything it needs are in that one file, standard library only (the skill
 bundle ships exactly that file). The other modules (`quorum`, `payers`, ...) need the package.
+Do not keep that copy beside an installed 2.0.0: a local `nano_settlement_verify.py` shadows the package, and
+`import nano_settlement_verify.quorum` then fails.
 
 ### 2.0.0: one package
 
 Up to 1.3.0 the distribution installed 13 top-level modules and two top-level packages,
 `node_set` and `links`. From 2.0.0 everything is inside the one package
 `nano_settlement_verify`, so the import paths of every module but the main one changed.
-The behaviour did not change; only where it lives.
+The behaviour did not change; only where it lives. One addition: the wheel now ships
+`nano_settlement_verify/node_set/NODES.json`, which the 1.3.0 wheel left out, so `fallback_urls()` returns the
+public node list after a pip install instead of an empty list.
 
 | 1.3.0 | 2.0.0 |
 |---|---|
@@ -603,7 +607,8 @@ thin: `rpc.nano.to` wants a key and rate-limits a burst, Nanswap throttles, and 
 in front of any of them can answer HTTP 200 with something that is not a node reply at
 all. An agent with no node of its own has no second opinion to fall back on.
 
-`nano_settlement_verify/quorum.py` (same package, also one stdlib file) is that second opinion.
+`nano_settlement_verify/quorum.py` (same package, standard library only) is that second opinion. It is run as
+`python3 -m nano_settlement_verify.quorum`, not as a file: since 2.0.0 the package modules use relative imports.
 
 ```python
 from nano_settlement_verify.quorum import verify_corroborated, Disagreement, NotCorroborated
@@ -760,7 +765,7 @@ arrived with it.
 
 ## Pay against terms, not against a claim
 
-`nano_settlement_verify/terms.py` (same package, also one stdlib file) is for two agents that trade once
+`nano_settlement_verify/terms.py` (same package, standard library only; run it as `python3 -m nano_settlement_verify.terms`) is for two agents that trade once
 and need to agree, before any XNO moves, on what is paid, to whom, and what counts as
 delivered.
 

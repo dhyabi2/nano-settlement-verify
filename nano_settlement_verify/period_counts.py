@@ -189,7 +189,7 @@ def nsv_fmt(raw: int) -> str:
 
 
 def main(argv=None, page_fn=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.period_counts", description=__doc__.split("\n")[0])
     p.add_argument("--address", required=True)
     p.add_argument("--period", default="month", choices=PERIODS)
     p.add_argument("--node", action="append")

@@ -98,7 +98,7 @@ def probe(candidates, post=http_post, timeout=15, probed_from="unknown", now=Non
 
 
 def main(argv=None, post=http_post) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.node_set.probe", description=__doc__.split("\n")[0])
     p.add_argument("--out", required=True)
     p.add_argument("--candidate", action="append")
     p.add_argument("--timeout", type=float, default=15)

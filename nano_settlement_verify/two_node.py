@@ -57,7 +57,7 @@ EXIT = {"settled": 0, "unknown": 2, "refused": 4}
 
 
 def main(argv=None, fetch=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.two_node", description=__doc__.split("\n")[0])
     p.add_argument("--block", required=True)
     p.add_argument("--amount-raw", required=True, help="exact tagged amount quoted, integer raw")
     p.add_argument("--invoice-id", required=True)

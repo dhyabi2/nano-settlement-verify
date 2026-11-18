@@ -666,7 +666,7 @@ def to_text(report: dict) -> str:
 
 
 def main(argv=None, post=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.stated_payer_test", description=__doc__.split("\n")[0])
     p.add_argument("--payee", required=True, help="the seller's account")
     p.add_argument("--payer", action="append", required=True)
     p.add_argument("--excluded", action="append", default=[], help="an account of either party")
