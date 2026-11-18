@@ -1,6 +1,6 @@
 """One verdict per payer against a stated independence test, re-runnable by anyone.
 
-    python3 nano_stated_payer_test.py --payee nano_... --payer nano_... [--payer ...]
+    python3 -m nano_settlement_verify.stated_payer_test --payee nano_... --payer nano_... [--payer ...]
         [--excluded nano_...]... [--exchange nano_...]...
         [--shared-wallet nano_...=KIND=https://...]... [--hop largest-receive|opening-send]
         [--payment HASH]... [--hops 1] [--rpc URL]... [--json]
@@ -63,7 +63,7 @@ What each rule does not test. `largest-receive`: the other receives (each
 `independent` carries `caveat` and `receives`: how many receives came before the
 payment, their raw total and the chosen one's share). `opening-send`: receives after
 the open block (`caveat` "opener only" and `opener`: the opening amount, the number
-and raw total of later receives and the opener's share). Run `nano_funding.py` on
+and raw total of later receives and the opener's share). Run `nano_settlement_verify.funding` on
 the payment block for who funded a payment.
 
 A funder the node names must itself be a valid Nano account (prefix, length,
@@ -93,9 +93,9 @@ import http.client
 import json
 import sys
 
-import nano_independence
-from nano_independence import _check_hops, _key, _utc_now
-from nano_settlement_verify import public_key_from_address
+from . import independence as nano_independence
+from .independence import _check_hops, _key, _utc_now
+from . import public_key_from_address
 
 STATED_TEST = ("a payer counts as independent iff the largest receive into its account before the payment "
                "was funded by neither Unstuck nor us, one hop back - where a hop ending at a publicly "

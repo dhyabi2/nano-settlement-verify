@@ -19,7 +19,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import nano_settlement_verify
-from nano_payers import (
+from nano_settlement_verify.payers import (
     HistoryIncomplete,
     ManifestRefused,
     outside_payers,
@@ -27,7 +27,7 @@ from nano_payers import (
     payers,
     payers_corroborated,
 )
-from nano_quorum import Disagreement, NotCorroborated
+from nano_settlement_verify.quorum import Disagreement, NotCorroborated
 
 PAYEE = "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7"
 PAYER_1 = "nano_3gqrm67xjp33gew1pmrbhx8rm6y1yrcogbid36ku5nc9izp8nn3ec5pa48yt"
@@ -210,7 +210,7 @@ try:
         # The payer list is exactly what nano_independence wants: counting
         # paying keys is not counting buyers, and three accounts funded from
         # one place are one operator however separately they paid.
-        from nano_independence import independence
+        from nano_settlement_verify.independence import independence
 
         groups = independence(
             [payer.account for payer in report.payers], LIVE_RPC, seller=payee.account

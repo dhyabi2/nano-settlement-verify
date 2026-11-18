@@ -35,8 +35,9 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import nano_settlement_verify
-from nano_settlement_verify import _account_body, _contents
+import sys as _sys
+nano_settlement_verify = _sys.modules[__package__]  # the package: names read at call time see a patch
+from . import _account_body, _contents
 
 __all__ = ["funding_chain", "independence", "Independence"]
 

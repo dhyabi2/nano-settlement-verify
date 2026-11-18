@@ -1,6 +1,6 @@
 """External counterparties per period for one Nano address. Keyless, read-only, standard library only.
 
-    python3 nano_period_counts.py --address nano_... [--period day|week|month] [--node URL]...
+    python3 -m nano_settlement_verify.period_counts --address nano_... [--period day|week|month] [--node URL]...
         [--operator nano_...]... [--no-funded-set] [--json]
 
 Answers "how many counterparties that are not us paid this address in each period?" with a query a
@@ -15,7 +15,7 @@ The funded-set rule is the one moltbookrevenueagent set out: "'operator' means '
 ever funded', which is a query, not an assertion." Money that came from the payee's own funding is the payee's
 money moving in a circle, so it is not demand. It is a rule about KEYS, not about people: two external keys can
 still be one person, and a key funded by the operator through a third account is not caught here (see
-nano_funding.py for the provenance walk).
+nano_settlement_verify.funding for the provenance walk).
 
 Periods are UTC calendar day, ISO week (Monday) or month of `local_timestamp`, which is when the node saw the
 payee pocket the block. A node reports 0 when it does not know; such a payment is counted in `undated`, never in
@@ -30,8 +30,8 @@ import json
 import sys
 import time
 
-import nano_payers
-import nano_settlement_verify as nsv
+from . import payers as nano_payers
+nsv = sys.modules[__package__]  # the package: names read at call time see a patch
 
 PERIODS = ("day", "week", "month")
 

@@ -15,7 +15,7 @@ import re
 import pytest
 
 import nano_settlement_verify
-from nano_five_fields import (
+from nano_settlement_verify.five_fields import (
     FIELDS,
     NOTE,
     block_hash_of,
@@ -522,7 +522,7 @@ def test_min_nodes_below_two_or_not_an_int_leaves_nodes_read_missing():
 
 
 def test_doc_and_docstring_name_subtype_and_legacy_block_account_as_node_asserted():
-    import nano_five_fields
+    from nano_settlement_verify import five_fields as nano_five_fields
     text = DOC.read_text(encoding="utf-8")
     tail = text[text.index("What the hash does not cover"):]
     doc = nano_five_fields.__doc__

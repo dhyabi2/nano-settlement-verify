@@ -1,7 +1,7 @@
 """Refuse to send a link a stranger cannot open.
 
-    python3 -m links.public_check --text FILE|-  [--json]
-    python3 -m links.public_check --url URL [URL ...] [--json]
+    python3 -m nano_settlement_verify.links.public_check --text FILE|-  [--json]
+    python3 -m nano_settlement_verify.links.public_check --url URL [URL ...] [--json]
 
 Every http(s) URL is fetched once with NO credentials (no Authorization, no cookie, no token), at most 5
 redirects, 15 s, a plain browser User-Agent. `public` is true only for a final 200 with a non-empty body that is
@@ -152,7 +152,7 @@ def check_text(text, fetch=default_fetch):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="links.public_check")
+    ap = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.links.public_check")
     ap.add_argument("--text")
     ap.add_argument("--url", nargs="+")
     ap.add_argument("--json", action="store_true")

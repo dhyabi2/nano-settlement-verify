@@ -37,8 +37,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 
-import nano_settlement_verify
-from nano_settlement_verify import Mismatch, NotFound, Receipt
+nano_settlement_verify = sys.modules[__package__]  # the package: names read at call time see a patch
+from . import Mismatch, NotFound, Receipt
 
 __all__ = [
     "AGREE_DEFAULT",
@@ -1435,7 +1435,7 @@ def _payer_of(reply: object):
     key = nano_settlement_verify.public_key_from_address(named)
     if key is None:
         return None
-    from nano_five_fields import _address_of_key  # here, not at the top: it imports this module
+    from .five_fields import _address_of_key  # here, not at the top: it imports this module
 
     return _address_of_key(key)
 
@@ -1489,7 +1489,7 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
         return ("not-yet",), None
     if reply is None:
         return ("settled", receipt.amount_raw, receipt.height, receipt.account, None), receipt
-    from nano_five_fields import block_hash_of  # here, not at the top: it imports this module
+    from .five_fields import block_hash_of  # here, not at the top: it imports this module
 
     answered_for = block_hash_of(reply.get("contents"))
     if answered_for is not None and answered_for != str(block_hash).strip().upper():
@@ -2055,10 +2055,10 @@ def replay_receipt(record) -> dict:
 
 
 def _main(argv=None) -> int:
-    """`python3 nano_quorum.py --replay RECEIPT.json`: exit 0 on a match, 1 on a mismatch."""
+    """`python3 -m nano_settlement_verify.quorum --replay RECEIPT.json`: exit 0 on a match, 1 on a mismatch."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="nano_quorum.py", description=_main.__doc__)
+    parser = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.quorum", description=_main.__doc__)
     parser.add_argument("--replay", metavar="RECEIPT", required=True,
                         help="a stored Corroboration.to_json() record ('-' reads stdin)")
     args = parser.parse_args(argv)

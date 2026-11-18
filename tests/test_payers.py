@@ -16,10 +16,10 @@ import json
 
 import pytest
 
-import nano_payers
-import nano_quorum
+from nano_settlement_verify import payers as nano_payers
+from nano_settlement_verify import quorum as nano_quorum
 import nano_settlement_verify
-from nano_payers import (
+from nano_settlement_verify.payers import (
     HISTORY_PAGE,
     HistoryIncomplete,
     ManifestRefused,

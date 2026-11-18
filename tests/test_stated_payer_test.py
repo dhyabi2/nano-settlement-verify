@@ -11,8 +11,8 @@ from contextlib import redirect_stderr, redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nano_settlement_verify  # noqa: E402
-import nano_stated_payer_test as st  # noqa: E402
-from nano_five_fields import _address_of_key  # noqa: E402
+from nano_settlement_verify import stated_payer_test as st  # noqa: E402
+from nano_settlement_verify.five_fields import _address_of_key  # noqa: E402
 
 URL = "http://127.0.0.1:7076"
 NAMES = "payee us exchange stranger a b c d e f".split()

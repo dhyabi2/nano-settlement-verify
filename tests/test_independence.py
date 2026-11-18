@@ -6,9 +6,9 @@ no_sockets fixture makes any real urlopen call fail the test that made it.
 
 import pytest
 
-import nano_independence
+from nano_settlement_verify import independence as nano_independence
 import nano_settlement_verify
-from nano_independence import funding_chain, independence
+from nano_settlement_verify.independence import funding_chain, independence
 
 URL = "http://127.0.0.1:7076"
 SELLER = "nano_1seller"

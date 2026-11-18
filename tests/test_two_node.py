@@ -2,7 +2,7 @@
 import hashlib, json, pathlib, re, subprocess, sys
 import pytest
 import nano_settlement_verify
-import nano_two_node as tn
+from nano_settlement_verify import two_node as tn
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOC = (ROOT / "TWO-NODE-CHECK.md").read_text()

@@ -1,6 +1,6 @@
 """Stranger recount: one address in, a countable number out, on either rail. Keyless, read-only.
 
-    python3 nano_recount.py --address nano_...|0x... [--network nano:mainnet|eip155:8453]
+    python3 -m nano_settlement_verify.recount --address nano_...|0x... [--network nano:mainnet|eip155:8453]
         [--node URL]... [--from-block N] [--exclude-self ADDR]... [--rule-stated-at ISO] [--json]
 
 Counts distinct sending accounts that paid an address and their confirmed payments: no clustering, no
@@ -22,10 +22,10 @@ import sys
 import time
 import urllib.request
 
-import nano_payers
-import nano_quorum
-import nano_settlement_verify
-from nano_settlement_verify import is_valid_account
+from . import payers as nano_payers
+from . import quorum as nano_quorum
+nano_settlement_verify = sys.modules[__package__]  # the package: names read at call time see a patch
+from . import is_valid_account
 
 USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 DEFAULT_EVM_NODE = "https://base-rpc.publicnode.com"

@@ -19,8 +19,8 @@ import pathlib
 
 import pytest
 
-import nano_quorum
-from nano_quorum import Observation, canonical_json
+from nano_settlement_verify import quorum as nano_quorum
+from nano_settlement_verify.quorum import Observation, canonical_json
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "observations"
 

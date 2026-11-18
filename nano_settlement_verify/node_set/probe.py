@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe public Nano RPC nodes with one known block and write what was measured to NODES.json.
 
-    python3 node_set/probe.py --out node_set/NODES.json [--candidate URL ...] [--timeout S] [--probed-from LABEL]
+    python3 -m nano_settlement_verify.node_set.probe --out nano_settlement_verify/node_set/NODES.json [--candidate URL ...] [--timeout S] [--probed-from LABEL]
 
 Read-only: one block_info call per candidate. Exit 0 when at least one node is usable, 3 when none is
 (a measurement, not a failure to run), 5 when --out cannot be written (any old file is left untouched).

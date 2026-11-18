@@ -7,7 +7,7 @@ for a new account, an open) block naming the send. Until it does, the send sits
 on the ledger as receivable, and an account that has never received anything
 does not exist on the ledger at all.
 
-    python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]
+    python3 -m nano_settlement_verify.claim <send-block-hash> [rpc-url] [--nodes URL ...]
         [--attempt N] [--first-unknown-at T] [--retry-after S]
         [--escalate-reads N] [--escalate-hours H]
 
@@ -61,8 +61,9 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
-import nano_settlement_verify
-from nano_settlement_verify import is_valid_account
+import sys as _sys
+nano_settlement_verify = _sys.modules[__package__]  # the package: names read at call time see a patch
+from . import is_valid_account
 
 __all__ = [
     "Refused",
@@ -388,7 +389,7 @@ def exit_code(status: dict) -> int:
 
 
 USAGE = (
-    "usage: python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]\n"
+    "usage: python3 -m nano_settlement_verify.claim <send-block-hash> [rpc-url] [--nodes URL ...]\n"
     "       [--attempt N] [--first-unknown-at YYYY-MM-DDTHH:MM:SSZ]\n"
     "       [--retry-after SECONDS] [--escalate-reads N] [--escalate-hours H]"
 )
@@ -428,7 +429,7 @@ def _parse(argv: list[str]):
 
 
 def _main(argv: list[str]) -> int:
-    """`python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...] ...`."""
+    """`python3 -m nano_settlement_verify.claim <send-block-hash> [rpc-url] [--nodes URL ...] ...`."""
     import sys
 
     try:

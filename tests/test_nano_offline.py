@@ -7,7 +7,7 @@ with block_info json_block=true and frozen.
 import copy, json, pathlib
 import pytest
 import nano_settlement_verify
-import nano_offline as off
+from nano_settlement_verify import offline as off
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SEND = json.loads((ROOT / "tests/fixtures/block_B749B757.json").read_text())

@@ -22,7 +22,7 @@ What this does not prove: that the block is on the ledger, or confirmed
 (cemented). A key holder can sign a block that never lands, or one that loses a
 fork. Inclusion still needs nodes - see nano_quorum.
 
-    python3 nano_offline.py <block_hash> [rpc_url]
+    python3 -m nano_settlement_verify.offline <block_hash> [rpc_url]
 
 fetches block_info (json_block=true) for the block and its previous from one
 node (default https://rpc.nano.to) and prints `offline_check` on the fetched
@@ -38,8 +38,8 @@ import json
 import re
 import sys
 
-from nano_five_fields import block_hash_of
-from nano_settlement_verify import post_json, public_key_from_address
+from .five_fields import block_hash_of
+from . import post_json, public_key_from_address
 
 DEFAULT_RPC = "https://rpc.nano.to"
 NOTE = "offline: proves the account signed these contents; inclusion on the ledger still needs nodes (nano_quorum)"
@@ -207,7 +207,7 @@ def _fetch(rpc_url: str, block_hash: str) -> dict:
 
 def main(argv: list[str]) -> int:
     if not argv or len(argv) > 2:
-        print(__doc__.strip().splitlines()[0], "\nusage: python3 nano_offline.py <block_hash> [rpc_url]", file=sys.stderr)
+        print(__doc__.strip().splitlines()[0], "\nusage: python3 -m nano_settlement_verify.offline <block_hash> [rpc_url]", file=sys.stderr)
         return 2
     block_hash, rpc_url = argv[0].upper(), argv[1] if len(argv) > 1 else DEFAULT_RPC
     contents = _fetch(rpc_url, block_hash)

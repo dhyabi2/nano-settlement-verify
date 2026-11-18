@@ -14,9 +14,9 @@ from collections.abc import Mapping
 
 import pytest
 
-import nano_quorum
+from nano_settlement_verify import quorum as nano_quorum
 import nano_settlement_verify
-from nano_quorum import (
+from nano_settlement_verify.quorum import (
     AGREE_DEFAULT,
     Corroboration,
     Disagreement,
@@ -1012,7 +1012,7 @@ def state_send(previous="11" * 32, payer_key=bytes(range(1, 33)), height=7, bloc
     Its contents are complete, so `nano_five_fields.block_hash_of` recomputes the
     block's hash from them. Returns (reply, the hash its contents hash to).
     """
-    from nano_five_fields import _address_of_key, block_hash_of
+    from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
 
     payer = _address_of_key(payer_key)
     contents = {
@@ -1089,7 +1089,7 @@ def test_the_requested_hash_is_compared_whatever_its_letter_case(monkeypatch):
 def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):
     """Same amount, payee and height, but the nodes name different chains the block
     sits on: two different blocks, so not one payment seen twice."""
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     one = send_block()
     one["block_account"] = _address_of_key(bytes(range(1, 33)))
@@ -1101,7 +1101,7 @@ def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):
 
 
 def test_both_spellings_of_one_payer_chain_still_agree(monkeypatch):
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     payer = _address_of_key(bytes(range(1, 33)))
     one = send_block()
@@ -1118,7 +1118,7 @@ def test_both_spellings_of_one_payer_chain_still_agree(monkeypatch):
 def test_a_payer_chain_disagreement_names_each_nodes_own_chain(monkeypatch):
     """Same block facts, different `block_account`: each node's own Observation,
     not only `answers`, says which chain that node reported, as a nano_ address."""
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     first = _address_of_key(bytes(range(1, 33)))
     second = _address_of_key(bytes(range(2, 34)))
@@ -1160,7 +1160,7 @@ def test_a_reply_naming_no_payer_chain_records_none(monkeypatch):
 
 
 def test_only_a_confirmed_observation_names_a_payer_chain():
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     at = "2026-11-09T12:00:00.000Z"
     payer = _address_of_key(bytes(range(1, 33)))
@@ -1282,7 +1282,7 @@ def test_redact_url_leaves_a_plain_url_alone_and_handles_an_at_in_the_password()
 
 def test_one_node_naming_its_payer_chain_and_one_naming_none_still_settle(monkeypatch):
     """main settled this; a missing `block_account` is no payer named, not another payer."""
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     named = send_block()
     named["block_account"] = _address_of_key(bytes(range(1, 33)))
@@ -1297,7 +1297,7 @@ def test_one_node_naming_its_payer_chain_and_one_naming_none_still_settle(monkey
 def test_a_payer_that_is_not_an_address_is_no_payer_named(monkeypatch):
     """A valid payer beside garbage, and garbage beside garbage that differs only by
     case, are not two payer chains: each such answer settles as it did on main."""
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     valid = send_block()
     valid["block_account"] = _address_of_key(bytes(range(1, 33)))
@@ -1315,7 +1315,7 @@ def test_a_payer_that_is_not_an_address_is_no_payer_named(monkeypatch):
 def test_a_node_naming_no_payer_does_not_bridge_two_different_payers(monkeypatch):
     """X, then none, then Y: the answer naming none says nothing about the chain,
     so X and Y are still compared, and differ."""
-    from nano_five_fields import _address_of_key
+    from nano_settlement_verify.five_fields import _address_of_key
 
     one = send_block()
     one["block_account"] = _address_of_key(bytes(range(1, 33)))

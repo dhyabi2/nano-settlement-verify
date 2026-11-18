@@ -2,7 +2,7 @@
 import json
 import pytest
 import nano_settlement_verify
-import nano_recount as rc
+from nano_settlement_verify import recount as rc
 
 PAYEE = "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7"
 BROKEN = "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx8"

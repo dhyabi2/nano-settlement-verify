@@ -4,7 +4,7 @@ This adds nothing to `nano_five_fields.five_field_verdict`; it is the command li
 one thing the document promises: the curl recipe in TWO-NODE-CHECK.md and the request this module
 sends are the same request (`REQUEST_FOR` below is what the document's curl line is tested against).
 
-    python3 nano_two_node.py --block HASH --amount-raw RAW --invoice-id ID \\
+    python3 -m nano_settlement_verify.two_node --block HASH --amount-raw RAW --invoice-id ID \\
         --invoice-issued-at 2026-10-10T15:04:58Z --payee nano_... \\
         [--operator-account nano_...]... [--node URL]... [--json]
 
@@ -19,7 +19,7 @@ import json
 import re
 import sys
 
-import nano_five_fields as ff
+from . import five_fields as ff
 
 DEFAULT_NODES = ("https://rpc.nano.to", "https://node.somenano.com/proxy")
 SETTLED_MEANS = "I can start work. This is NOT buyer_accept."

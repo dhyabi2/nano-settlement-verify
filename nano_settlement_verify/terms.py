@@ -35,7 +35,8 @@ import json
 import re
 from dataclasses import dataclass
 
-import nano_settlement_verify
+import sys as _sys
+nano_settlement_verify = _sys.modules[__package__]  # the package: names read at call time see a patch
 
 __all__ = [
     "Terms",
