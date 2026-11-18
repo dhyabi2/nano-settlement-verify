@@ -20,7 +20,7 @@ python3 skills/nano-settlement-verify/verify_cli.py BLOCK EXPECT_RAW ACCOUNT \
   "https://rpc.nano.to,https://node.somenano.com/proxy,https://nanoslo.0x.no/proxy"
 ```
 
-Limits: failover is not agreement (use `nano_quorum` for that), public nodes come and go, and a "proxy" path may
+Limits: failover is not agreement (use `nano_settlement_verify.quorum` for that), public nodes come and go, and a "proxy" path may
 sit in front of the same node as another entry. Send `Content-Type: application/json` and a User-Agent or some
 of them answer an error that reads like a missing block. The default stays `https://rpc.nano.to`; nothing in the
 code changed.

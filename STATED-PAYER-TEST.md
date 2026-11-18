@@ -12,12 +12,12 @@ Amended a second time by the seller, also dated 2026-11-10:
 
 > "A wallet that is publicly identified as a shared hot wallet - an exchange's, a payment service's, a custodian's - ends the hop as 'not determinable from funding alone', never as independent. ... Two bounds, so this stays re-derivable by anyone: the wallet must be publicly identified as a shared service hot wallet (the service's own public statement ... is enough), and the verdict is reported with the wallet named, so the call can be argued with on the record. ... The Dec 8 test now stands as: a payer counts as independent iff the largest receive into its account before the payment was funded by neither Unstuck nor us, one hop back - where a hop ending at a publicly identified shared hot wallet (exchange, payment service, or custodian) is not determinable and never independent."
 
-`nano_stated_payer_test.py` applies that test, one verdict per payer, so the count can be re-derived by anyone from the public ledger. The amended reading is the default (`--hop largest-receive`); the reading as first stated stays selectable (`--hop opening-send`) so verdicts given under it can still be re-derived.
+`nano_settlement_verify/stated_payer_test.py` applies that test, one verdict per payer, so the count can be re-derived by anyone from the public ledger. The amended reading is the default (`--hop largest-receive`); the reading as first stated stays selectable (`--hop opening-send`) so verdicts given under it can still be re-derived.
 
 ## Run it
 
 ```
-python3 nano_stated_payer_test.py --payee <seller account> \
+python3 -m nano_settlement_verify.stated_payer_test --payee <seller account> \
     --excluded <seller-side account> --excluded <buyer-side account> ... \
     --exchange <exchange hot wallet> ... \
     --shared-wallet <account>=<exchange|payment-service|custodian>=<https:// URL of the service's own statement> ... \
@@ -26,10 +26,10 @@ python3 nano_stated_payer_test.py --payee <seller account> \
     [--hops 1] [--rpc https://rpc.nano.to] [--rpc <second node>] [--json]
 ```
 
-On a real address, from a fresh clone (read-only, public node; `<BRANCH>` is the commit to check):
+On a real address, from a fresh clone (read-only, public node; `<BRANCH>` is the commit to check; before 2.0.0 the script was `nano_stated_payer_test.py` at the top of the checkout):
 
 ```
-git clone -q https://github.com/dhyabi2/nano-settlement-verify nsv-amended && git -C nsv-amended checkout -q <BRANCH> && python3 nsv-amended/nano_stated_payer_test.py --payee nano_1edjtwsjn1ptew5tg3915q6sm6jwzryj7t7frsn4rmu31ujripc5c9nw6aqz --exchange nano_1banexkcfuieufzxksfrxqf6xy8e57ry1zdtq9yn7jntzhpwu4pg4hajojmq --exchange nano_335o96s1kje9jzwukjkqt74iatrfqz4uoue7ocxpce95eukmicpyjmj1ke81 --payer nano_3tgrwaodjnqi8mxw1q1ahwqh5brhwzpxgw34jmoyuy6aou55sea9gpnrwkif --payer nano_11kh65hyny1qtgkmzbpg1nzfujjjz8u8ieknpnbga97jmyfqtuz5h4q4qiux
+git clone -q https://github.com/dhyabi2/nano-settlement-verify nsv-amended && git -C nsv-amended checkout -q <BRANCH> && cd nsv-amended && python3 -m nano_settlement_verify.stated_payer_test --payee nano_1edjtwsjn1ptew5tg3915q6sm6jwzryj7t7frsn4rmu31ujripc5c9nw6aqz --exchange nano_1banexkcfuieufzxksfrxqf6xy8e57ry1zdtq9yn7jntzhpwu4pg4hajojmq --exchange nano_335o96s1kje9jzwukjkqt74iatrfqz4uoue7ocxpce95eukmicpyjmj1ke81 --payer nano_3tgrwaodjnqi8mxw1q1ahwqh5brhwzpxgw34jmoyuy6aou55sea9gpnrwkif --payer nano_11kh65hyny1qtgkmzbpg1nzfujjjz8u8ieknpnbga97jmyfqtuz5h4q4qiux
 ```
 
 Exit 0 when every payer got a ledger verdict, 2 when any is `unopened` or `unreadable` (argparse also exits 2 on a usage error), 3 when a `--payee`, `--excluded`, `--exchange` or `--shared-wallet` account is not a Nano account, a `--shared-wallet` kind is not `exchange`, `payment-service` or `custodian` or its source does not start with `https://`, `--hops` is not a whole number of at least 1, or `--hop` is not one of the two rules (a one-line `error:` on stderr, no traceback).
@@ -76,7 +76,7 @@ For anyone reading output or calling the library from before the amendments:
 
 `opening-send`: every `independent` verdict is marked **opener only**: in JSON a `caveat` field, and an `opener` object read from one `account_history` call on the payer - `amount_raw` (the opening receive), `later_receives` and `later_receives_raw` (how many receives came after it and their raw total) and `opener_share` (the opener's share of everything received, rounded down). In text, a line under the verdict: `opener only: ...: opener sent X raw, then N later receive(s) totalling Y raw; opener share Z%`. If that read fails, or the account has more than 4096 blocks, or two nodes give different histories, those fields read `unreadable`; the verdict itself is unchanged.
 
-For who funded a particular payment, run `nano_funding.py --block <payment hash>`, which reads every receive in a window before the payment.
+For who funded a particular payment, run `python3 -m nano_settlement_verify.funding --block <payment hash>`, which reads every receive in a window before the payment.
 
 The shared-wallet list and the excluded list are the caller's: there is no built-in registry, and an unlisted shared wallet reads as a stranger. A `--shared-wallet` carries the URL where the service itself says the wallet is its own, so the call can be argued with on the record.
 
@@ -95,7 +95,7 @@ Payee `nano_1edjtwsjn1ptew5tg3915q6sm6jwzryj7t7frsn4rmu31ujripc5c9nw6aqz`; buyer
 Re-read 2026-11-10 09:30Z under the second amendment, with pursekeeper's hot wallet named as a payment service (pursekeeper's own statement, 2026-10-15: "`nano_1xug1q5t7...` is pursekeeper's hot wallet, the one published on pursekeeper.dev", on record at https://github.com/dhyabi2/agent-conversations/issues/10):
 
 ```
-python3 nano_stated_payer_test.py --payee nano_1edjtwsjn1ptew5tg3915q6sm6jwzryj7t7frsn4rmu31ujripc5c9nw6aqz --excluded nano_1434j1n4sin4cefs5njibag4tsmo596fmg3s6bdogtod3ndmdfez5yuebrh9 --excluded nano_3z335ug5oz6sxfgcfz3kdqdrgn5otx7ht3epuc3kuimka6hc59xqem1jrzqy --excluded nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 --shared-wallet nano_1xug1q5t7nxoj3ywwzokiea9jz8fq8qfgzp8pbyfr3co3e5xgj755uofu8ue=payment-service=https://github.com/dhyabi2/agent-conversations/issues/10 --payer nano_3m8cz87zwxb1y16ob4bzp1eyek78qaig8ktohk7d45b18sh6u9exbowbnekr
+python3 -m nano_settlement_verify.stated_payer_test --payee nano_1edjtwsjn1ptew5tg3915q6sm6jwzryj7t7frsn4rmu31ujripc5c9nw6aqz --excluded nano_1434j1n4sin4cefs5njibag4tsmo596fmg3s6bdogtod3ndmdfez5yuebrh9 --excluded nano_3z335ug5oz6sxfgcfz3kdqdrgn5otx7ht3epuc3kuimka6hc59xqem1jrzqy --excluded nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 --shared-wallet nano_1xug1q5t7nxoj3ywwzokiea9jz8fq8qfgzp8pbyfr3co3e5xgj755uofu8ue=payment-service=https://github.com/dhyabi2/agent-conversations/issues/10 --payer nano_3m8cz87zwxb1y16ob4bzp1eyek78qaig8ktohk7d45b18sh6u9exbowbnekr
 ```
 
 `nano_3m8cz87z...` `not-determinable` (hop depth 1): largest receive `7CE14986...` (height 13, 14.651 XNO) from the payment-service wallet `nano_1xug1q5t7nxoj3ywwzokiea9jz8fq8qfgzp8pbyfr3co3e5xgj755uofu8ue`. Exit 0.

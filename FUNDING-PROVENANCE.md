@@ -2,7 +2,7 @@
 
 A payment that arrives is not necessarily demand. If the payer's money came from the payee, from a
 sponsor, or from a dispenser that hands the same amount to many accounts, the payment is subsidised use.
-This page is the check by hand; `nano_funding.py` reproduces it and is tested against the same
+This page is the check by hand; `nano_settlement_verify/funding.py` reproduces it and is tested against the same
 recipe. Reads only. One node is enough (two make it stronger).
 
 ## The recipe: two kinds of call
@@ -59,7 +59,7 @@ the example block was seeded by us, with one part per million of what it later h
 the table; the label follows the rule, the share lets you weigh it. Run it:
 
 ```sh
-python3 nano_funding.py --block B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F --json
+python3 -m nano_settlement_verify.funding --block B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F --json
 ```
 
 Exit codes: 0 unsubsidised, 3 any subsidy label, 2 unknown.

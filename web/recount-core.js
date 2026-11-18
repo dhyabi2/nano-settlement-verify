@@ -1,5 +1,5 @@
 // Pure counting logic shared by recount.html and its test. No network here: the caller passes rpc(body)->Promise<json>.
-// Rule (same as nano_recount.py): count confirmed RECEIVE blocks of the address, grouped by sending account; a receive
+// Rule (same as nano_settlement_verify/recount.py): count confirmed RECEIVE blocks of the address, grouped by sending account; a receive
 // from the address itself is a self-send, not a payer. A history that does not reach height 1 is refused, never shrunk.
 async function recount(address, rpc, maxPages = 40) {
   if (!/^(nano|xrb)_[13][13-9a-km-uw-z]{59}$/.test(address)) throw new Error("not a nano_ address");

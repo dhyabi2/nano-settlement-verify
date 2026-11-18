@@ -2,7 +2,7 @@
 
 You do not have to run our code to check that a Nano payment settled. This page is the whole check:
 two `curl` calls, one hash recompute with the Python standard library, and a decision table you apply
-yourself. `nano_two_node.py` in this repository does the same comparison and is tested to send the
+yourself. `nano_settlement_verify/two_node.py` in this repository does the same comparison and is tested to send the
 same request as the first call below, but you do not need it. It adds nothing.
 
 ## 1. The two calls
@@ -96,7 +96,7 @@ Suppose you quoted exactly `500000000000000000000000000` raw, issued the invoice
 With the tool, same inputs:
 
 ```sh
-python3 nano_two_node.py --block B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F \
+python3 -m nano_settlement_verify.two_node --block B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F \
   --amount-raw 500000000000000000000000000 --invoice-id example --invoice-issued-at 1790150000 \
   --payee nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 --json
 ```
