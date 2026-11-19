@@ -1457,6 +1457,61 @@ class UnhashableContents(ValueError):
     """
 
 
+class UnboundAnswer(ValueError):
+    """A confirmed answer whose contents hash to the block, but whose reading of it does not.
+
+    The block hash covers the contents' `link` (a legacy send's `destination`)
+    and `account`, not the node's rendering of them: `link_as_account`, a
+    top-level `destination`, `block_account` and `subtype` are the node's word.
+    When that word names a payee the hashed contents do not pay, a payer chain
+    other than the hashed `account`, or an operation the hashed block is not, the
+    hash ties the answer to the right block but the facts it asserts are not that
+    block's. Such an answer is not a witness: like `UnhashableContents` it is a
+    `ValueError`, recorded "unreadable", neither agreement nor disagreement.
+    """
+
+
+def _unbound(reply: dict, contents: dict, paid: str) -> str | None:
+    """Why `reply`'s reading of its hashed `contents` is not those contents, or None.
+
+    `contents` already hash to the block asked for. `paid` is the payee the
+    receipt was built from. The payee is the one the hashed fields pay
+    (`five_fields._hashed_destination`): a state block's `link` read as an
+    account, a legacy send's `destination`; every rendering of a payee in the
+    reply must be that account. A state receive's `link` is a source block hash,
+    so read as an account it is no seller's address - the payee check is what
+    refuses a receive passed off as a send. A legacy block hashes only as a
+    "send", so a `subtype` naming anything else contradicts it; a state block
+    must say "send". A state block's `account` is hashed, so a `block_account`
+    naming another chain contradicts it; one naming no valid address names no
+    payer, as `_payer_of` reads it, and is not compared.
+    """
+    from .five_fields import _hashed_destination  # here, not at the top: it imports this module
+
+    same = nano_settlement_verify._same_account
+    destination = _hashed_destination(contents)
+    if destination is None:
+        return "the hashed contents name no payee"
+    if not same(paid, destination):
+        return f"it says the block paid {paid!r}, but the hashed contents pay {destination!r}"
+    for where, rendered in (("contents", contents), ("reply", reply)):
+        for name in ("link_as_account", "destination"):
+            if name in rendered and not same(rendered[name], destination):
+                return (f"its {where} {name} {rendered[name]!r} is not {destination!r}, "
+                        f"the account the hashed contents pay")
+    kind, subtype = contents.get("type"), reply.get("subtype")
+    if kind == "state" and subtype != "send":
+        return f"its subtype is {subtype!r}; only a state send pays anyone"
+    if kind == "send" and subtype not in (None, "", "send"):
+        return f"its subtype is {subtype!r}, but the hashed contents are a legacy send"
+    if kind == "state":
+        payer = _payer_of(reply)
+        if payer is not None and not same(payer, contents.get("account")):
+            return (f"its block_account {payer!r} is not {contents.get('account')!r}, "
+                    f"the account the hashed contents name")
+    return None
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
@@ -1475,7 +1530,16 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     sparse to hash are not a hash checked either: that answer raises
     `UnhashableContents`, so it is recorded "unreadable" (error kind
     "UnhashableContents") and is neither agreement nor disagreement. A quorum
-    of sparse answers cannot settle; it is `NotCorroborated`.
+    of sparse answers cannot settle; it is `NotCorroborated`. Contents that do
+    hash to the block bind what the answer may assert: a payee, payer chain or
+    subtype the hashed contents contradict (`_unbound`) raises `UnboundAnswer`,
+    recorded "unreadable" in the same way. The amount is not in the hashed
+    contents (only the resulting balance is), so it is still the node's word,
+    compared across answers as before.
+
+    A `Mismatch` is reached before the hash is read, so one node naming another
+    payee or amount still refuses at once, hashable contents or not: that
+    ordering is kept, since a refusal fails closed.
 
     If `nano_settlement_verify.verify` is no longer the original function, it
     is called as before this module read replies itself, and the answer is
@@ -1512,6 +1576,12 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
         )
     if answered_for != str(block_hash).strip().upper():
         return ("other-block", answered_for, str(block_hash)), None
+    why = _unbound(reply, reply["contents"], receipt.account)
+    if why is not None:
+        raise UnboundAnswer(
+            f"confirmed, and its contents hash to block {block_hash}, but {why}; "
+            f"nothing it asserts beyond the hash is that block's"
+        )
     return (
         "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)
     ), receipt

@@ -28,7 +28,10 @@ B = "http://127.0.0.1:7072"
 C = "http://127.0.0.1:7073"
 D = "http://127.0.0.1:7074"
 
-PAYEE = "nano_1payee"
+# A real address: the account whose public key is the block's `link`, so the
+# payee the reply names is the payee the hashed contents pay.
+_PAYEE_KEY = bytes.fromhex("AB" * 32)
+PAYEE = _address_of_key(_PAYEE_KEY)
 ONE_XNO = 10**30
 
 # Complete state-block contents, as a real node's json_block returns, so the
@@ -40,7 +43,7 @@ CONTENTS = {
     "previous": "11" * 32,
     "representative": _SENDER,
     "balance": str(5 * ONE_XNO),
-    "link": "AB" * 32,
+    "link": _PAYEE_KEY.hex().upper(),
     "link_as_account": PAYEE,
 }
 HASH = block_hash_of(CONTENTS)
