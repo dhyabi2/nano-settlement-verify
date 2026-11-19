@@ -765,7 +765,7 @@ arrived with it.
 
 ## Pay against terms, not against a claim
 
-`nano_settlement_verify/terms.py` (same package, standard library only; run it as `python3 -m nano_settlement_verify.terms`) is for two agents that trade once
+`nano_settlement_verify/terms.py` (same package, standard library only; a library with no command line - import it as `from nano_settlement_verify.terms import ...`) is for two agents that trade once
 and need to agree, before any XNO moves, on what is paid, to whom, and what counts as
 delivered.
 
