@@ -17,7 +17,7 @@ count that only we can produce are worth nothing to the agent deciding whether
 to pay us.
 
     import json, urllib.request
-    from nano_payers import payees_from_manifest, payers
+    from nano_settlement_verify.payers import payees_from_manifest, payers
 
     doc = json.load(urllib.request.urlopen("https://seller.example/.well-known/x402"))
     for payee in payees_from_manifest(doc):
@@ -47,9 +47,10 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import nano_quorum
-import nano_settlement_verify
-from nano_settlement_verify import is_valid_account, public_key_from_address
+from . import quorum as nano_quorum
+import sys as _sys
+nano_settlement_verify = _sys.modules[__package__]  # the package: names read at call time see a patch
+from . import is_valid_account, public_key_from_address
 
 __all__ = [
     "Payee",
@@ -824,7 +825,7 @@ def outside_payers(report: PayerReport, our_accounts) -> PayerReport:
 
 
 def _main(argv: list[str]) -> int:
-    """`python3 nano_payers.py <x402-url> [rpc-url ...]` - audit a seller.
+    """`python3 -m nano_settlement_verify.payers <x402-url> [rpc-url ...]` - audit a seller.
 
     Fetching lives here and not in the functions above so that they stay
     offline and testable: everything this prints was derived from the seller's
@@ -836,7 +837,7 @@ def _main(argv: list[str]) -> int:
     if not argv:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         print(
-            "usage: python3 nano_payers.py <x402-document-url> [rpc-url ...]",
+            "usage: python3 -m nano_settlement_verify.payers <x402-document-url> [rpc-url ...]",
             file=sys.stderr,
         )
         return 64

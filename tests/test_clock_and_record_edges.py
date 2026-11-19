@@ -18,9 +18,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import nano_quorum
+from nano_settlement_verify import quorum as nano_quorum
 import nano_settlement_verify
-from nano_quorum import Observation, verify_corroborated
+from nano_settlement_verify.quorum import Observation, verify_corroborated
 
 A = "http://127.0.0.1:7071"
 B = "http://127.0.0.1:7072"

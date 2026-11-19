@@ -1,6 +1,6 @@
 """Funding provenance: was the payer's money already somebody's we should name? Read from the ledger only.
 
-    python3 nano_funding.py --block HASH [--rpc URL]... [--sponsor ACCT]... [--self ACCT]...
+    python3 -m nano_settlement_verify.funding --block HASH [--rpc URL]... [--sponsor ACCT]... [--self ACCT]...
                             [--window-hours 720] [--json]
 
 Verdicts: `unsubsidised`, `sponsor_funded`, `dispenser_funded`, `self_funded`, `unknown`, each with the
@@ -28,8 +28,8 @@ import json
 import re
 import sys
 
-import nano_settlement_verify
-from nano_five_fields import _same_account, public_key_from_address
+nano_settlement_verify = sys.modules[__package__]  # the package: names read at call time see a patch
+from .five_fields import _same_account, public_key_from_address
 
 DISPENSER_MIN_RECIPIENTS = 10
 HISTORY_PAGE = 100
@@ -196,7 +196,7 @@ def provenance(block_hash, rpc_urls, sponsors=(), selfs=(), window_hours=720, fe
 
 
 def main(argv=None, fetch=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="python3 -m nano_settlement_verify.funding", description=__doc__.split("\n")[0])
     p.add_argument("--block", required=True)
     p.add_argument("--rpc", action="append")
     p.add_argument("--sponsor", action="append", default=[])

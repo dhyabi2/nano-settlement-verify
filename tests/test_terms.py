@@ -13,9 +13,9 @@ import json
 import pytest
 
 import nano_settlement_verify
-import nano_terms
+from nano_settlement_verify import terms as nano_terms
 from nano_settlement_verify import Mismatch
-from nano_terms import NotAccepted, TermsRefused, accept, load_terms, settle, terms_sha256
+from nano_settlement_verify.terms import NotAccepted, TermsRefused, accept, load_terms, settle, terms_sha256
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
 # Real, checksum-valid Nano addresses, not placeholders. `load_terms` refuses a

@@ -44,5 +44,5 @@ account required" from the verdicts instead of asserting it.
 ## What this does not do
 
 One node's word is still one node's word: this tool trusts the reply it fetches. To not trust it, recompute the
-block hash (`TWO-NODE-CHECK.md`) and compare two nodes (`nano_two_node.py`). It reads only; it never sends, signs
+block hash (`TWO-NODE-CHECK.md`) and compare two nodes (`nano_settlement_verify/two_node.py`). It reads only; it never sends, signs
 or holds a key.

@@ -131,4 +131,4 @@ ASCII-escaped and cut, to the gate's stderr.
 
 It does not prove the node is honest. Only the recipient is varied, so a node that answers the true amount and
 payee for this block (a stub written for this payment, or a reply about another block that paid the same amount to
-the same payee) passes both calls. For that, ask independent nodes and require agreement (`nano_quorum`).
+the same payee) passes both calls. For that, ask independent nodes and require agreement (`nano_settlement_verify.quorum`).

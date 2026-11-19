@@ -68,9 +68,10 @@ from __future__ import annotations
 import hashlib
 import re
 
-import nano_settlement_verify
-from nano_quorum import _endpoint_key
-from nano_settlement_verify import (
+import sys as _sys
+nano_settlement_verify = _sys.modules[__package__]  # the package: names read at call time see a patch
+from .quorum import _endpoint_key
+from . import (
     _ACCOUNT_ALPHABET,
     TIME_SOURCE,
     _contents,

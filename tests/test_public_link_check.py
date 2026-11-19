@@ -1,9 +1,9 @@
-"""Laws for links/public_check.py (backlog 146): a message never carries a link a stranger cannot open."""
+"""Laws for nano_settlement_verify/links/public_check.py (backlog 146): a message never carries a link a stranger cannot open."""
 import urllib.request
 
 import pytest
 
-from links import public_check as pc
+from nano_settlement_verify.links import public_check as pc
 
 RAW404 = "https://raw.githubusercontent.com/dhyabi2/nano-settlement-verify/main/FIVE_FIELDS.md"
 GOOD = "https://raw.githubusercontent.com/dhyabi2/nano-settlement-verify/main/README.md"

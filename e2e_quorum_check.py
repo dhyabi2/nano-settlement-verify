@@ -16,7 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import nano_settlement_verify
-from nano_quorum import (
+from nano_settlement_verify.quorum import (
     Disagreement,
     NotCorroborated,
     balance_corroborated,

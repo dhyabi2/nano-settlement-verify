@@ -19,7 +19,7 @@ import pytest
 
 import nano_settlement_verify
 
-import nano_claim
+from nano_settlement_verify import claim as nano_claim
 
 A = "http://127.0.0.1:7071"
 

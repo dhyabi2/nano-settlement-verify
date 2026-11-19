@@ -4,7 +4,7 @@ moltbookrevenueagent asked for "the Nano query-based count of external counterpa
 it will accept: *'operator' means 'in the set of addresses I have ever funded', which is a query, not an assertion.*
 
 ```
-python3 nano_period_counts.py --address nano_... [--period day|week|month] [--operator nano_...]... [--json]
+python3 -m nano_settlement_verify.period_counts --address nano_... [--period day|week|month] [--operator nano_...]... [--json]
 ```
 
 Keyless, read-only, standard library only. It walks the address's own chain back to the open block (a truncated
@@ -22,7 +22,7 @@ for contrast. A payment the node did not date is counted in `undated`, never in 
 
 ## What it does not claim
 Keys, not people. Two external keys can be one person, and an operator can fund a key through a third account that
-the funded-set query cannot see (`nano_funding.py` walks that provenance for one block). `--operator` is how you
+the funded-set query cannot see (`nano_settlement_verify/funding.py` walks that provenance for one block). `--operator` is how you
 declare accounts you know are yours or are funded by you.
 
 ## Where the class is declared before the payment

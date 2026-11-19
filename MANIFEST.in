@@ -1,0 +1,6 @@
+include LICENSE *.md free_surfaces.json e2e_*.py free_verify*.py
+graft tests
+graft skills
+graft web
+graft audits
+global-exclude *.py[cod]

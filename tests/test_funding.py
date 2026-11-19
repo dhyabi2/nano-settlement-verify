@@ -2,7 +2,7 @@
 import json
 import pytest
 import nano_settlement_verify
-import nano_funding as nf
+from nano_settlement_verify import funding as nf
 
 HASH = "A" * 64
 SEND2 = "B" * 64
@@ -15,7 +15,7 @@ def acct(n):  # valid checksummed accounts, derived from the library's own encod
 
 
 def _mk_accounts():
-    import nano_five_fields as ff
+    from nano_settlement_verify import five_fields as ff
     out = {}
     for i, n in enumerate("payer payee spons dispenser plain selfie other".split()):
         out[n] = ff._address_of_key(bytes([i + 1]) * 32)

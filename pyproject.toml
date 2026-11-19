@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-settlement-verify"
-version = "1.3.0"
+version = "2.0.0"
 description = "Verify that a Nano (XNO) send block really settled, without running a node client."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = []
 keywords = ["nano", "xno", "x402", "payments", "settlement", "receipt", "audit"]
@@ -16,8 +17,10 @@ keywords = ["nano", "xno", "x402", "payments", "settlement", "receipt", "audit"]
 Source = "https://github.com/dhyabi2/nano-settlement-verify"
 
 [tool.setuptools]
-packages = ["node_set", "links"]
-py-modules = ["nano_settlement_verify", "nano_terms", "nano_independence", "nano_quorum", "nano_payers", "nano_claim", "nano_five_fields", "nano_two_node", "nano_funding", "nano_recount", "nano_period_counts", "nano_offline", "nano_stated_payer_test"]
+packages = ["nano_settlement_verify", "nano_settlement_verify.node_set", "nano_settlement_verify.links"]
+
+[tool.setuptools.package-data]
+"nano_settlement_verify.node_set" = ["NODES.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

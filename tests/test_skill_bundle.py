@@ -29,15 +29,15 @@ ACCOUNT = "nano_1natrium1o3z5519ifou7xii8crpxpk8y65qmkih8e8bpsjri651oza8imdd"
 def test_the_vendored_library_is_the_library():
     """The bundle's copy is byte for byte the module the repository tests.
 
-    Every fix to `nano_settlement_verify.py` has to reach the copy agents
+    Every fix to `nano_settlement_verify/__init__.py` has to reach the copy agents
     actually run. Comparing the bytes is the only check that keeps saying so
     for fixes nobody has written yet.
     """
     vendored = (SKILL / "nano_settlement_verify.py").read_bytes()
-    library = (ROOT / "nano_settlement_verify.py").read_bytes()
+    library = (ROOT / "nano_settlement_verify" / "__init__.py").read_bytes()
     assert vendored == library, (
         "skills/nano-settlement-verify/nano_settlement_verify.py has drifted "
-        "from nano_settlement_verify.py; the skill ships the stale one"
+        "from nano_settlement_verify/__init__.py; the skill ships the stale one"
     )
 
 

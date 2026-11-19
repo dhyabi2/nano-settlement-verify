@@ -8,8 +8,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import node_set  # noqa: E402
-from node_set import probe as pr  # noqa: E402
+from nano_settlement_verify import node_set  # noqa: E402
+from nano_settlement_verify.node_set import probe as pr  # noqa: E402
 
 GOOD = json.dumps({"confirmed": "true", "amount": pr.PROBE_AMOUNT})
 
@@ -121,7 +121,7 @@ def test_unwritable_out_exits_5(tmp_path):
 
 
 def test_nodes_json_committed_is_not_empty():
-    data = json.loads((ROOT / "node_set" / "NODES.json").read_text())
+    data = json.loads((ROOT / "nano_settlement_verify" / "node_set" / "NODES.json").read_text())
     assert data["usable_count"] >= 2 and len(data["usable"]) == data["usable_count"]
     assert data["probed_from"] != "unknown"
     assert all(u.startswith("https://") for u in data["usable"])

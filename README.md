@@ -30,10 +30,10 @@ Nano node and hands back a receipt.
   records the account as the node spelled it, so it always carries the `nano_` form.
 - No signing, no sending, no wallet or seed handling of any kind. It only reads.
 
-This installs the tagged release straight from GitHub, with no clone and no PyPI:
+Install it from PyPI:
 
 ```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
+pip install nano-settlement-verify
 ```
 
 ## First five minutes
@@ -84,17 +84,50 @@ An operator who will not let the agent hold a key: see [OPERATORS.md](https://gi
 ## Install
 
 ```
-pip install .
+pip install nano-settlement-verify
 ```
 
-Or straight from the tagged release, no clone and no PyPI (`v1.3.0`; `import nano_settlement_verify`):
+Then `import nano_settlement_verify`. From a clone of this repository, `pip install .`
+installs the same package.
 
-```
-pip install "nano-settlement-verify @ git+https://github.com/dhyabi2/nano-settlement-verify@v1.3.0"
-```
+Or copy `nano_settlement_verify/__init__.py` into your project as `nano_settlement_verify.py`:
+`verify` and everything it needs are in that one file, standard library only (the skill
+bundle ships exactly that file). The other modules (`quorum`, `payers`, ...) need the package.
+Do not keep that copy beside an installed 2.0.0: a local `nano_settlement_verify.py` shadows the package, and
+`import nano_settlement_verify.quorum` then fails.
 
-Or just copy `nano_settlement_verify.py` into your project — it is one file with no
-dependencies.
+### 2.0.0: one package
+
+Up to 1.3.0 the distribution installed 13 top-level modules and two top-level packages,
+`node_set` and `links`. From 2.0.0 everything is inside the one package
+`nano_settlement_verify`, so the import paths of every module but the main one changed.
+The behaviour did not change; only where it lives. One addition: the wheel now ships
+`nano_settlement_verify/node_set/NODES.json`, which the 1.3.0 wheel left out, so `fallback_urls()` returns the
+public node list after a pip install instead of an empty list.
+
+| 1.3.0 | 2.0.0 |
+|---|---|
+| `import nano_settlement_verify` | `import nano_settlement_verify` (unchanged) |
+| `from nano_terms import ...` | `from nano_settlement_verify.terms import ...` |
+| `from nano_independence import ...` | `from nano_settlement_verify.independence import ...` |
+| `from nano_quorum import ...` | `from nano_settlement_verify.quorum import ...` |
+| `from nano_payers import ...` | `from nano_settlement_verify.payers import ...` |
+| `from nano_claim import ...` | `from nano_settlement_verify.claim import ...` |
+| `from nano_five_fields import ...` | `from nano_settlement_verify.five_fields import ...` |
+| `from nano_two_node import ...` | `from nano_settlement_verify.two_node import ...` |
+| `from nano_funding import ...` | `from nano_settlement_verify.funding import ...` |
+| `from nano_recount import ...` | `from nano_settlement_verify.recount import ...` |
+| `from nano_period_counts import ...` | `from nano_settlement_verify.period_counts import ...` |
+| `from nano_offline import ...` | `from nano_settlement_verify.offline import ...` |
+| `from nano_stated_payer_test import ...` | `from nano_settlement_verify.stated_payer_test import ...` |
+| `from node_set import ...` | `from nano_settlement_verify.node_set import ...` |
+| `from links import public_check` | `from nano_settlement_verify.links import public_check` |
+| `python3 nano_quorum.py ...` (any module) | `python3 -m nano_settlement_verify.quorum ...` |
+| `python3 node_set/probe.py ...` | `python3 -m nano_settlement_verify.node_set.probe ...` |
+| `python3 -m links.public_check ...` | `python3 -m nano_settlement_verify.links.public_check ...` |
+
+`nano_settlement_verify.__version__` is new and reads `2.0.0`. Stored records keep their
+schema names (`"nano_quorum.corroboration/5"` and the rest): those are data, not import paths.
 
 The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
 `$NANO_RPC_URL` when no `RPC_URL` argument is given - so if you export that variable for
@@ -128,11 +161,11 @@ The next node is asked only when the one before could not be reached or read (ex
 answer from a node - settled, not yet, mismatch, no such block - is final and is not retried.
 Every URL is checked before any is asked, a URL listed twice or an empty entry is refused (exit 4),
 and with more than one URL the verdict names the node that answered as `"rpc_index"` (0-based).
-Failover is not agreement: to need two nodes to agree, use `nano_quorum` ([One node's word, or two?](#one-nodes-word-or-two)).
+Failover is not agreement: to need two nodes to agree, use `nano_settlement_verify.quorum` ([One node's word, or two?](#one-nodes-word-or-two)).
 
-**Two-node usage from the pinned list.** `node_set/NODES.json` is the measured list (5 usable, 1 unusable on 2026-11-02; re-measure with `node_set/probe.py`). Build the CLI argument from it, first two usable nodes, and run (checked on 2026-11-02, exit 0, `"settled": true`, `"rpc_index": 0`):
-`python3 skills/nano-settlement-verify/verify_cli.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 "$(python3 -c 'from node_set import fallback_urls;print(",".join(fallback_urls()[:2]))')"`
-That is failover (the second node is asked only if the first cannot be reached). For both nodes to agree before you ship, use `nano_two_node.py` or `nano_quorum`. Some listed RPCs may sit in front of the same node, so two URLs are not proof of two operators.
+**Two-node usage from the pinned list.** `nano_settlement_verify/node_set/NODES.json` is the measured list (5 usable, 1 unusable on 2026-11-02; re-measure with `nano_settlement_verify/node_set/probe.py`). Build the CLI argument from it, first two usable nodes, and run (checked on 2026-11-02, exit 0, `"settled": true`, `"rpc_index": 0`):
+`python3 skills/nano-settlement-verify/verify_cli.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 "$(python3 -c 'from nano_settlement_verify.node_set import fallback_urls;print(",".join(fallback_urls()[:2]))')"`
+That is failover (the second node is asked only if the first cannot be reached). For both nodes to agree before you ship, use `python3 -m nano_settlement_verify.two_node` or `nano_settlement_verify.quorum`. Some listed RPCs may sit in front of the same node, so two URLs are not proof of two operators.
 
 When the node cannot be reached or read, the detail is chosen by the error's class alone,
 from parts of it that cannot hold the URL - the URL itself is never consulted:
@@ -376,7 +409,7 @@ slack, or pass `not_after=None` to have no deadline.
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
-  `Disagreement.record()` is not redacted: as on main, it writes each `rpc_url` as given,
+  `Disagreement.record()` is not redacted: as before, it writes each `rpc_url` as given,
   credentials included (its `node_observations` redact only through `to_dict()`).
 - `observations` is part of `Corroboration` equality. A `Corroboration` built by hand from
   the four old fields (`receipt`, `agreed`, `answered`, `failed`) has no observations, so it
@@ -408,7 +441,7 @@ slack, or pass `not_after=None` to have no deadline.
   (`2026-11-09T12:00:00.123Z`). A time without seconds, a week or ordinal date, the basic
   no-separator form, a longer fraction or any other offset is refused; `attempted_at`,
   `returned_at` and `stop.at` follow the same rule. `+00:00` is accepted because an
-  `Observation` on `main` took any text, and it is UTC; the module itself always writes `Z`.
+  `Observation` written before this check took any text, and it is UTC; the module itself always writes `Z`.
   So every asked node in a stored receipt says when it was read. `verify_corroborated`
   already wrote one for every asked node, so this check changes none of its records (the
   schema string is now `/5`, for the reasons below); only an `Observation` built by hand
@@ -443,7 +476,7 @@ slack, or pass `not_after=None` to have no deadline.
   unsettled receipt, or `NotCorroborated`), `mismatch` and `disagreement` (both raise). The
   check has no deadline and no budget, so neither is a reason. The table of reasons and their
   meanings is written inline as `"stop_reasons"` with `"stop_reasons_sha256"` (computed like
-  `node_states_sha256`, pinned as `nano_quorum.STOP_REASONS_SHA256` =
+  `node_states_sha256`, pinned as `nano_settlement_verify.quorum.STOP_REASONS_SHA256` =
   `10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342`), and
   `verify_receipt_vocabulary` now checks it too. `Corroboration.stop` holds it (null in the
   JSON for one built by hand; not part of `==`), and a raised `Mismatch`, `Disagreement` or
@@ -466,7 +499,7 @@ slack, or pass `not_after=None` to have no deadline.
 - `Observation.from_dict(entry)` reads a `to_dict()` entry back (unknown or missing keys
   are refused; so are an `"error"` on any state but `unreadable`, and `""` where `to_dict()`
   writes null for an empty `read_at`, `attempted_at` or `returned_at` - nothing is dropped
-  silently, an entry is read only if `to_dict()` could have written it), and `nano_quorum.canonical_json` is the sorted, whitespace-free form
+  silently, an entry is read only if `to_dict()` could have written it), and `nano_settlement_verify.quorum.canonical_json` is the sorted, whitespace-free form
   `node_states_sha256` hashes. Three per-node fixtures in `tests/fixtures/observations/` -
   `not_asked.json`, `asked_returned.json` (asked, answer came back with its time) and
   `asked_no_return.json` (asked, unreadable, no `returned_at`) - must round-trip
@@ -488,12 +521,12 @@ slack, or pass `not_after=None` to have no deadline.
   `verify_corroborated(..., order_seed=N)` (an int from 0 to 2\*\*64 - 1) asks in
   `"seed-sha256"` order instead: ascending SHA-256 hex of `str(N) + "\n" + url` (the URL as
   written in the record), ties in configured order, so anyone can recompute it from the
-  record, and the same seed and nodes give the same order. `nano_quorum.replay_receipt(record)`
+  record, and the same seed and nodes give the same order. `nano_settlement_verify.quorum.replay_receipt(record)`
   re-runs the stop from the record alone - recomputes `ask_order` from the rule, checks each
   observation's `ask_index`, walks the answers with the k of n in `"stop"`, and checks the
   stop reason and moment, `settled`, `agreed` and which nodes are `not-asked` - and returns
   `{"verdict": "match" | "mismatch", "problems", "expected_stop", "expected_not_asked"}`.
-  From a shell: `python3 nano_quorum.py --replay receipt.json` (exit 0 on a match, 1 on a
+  From a shell: `python3 -m nano_settlement_verify.quorum --replay receipt.json` (exit 0 on a match, 1 on a
   mismatch). It checks order and stopping, not amounts and not whether a node told the truth.
   Neither vocabulary changed, so both pinned hashes are as in `/4`; the three per-node
   fixtures gained `ask_index` and their pinned SHA-256 changed with it.
@@ -533,8 +566,8 @@ is not enough; the next section does that in code.
 For a verdict an outside agent can audit field by field - block hash and confirmed,
 source not destination and not excluded, exact amount, invoice issued before the block,
 nodes read - with any missing field answered `unknown` and never `settled`, see
-[FIVE_FIELDS.md](FIVE_FIELDS.md): the same check as two `curl` calls and a local hash
-recompute, and `nano_five_fields.five_field_verdict` for callers who want it in code.
+[FIVE_FIELDS.md](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/FIVE_FIELDS.md): the same check as two `curl` calls and a local hash
+recompute, and `nano_settlement_verify.five_fields.five_field_verdict` for callers who want it in code.
 `settled` there means work may start; it is not buyer acceptance.
 
 ## Check a block offline (the payer's own signature)
@@ -546,7 +579,7 @@ node, that the holder of that account's key signed exactly those contents. Chang
 digit of the balance or the destination and the check fails.
 
 It does not prove the block is on the ledger or confirmed. A key holder can sign a block
-that never lands, or one that loses a fork. Inclusion still needs nodes: `nano_quorum`.
+that never lands, or one that loses a fork. Inclusion still needs nodes: `nano_settlement_verify.quorum`.
 
 Carrying the previous block's hash adds nothing by itself, because `previous` is already
 inside the signed contents. What the previous block's full contents add is the amount: a
@@ -560,11 +593,11 @@ Small-order public keys and R points (such as the identity key `nano_11a1...6iq5
 which a forged signature would verify any contents) and non-canonical encodings are refused.
 
 ```
-python3 nano_offline.py B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F
+python3 -m nano_settlement_verify.offline B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F
 ```
 
 The node (default rpc.nano.to) is only used to fetch the two blocks; the check runs on the
-fetched bytes. In code: `nano_offline.offline_check(contents, signature, previous_contents)`.
+fetched bytes. In code: `nano_settlement_verify.offline.offline_check(contents, signature, previous_contents)`.
 
 ## One node's word, or two?
 
@@ -574,10 +607,11 @@ thin: `rpc.nano.to` wants a key and rate-limits a burst, Nanswap throttles, and 
 in front of any of them can answer HTTP 200 with something that is not a node reply at
 all. An agent with no node of its own has no second opinion to fall back on.
 
-`nano_quorum.py` (same package, also one stdlib file) is that second opinion.
+`nano_settlement_verify/quorum.py` (same package, standard library only) is that second opinion. It is run as
+`python3 -m nano_settlement_verify.quorum`, not as a file: since 2.0.0 the package modules use relative imports.
 
 ```python
-from nano_quorum import verify_corroborated, Disagreement, NotCorroborated
+from nano_settlement_verify.quorum import verify_corroborated, Disagreement, NotCorroborated
 
 NODES = ["https://rpc.nano.to", "https://my-other-node.example/proxy"]
 
@@ -649,14 +683,14 @@ carries it as `.observations`, and `Disagreement` as `.node_observations` (its
 (the node errored, timed out or sent something that is not a node reply), and an
 `unreadable` entry carries `"error": {"kind", "message"}` that no other state has. The
 record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/5"` and
-`"node_states"`, the full state vocabulary (`nano_quorum.NODE_STATES`) with a one-line
+`"node_states"`, the full state vocabulary (`nano_settlement_verify.quorum.NODE_STATES`) with a one-line
 meaning for each, so a stored receipt can be read without this code. Beside them it
 writes `"node_states_sha256"`: the SHA-256 hex of
 `json.dumps(node_states, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
 encoded as UTF-8. For schema `/5` (and `/4` and `/3` before it: the state table did not change) that is
 `3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c`
-(`nano_quorum.NODE_STATES_SHA256`; the module refuses to import if the table and this
-value disagree). `nano_quorum.verify_receipt_vocabulary(record)` recomputes it from a
+(`nano_settlement_verify.quorum.NODE_STATES_SHA256`; the module refuses to import if the table and this
+value disagree). `nano_settlement_verify.quorum.verify_receipt_vocabulary(record)` recomputes it from a
 stored record's own table and returns True only if it matches both the record's field
 and the pinned value, so an edited table, or a `/5` record with a different vocabulary,
 is caught.
@@ -713,7 +747,7 @@ Nothing is served on a disagreement; the record only says what each node said.
 Two more functions come with it:
 
 ```python
-from nano_quorum import balance_corroborated, post_json_failover
+from nano_settlement_verify.quorum import balance_corroborated, post_json_failover
 
 balance_raw, receivable_raw = balance_corroborated("nano_3abc", NODES)   # integers of raw
 reply, which_node = post_json_failover(NODES, {"action": "account_info", ...})
@@ -731,7 +765,7 @@ arrived with it.
 
 ## Pay against terms, not against a claim
 
-`nano_terms.py` (same package, also one stdlib file) is for two agents that trade once
+`nano_settlement_verify/terms.py` (same package, standard library only; a library with no command line - import it as `from nano_settlement_verify.terms import ...`) is for two agents that trade once
 and need to agree, before any XNO moves, on what is paid, to whom, and what counts as
 delivered.
 
@@ -753,7 +787,7 @@ delivered.
   `verify` above, never against what the seller says afterwards.
 
 ```python
-from nano_terms import load_terms, accept, settle, terms_sha256
+from nano_settlement_verify.terms import load_terms, accept, settle, terms_sha256
 
 terms = load_terms(terms_bytes, cited_sha256)   # TermsRefused on any mismatch
 done = accept(terms, deliverable_bytes)         # offline; NotAccepted if it fails
@@ -776,7 +810,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1223 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1227 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -816,12 +850,12 @@ their text, a `TypeError` from the transport is named as a failed request rather
 problem, an uppercase `HTTP://` is asked, a long `<urlopen error ...>` is cut at 200, a URL with a control character or both kinds of quote
 never prints it either, and two overlapping callers of the CLI in one process, or one that
 calls it again from inside `post_json`, leave the library's `post_json` as they found it;
-for `nano_terms`, the hash check, the pinned schema, both
+for `nano_settlement_verify.terms`, the hash check, the pinned schema, both
 acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
-`nano_independence`, the funding chain and the independent-payer grouping; for
-`nano_quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
+`nano_settlement_verify.independence`, the funding chain and the independent-payer grouping; for
+`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring
@@ -831,15 +865,15 @@ nothing), a node's "Account not found" still read as a balance of nothing while 
 or receivable sent as a JSON number, or as a string `int()` reads but a node never sends
 ("-5", "1_000", " 7 ", "+9"), refused rather than put through `int()`, which
 reads 1e30 as 19884624838656 raw above one XNO and an infinite one as an
-`OverflowError` outside the family a caller catches; for `nano_payers`, both x402 document shapes, every refusal in
+`OverflowError` outside the family a caller catches; for `nano_settlement_verify.payers`, both x402 document shapes, every refusal in
 the payee table, and what the payer count will not include - an unconfirmed receive, the
 seller's own sends, a receive from itself, one account written two ways, a chain read only
-half way; for `nano_claim`, claimed, still receivable to an opened and an unopened
+half way; for `nano_settlement_verify.claim`, claimed, still receivable to an opened and an unopened
 account, a non-send and a malformed hash refused, and every read that fails - a node error, a
 receive not found within the bound - coming back as `unknown` with a nonzero exit, each
 `unknown` carrying its reconcile path (same send hash, no re-send, next check, escalation
 after the read or time limit), each not-found scoped to the nodes and instant read, and a
-not-found on one node yielding to a found answer on another; for `nano_five_fields`, the
+not-found on one node yielding to a found answer on another; for `nano_settlement_verify.five_fields`, the
 block hash recomputed locally and matched against two real blocks pinned as the network
 returned them, each of the five fields missing in turn coming back `unknown`, nodes that
 disagree, one node, the same node twice and a failed node all `unknown`, an amount over or
@@ -852,7 +886,10 @@ that one seed gives one order, and that `replay_receipt` passes two orders of th
 and fails a receipt whose order was edited; and for the README itself, that the curl body in *Check it without running our
 code* is the payload `verify` really sends, so the two cannot drift, and that the count at the head of this
 paragraph is the count the suite collects; for the skill bundle, that its vendored library is the
-library and that its CLI answers the exit codes SKILL.md documents. None of them touch the network — the node reply is stubbed,
+library and that its CLI answers the exit codes SKILL.md documents; for the package, that the
+wheel ships the one package `nano_settlement_verify` and its node list, that every module imports
+from inside it, that `__version__` is the version in pyproject.toml, and that a patched
+`post_json` is the one its modules call. None of them touch the network — the node reply is stubbed,
 and a fixture fails any test that tries to open a socket; the skill-bundle CLI tests that
 need a real socket use a throwaway server on loopback.
 
@@ -876,21 +913,21 @@ paid it.
 
 ## Link check before you send
 
-`python3 -m links.public_check --url URL [URL ...]` fetches each link with no credentials and says `send`, `strip` or `refuse` for a message. A non-200 (or an auth wall, or a timeout) is never public; a 200 only proves it from here.
+`python3 -m nano_settlement_verify.links.public_check --url URL [URL ...]` fetches each link with no credentials and says `send`, `strip` or `refuse` for a message. A non-200 (or an auth wall, or a timeout) is never public; a 200 only proves it from here.
 
 ## Three more checks a stranger can reproduce
 
-- **Two nodes, five fields:** [TWO-NODE-CHECK.md](TWO-NODE-CHECK.md) is the check as two curl calls and a table; `python3 nano_two_node.py --block HASH --amount-raw RAW --invoice-id ID --invoice-issued-at T --payee ACCT --json` is the same thing in one command (exit 0 settled, 2 unknown, 4 refused). `settled` is not buyer acceptance.
-- **Who funded the payer:** [FUNDING-PROVENANCE.md](FUNDING-PROVENANCE.md); `python3 nano_funding.py --block HASH --json` returns `unsubsidised`, `sponsor_funded`, `dispenser_funded`, `self_funded` or `unknown`, with the receive that decides it. Payment time is the payer's send block.
-- **Recount an address on either rail:** `python3 nano_recount.py --address nano_... --json`, or `--address 0x... --from-block N` for USDC on Base. Distinct payers and payments, no clustering; a truncated read refuses (exit 3) instead of printing a smaller number.
+- **Two nodes, five fields:** [TWO-NODE-CHECK.md](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/TWO-NODE-CHECK.md) is the check as two curl calls and a table; `python3 -m nano_settlement_verify.two_node --block HASH --amount-raw RAW --invoice-id ID --invoice-issued-at T --payee ACCT --json` is the same thing in one command (exit 0 settled, 2 unknown, 4 refused). `settled` is not buyer acceptance.
+- **Who funded the payer:** [FUNDING-PROVENANCE.md](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/FUNDING-PROVENANCE.md); `python3 -m nano_settlement_verify.funding --block HASH --json` returns `unsubsidised`, `sponsor_funded`, `dispenser_funded`, `self_funded` or `unknown`, with the receive that decides it. Payment time is the payer's send block.
+- **Recount an address on either rail:** `python3 -m nano_settlement_verify.recount --address nano_... --json`, or `--address 0x... --from-block N` for USDC on Base. Distinct payers and payments, no clustering; a truncated read refuses (exit 3) instead of printing a smaller number.
 
 ## Scope
 
 It verifies. It does not sign, send, hold a key, retry or cache, and `verify` itself has no
 command line. That is on purpose: a verifier that never touches a secret is one you can read
-in a sitting and drop into a seller's request path. (`nano_payers` does have one, because an
+in a sitting and drop into a seller's request path. (`nano_settlement_verify.payers` does have one, because an
 audit is something a stranger runs once from a shell, not something on a request path. It
-reads the same way: no key, no send. So does `nano_claim`.)
+reads the same way: no key, no send. So does `nano_settlement_verify.claim`.)
 
 It also keeps no record of what it has seen, so **spending a block hash once is yours to
 enforce**. A settled receipt says this block paid you that amount; it does not say the block
@@ -899,7 +936,7 @@ refuse it the second time, or one payment buys every call the buyer cares to mak
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/LICENSE).
 
 ## Is anybody actually paying this seller?
 
@@ -907,18 +944,18 @@ MIT — see [LICENSE](LICENSE).
 asks something earlier: **is this seller real, and is the account it advertises the account
 that gets paid?**
 
-`nano_payers` answers that from two places the seller does not control the reading of — the
+`nano_settlement_verify.payers` answers that from two places the seller does not control the reading of — the
 seller's **own** x402 document, and the **public ledger**. So a stranger holding nothing but
 a URL can re-derive every number, and a seller claiming traffic it has not got is
 contradicted by the ledger rather than argued with.
 
 ```
-python nano_payers.py https://extract.paypercall.dev/.well-known/x402
+python3 -m nano_settlement_verify.payers https://extract.paypercall.dev/.well-known/x402
 ```
 
 ```python
 import json, urllib.request
-from nano_payers import payees_from_manifest, payers
+from nano_settlement_verify.payers import payees_from_manifest, payers
 
 doc = json.load(urllib.request.urlopen("https://seller.example/.well-known/x402"))
 for payee in payees_from_manifest(doc):     # offline: it parses, it does not fetch
@@ -973,7 +1010,7 @@ out of the count and puts it where it belongs — with whoever knows which accou
 theirs — and nothing here infers ownership from the size of a number:
 
 ```python
-from nano_payers import outside_payers
+from nano_settlement_verify.payers import outside_payers
 
 real = outside_payers(report, ["nano_<our own funding account>"])
 real.distinct_payers       # accounts that are not us
@@ -1002,17 +1039,17 @@ can since have been paid from elsewhere, and the reverse.
 ## How many independent payers?
 
 Counting paying keys is not counting buyers: one operator can pay from ten accounts.
-`nano_independence` groups payer accounts by where their money came from - the send that
+`nano_settlement_verify.independence` groups payer accounts by where their money came from - the send that
 opened each account - and counts each group once. Read-only; same bounded node call.
 
-`nano_payers.payers` produces exactly the list it wants, so the two compose into the whole
+`nano_settlement_verify.payers.payers` produces exactly the list it wants, so the two compose into the whole
 question: from a seller's URL to how many independent payers it has. On the live seller
 above, the 10 paying accounts group into **7** independent payers - three of the small
 per-call payers were funded from one account, and so are one operator however separately
 they paid.
 
 ```python
-from nano_independence import independence
+from nano_settlement_verify.independence import independence
 
 report = independence(payers, "https://rpc.nano.to", seller="nano_<your account>",
                       ignore=["nano_<an exchange hot wallet>"])
@@ -1033,7 +1070,7 @@ which lives outside the ledger.
 
 To apply one stated test instead - "funded by neither us nor you, one hop back, exchange
 hot wallets set aside" - with one verdict and witness per payer:
-`python3 nano_stated_payer_test.py --payee nano_... --excluded nano_... --exchange nano_... --payer nano_...`.
+`python3 -m nano_settlement_verify.stated_payer_test --payee nano_... --excluded nano_... --exchange nano_... --payer nano_...`.
 By default "one hop back" is the seller's amended reading (2026-11-10): the source of the
 largest receive into the payer before the payment (ties: the earliest; no payment yet: all
 receives to date, said in `before`). `--hop opening-send` keeps the reading as first stated,
@@ -1046,17 +1083,17 @@ Schema change: the JSON tag is now `stated-payer-test-v3` (was `stated-payer-tes
 `why` of `independent` now ends "or only a shared hot wallet"; the text output names
 `hop rule X` and each payer's `(hop depth N)`; library callers of `stated_test()` get the
 new default `hop_rule="largest-receive"` (pass `hop_rule="opening-send"` for the old one).
-Verdicts, limits and a real read: [STATED-PAYER-TEST.md](STATED-PAYER-TEST.md).
+Verdicts, limits and a real read: [STATED-PAYER-TEST.md](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/STATED-PAYER-TEST.md).
 
 ## Was the send claimed?
 
 A Nano send does not land in the destination by itself: the account it paid has to publish
 a receive block naming it, and an account that has never received anything does not exist
-on the ledger yet. `nano_claim` reads one send hash off the public chain once and says which
+on the ledger yet. `nano_settlement_verify.claim` reads one send hash off the public chain once and says which
 of those it is:
 
 ```
-python3 nano_claim.py <send-block-hash> [rpc-url] [--nodes URL ...]
+python3 -m nano_settlement_verify.claim <send-block-hash> [rpc-url] [--nodes URL ...]
 ```
 
 ```json
@@ -1106,12 +1143,12 @@ nothing else. The outcome field was asked for by an agent on Moltbook.
 
 ## Pinned node set
 
-`node_set/NODES.json` lists the public Nano RPC nodes that answered `block_info` for a known block with the
-exact ledger amount, measured by `python3 node_set/probe.py --out node_set/NODES.json --probed-from <label>`
-(read-only). `from node_set import fallback_urls` returns them in file order; a missing or malformed file gives `[]`.
+`nano_settlement_verify/node_set/NODES.json` lists the public Nano RPC nodes that answered `block_info` for a known block with the
+exact ledger amount, measured by `python3 -m nano_settlement_verify.node_set.probe --out nano_settlement_verify/node_set/NODES.json --probed-from <label>`
+(read-only). `from nano_settlement_verify.node_set import fallback_urls` returns them in file order; a missing or malformed file gives `[]`.
 The committed file was measured from a Mac with open egress on 2026-11-02: five usable, one connect-rejected.
 Re-run the probe before relying on it; node availability changes.
 
 ## External counterparties per period
 
-`python3 nano_period_counts.py --address nano_... --period month --json` counts, per UTC period, the distinct payers that are neither the address itself nor in the set of accounts it has ever funded. Rule, limits and a real read: [EXTERNAL-COUNTERPARTIES.md](EXTERNAL-COUNTERPARTIES.md). Tests: `python3 -m unittest tests.test_period_counts`.
+`python3 -m nano_settlement_verify.period_counts --address nano_... --period month --json` counts, per UTC period, the distinct payers that are neither the address itself nor in the set of accounts it has ever funded. Rule, limits and a real read: [EXTERNAL-COUNTERPARTIES.md](https://github.com/dhyabi2/nano-settlement-verify/blob/HEAD/EXTERNAL-COUNTERPARTIES.md). Tests: `python3 -m unittest tests.test_period_counts`.

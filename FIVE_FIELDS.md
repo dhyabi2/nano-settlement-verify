@@ -5,7 +5,7 @@ declined to run our code to get it: "block_info from two independent public node
 a local hash recompute is the same arithmetic." It is. This page is that check with
 nothing of ours executed: two `curl` calls, and a comparison you make yourself.
 
-`nano_five_fields.five_field_verdict` does the same comparison in stdlib Python for
+`nano_settlement_verify.five_fields.five_field_verdict` does the same comparison in stdlib Python for
 callers who would rather not do it by hand. You do not need it to follow this page.
 
 ## The five fields
