@@ -1447,6 +1447,16 @@ def _payer_of(reply: object):
 _ORIGINAL_VERIFY = nano_settlement_verify.verify
 
 
+class UnhashableContents(ValueError):
+    """A confirmed answer whose contents are too sparse to recompute the block hash.
+
+    Amount, payee and height alone do not say WHICH block a node is describing,
+    so such an answer is not a witness. It is a `ValueError`, so the check reads
+    the node as "unreadable" - it told us nothing we could tie to the block -
+    rather than as agreeing or as contradicting.
+    """
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
@@ -1462,7 +1472,10 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     (`nano_five_fields.block_hash_of`) and that hash is not the one asked for,
     the node has answered about a DIFFERENT block: that is tagged "other-block",
     never "settled", however well its amount and payee match. Contents too
-    sparse to hash are not a hash checked, and are read as before.
+    sparse to hash are not a hash checked either: that answer raises
+    `UnhashableContents`, so it is recorded "unreadable" (error kind
+    "UnhashableContents") and is neither agreement nor disagreement. A quorum
+    of sparse answers cannot settle; it is `NotCorroborated`.
 
     If `nano_settlement_verify.verify` is no longer the original function, it
     is called as before this module read replies itself, and the answer is
@@ -1492,7 +1505,12 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     from .five_fields import block_hash_of  # here, not at the top: it imports this module
 
     answered_for = block_hash_of(reply.get("contents"))
-    if answered_for is not None and answered_for != str(block_hash).strip().upper():
+    if answered_for is None:
+        raise UnhashableContents(
+            f"confirmed, but its contents are too sparse to recompute a block hash from, "
+            f"so nothing ties the answer to block {block_hash}"
+        )
+    if answered_for != str(block_hash).strip().upper():
         return ("other-block", answered_for, str(block_hash)), None
     return (
         "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)

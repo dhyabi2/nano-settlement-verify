@@ -47,15 +47,44 @@ def no_sockets(monkeypatch):
     monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", refuse)
 
 
+def _send_contents(payee=PAYEE):
+    """Complete state-block contents, so the block hash can be recomputed from them.
+
+    The hash covers `link`, not `link_as_account`, so `payee` changes what the
+    node says the block pays without changing which block it is.
+    """
+    from nano_settlement_verify.five_fields import _address_of_key
+
+    sender = _address_of_key(bytes(range(1, 33)))
+    return {
+        "type": "state",
+        "account": sender,
+        "previous": "11" * 32,
+        "representative": sender,
+        "balance": str(5 * ONE_XNO),
+        "link": "AB" * 32,
+        "link_as_account": payee,
+    }
+
+
 def send_block(amount=ONE_XNO, payee=PAYEE, height=7, confirmed="true"):
-    """A node's block_info reply for a confirmed send of `amount` to `payee`."""
+    """A node's block_info reply for a confirmed send of `amount` to `payee`.
+
+    Its contents are complete and hash to HASH, as a real node's json_block does.
+    """
     return {
         "amount": str(amount),
         "height": str(height),
         "confirmed": confirmed,
         "subtype": "send",
-        "contents": {"link_as_account": payee},
+        "contents": _send_contents(payee),
     }
+
+
+from nano_settlement_verify.five_fields import block_hash_of as _block_hash_of  # noqa: E402
+
+# The block every send_block() reply describes.
+HASH = _block_hash_of(_send_contents())
 
 
 def nodes(monkeypatch, replies):
@@ -1084,6 +1113,37 @@ def test_the_requested_hash_is_compared_whatever_its_letter_case(monkeypatch):
     reply, asked = state_send()
     nodes(monkeypatch, {A: reply, B: reply})
     assert verify_corroborated(asked.lower(), ONE_XNO, HOLDER, [A, B]).receipt.settled is True
+
+
+def sparse_send(reply):
+    """`reply` with its contents cut to what cannot be hashed: payee only."""
+    return {**reply, "contents": {"link_as_account": reply["contents"]["link_as_account"]}}
+
+
+def test_answers_too_sparse_to_hash_are_not_witnesses_and_cannot_settle(monkeypatch):
+    """rossum's report. Two nodes answer `confirmed` with the right amount, payee and
+    height, but contents too sparse to recompute a block hash from. Nothing ties
+    their answers to the block asked for, so neither counts as an agreeing witness:
+    the check could not look, and nothing is served."""
+    reply, asked = state_send()
+    sparse = sparse_send(reply)
+    nodes(monkeypatch, {A: sparse, B: sparse})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
+    assert {o.error_kind for o in caught.value.observations} == {"UnhashableContents"}
+    assert set(caught.value.failures) == {A, B}
+
+
+def test_a_sparse_answer_does_not_help_one_full_answer_settle(monkeypatch):
+    """One honest full answer plus one sparse one is one witness, not two; a third
+    full answer then completes the quorum."""
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: sparse_send(reply), B: reply, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C])
+    assert out.receipt.settled is True
+    assert out.agreed == (B, C)
+    assert out.failed == (A,)
 
 
 def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):

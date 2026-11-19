@@ -14,6 +14,7 @@ import pytest
 
 from nano_settlement_verify import quorum as nano_quorum
 import nano_settlement_verify
+from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
 from nano_settlement_verify.quorum import replay_receipt, verify_corroborated
 
 A = "http://127.0.0.1:7071"
@@ -21,9 +22,22 @@ B = "http://127.0.0.1:7072"
 C = "http://127.0.0.1:7073"
 D = "http://127.0.0.1:7074"
 
-HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
 PAYEE = "nano_1payee"
 ONE_XNO = 10**30
+
+# Complete state-block contents, as a real node's json_block returns, so the
+# quorum can recompute the block hash; HASH is the block they describe.
+_SENDER = _address_of_key(bytes(range(1, 33)))
+CONTENTS = {
+    "type": "state",
+    "account": _SENDER,
+    "previous": "11" * 32,
+    "representative": _SENDER,
+    "balance": str(5 * ONE_XNO),
+    "link": "AB" * 32,
+    "link_as_account": PAYEE,
+}
+HASH = block_hash_of(CONTENTS)
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +54,7 @@ def send_block(confirmed="true"):
         "height": "7",
         "confirmed": confirmed,
         "subtype": "send",
-        "contents": {"link_as_account": PAYEE},
+        "contents": dict(CONTENTS),
     }
 
 
