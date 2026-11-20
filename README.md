@@ -422,7 +422,8 @@ slack, or pass `not_after=None` to have no deadline.
   or one that is not a valid address, names no payer chain and is compared as before. When
   `nano_settlement_verify.verify` has been replaced (stubbed or wrapped), `verify_corroborated`
   still calls it for each endpoint, as before; it then has no reply in hand, so neither of
-  these two checks is made.
+  these two checks is made, nor any of the hash, payee or amount checks below: a quorum
+  through a replaced `verify` settles on the replacement's word.
 - A node that answers `confirmed` with contents too sparse to recompute a block hash from
   no longer counts toward agreement. It is recorded `unreadable` (error kind
   `UnhashableContents`, a `ValueError`), so two such answers raise `NotCorroborated`
@@ -434,8 +435,18 @@ slack, or pass `not_after=None` to have no deadline.
   agreement either. It is recorded `unreadable` (error kind `UnboundAnswer`, a
   `ValueError`): the hash ties it to the block, but what it asserts is not that block's.
   Two colluding nodes can no longer settle a real send to someone else, or a receive, as
-  a payment to the seller. The amount is not hashed and is still compared across answers;
-  a legacy send's chain is not hashed and is still compared only when two answers name one.
+  a payment to the seller. A legacy send's chain is not hashed and is still compared only
+  when two answers name one.
+- The amount is no longer a node's word. A block's hash covers the balance it leaves, not
+  the amount it moved, so for each confirmed answer whose contents hash to the block,
+  `verify_corroborated` now makes a second `block_info` request to the same endpoint, for
+  the block's `contents.previous`. That block's contents must hash to exactly `previous`,
+  and its hashed balance less the send's must equal the `amount` the node reported. An
+  endpoint that cannot give that block, gives one that hashes to anything else (or to
+  nothing), or whose balances move another amount, is recorded `unreadable` (error kind
+  `UnboundAnswer`), never settled on its `amount`: two colluding nodes can no longer
+  settle a real send for an amount it did not move. Each answering endpoint is now asked
+  twice per check, and a stub of `post_json` must answer the second request too.
 - A `confirmed` observation whose reply named a valid payer chain now carries it as
   `payer_account` (a nano_ address, also written by `to_dict()` and part of equality), and
   a payer-chain `Disagreement`'s `answers` name the chains as nano_ addresses, not key hex.
@@ -662,10 +673,18 @@ The rules it holds to, each of which is a way of failing closed:
   an address, is not compared on it. A confirmed answer whose contents are too sparse to
   hash (amount, payee and height only) is not a witness either: it is recorded as
   `unreadable` with error kind `UnhashableContents`, neither agreement nor disagreement,
-  so a quorum of sparse answers is `NotCorroborated` and never settles. Contents that do
+  so a quorum of sparse answers is `NotCorroborated` and never settles (while
+  `nano_settlement_verify.verify` is the library's own; a replaced, stubbed or wrapped
+  `verify` hands back a receipt with no reply in hand, and none of these hash, payee or
+  amount checks is made on it). Contents that do
   hash to the block bind the answer: a payee other than the hashed `link`/`destination`,
   a `subtype` other than `send`, or a state block's `block_account` other than its hashed
-  `account` is `unreadable` with error kind `UnboundAnswer`, not a witness.
+  `account` is `unreadable` with error kind `UnboundAnswer`, not a witness. So is an
+  amount the hashed balances do not move: the hash covers the balance a send leaves, not
+  the amount, so the same endpoint is asked for the block's `previous`, whose contents
+  must hash to it, and that block's balance less the send's must be the amount the node
+  reported. No such block, one that hashes to anything else, or another difference, and
+  the answer is `UnboundAnswer` - never settled on the node's `amount`.
 - **One `Mismatch` refuses at once.** A node that has the block *confirmed* and says it
   paid a different amount or a different account is reporting something a later node
   cannot overturn — a confirmed block's contents are fixed by its hash.
@@ -827,7 +846,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1235 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1241 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -872,7 +891,7 @@ acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
 `nano_settlement_verify.independence`, the funding chain and the independent-payer grouping; for
-`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, a confirmed answer too sparse to hash, a confirmed answer whose hashed contents contradict the payee, operation or payer chain it names (a forged `link_as_account`, an extra one on a legacy send, a receive called a send, a forged `block_account`), the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
+`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, a confirmed answer too sparse to hash, a confirmed answer whose hashed contents contradict the payee, operation or payer chain it names (a forged `link_as_account`, an extra one on a legacy send, a receive called a send, a forged `block_account`), a confirmed answer whose amount the hashed balances do not move (two colluding nodes forging it, a previous block that does not hash to `previous` or is not given, and the genuine state and legacy sends that still settle for the balances' difference), the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring

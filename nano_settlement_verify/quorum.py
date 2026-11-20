@@ -53,6 +53,8 @@ __all__ = [
     "STOP_REASONS",
     "STOP_REASONS_SHA256",
     "Stop",
+    "UnboundAnswer",
+    "UnhashableContents",
     "balance_corroborated",
     "canonical_json",
     "distinct_endpoints",
@@ -1512,6 +1514,64 @@ def _unbound(reply: dict, contents: dict, paid: str) -> str | None:
     return None
 
 
+_NO_PREVIOUS = "0" * 64
+
+
+def _hashed_balance(contents: dict) -> int | None:
+    """The balance a block's hashed contents leave its chain with, in raw, or None.
+
+    Called only on contents `block_hash_of` has hashed, so the field already
+    parses: a state block hashes `balance` as a decimal string, a legacy send
+    as 32 hex characters. A legacy receive, open or change block hashes no
+    balance at all, so its balance is only a node's word: None.
+    """
+    kind, balance = contents.get("type"), contents.get("balance")
+    if kind == "state":
+        return int(str(balance))
+    if kind == "send":
+        return int(balance, 16)
+    return None
+
+
+def _bound_amount(post, rpc_url: str, contents: dict) -> int:
+    """The amount a send moved, from hashed balances alone, or `UnboundAnswer`.
+
+    `contents` already hash to the block asked for. The amount a node reports is
+    its own word - only the balance after the send is hashed - so it is derived
+    here instead: the block before it (`contents.previous`) is asked for from
+    the same endpoint, its contents must hash to exactly `contents.previous`,
+    and the amount is that block's hashed balance less this one's. A previous
+    block the endpoint cannot give, whose contents do not hash to `previous`,
+    or that hashes no balance (a legacy receive, open or change block) binds
+    nothing, and the answer is not a witness: it raises `UnboundAnswer` and
+    never falls back to the node's `amount`. A transport failure on that second
+    request propagates as it is (OSError, NotANodeReply) and is recorded
+    "unreadable" in the same way.
+    """
+    from .five_fields import block_hash_of  # here, not at the top: it imports this module
+
+    previous = str(contents.get("previous", "")).upper()
+    if previous == _NO_PREVIOUS:
+        raise UnboundAnswer("its hashed contents name no previous block to derive the amount from")
+    before_reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": previous})
+    if not isinstance(before_reply, dict) or "error" in before_reply:
+        raise UnboundAnswer(
+            f"the endpoint gave no previous block {previous}, so the amount is only its word"
+        )
+    before_contents = before_reply.get("contents")
+    if block_hash_of(before_contents) != previous:
+        raise UnboundAnswer(
+            f"the previous block it gave does not hash to {previous}, "
+            f"so the amount is only its word"
+        )
+    before = _hashed_balance(before_contents)
+    if before is None:
+        raise UnboundAnswer(
+            f"the previous block {previous} hashes no balance, so the amount is only its word"
+        )
+    return before - _hashed_balance(contents)
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
@@ -1534,8 +1594,12 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     hash to the block bind what the answer may assert: a payee, payer chain or
     subtype the hashed contents contradict (`_unbound`) raises `UnboundAnswer`,
     recorded "unreadable" in the same way. The amount is not in the hashed
-    contents (only the resulting balance is), so it is still the node's word,
-    compared across answers as before.
+    contents (only the resulting balance is), so it is not taken on the node's
+    word: the previous block is asked for from the same endpoint, must hash to
+    `contents.previous`, and its hashed balance less this block's must be the
+    amount the node reported (`_bound_amount`). Anything else - no previous
+    block, one that hashes to something else or hashes no balance, or balances
+    that move another amount - raises `UnboundAnswer`.
 
     A `Mismatch` is reached before the hash is read, so one node naming another
     payee or amount still refuses at once, hashable contents or not: that
@@ -1544,7 +1608,8 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     If `nano_settlement_verify.verify` is no longer the original function, it
     is called as before this module read replies itself, and the answer is
     built from the Receipt it returns; there is then no reply in hand, so no
-    block hash and no payer are checked.
+    block hash, payee binding, amount binding or payer is checked: a quorum of
+    such answers settles on the replacement's word.
     """
     verify = nano_settlement_verify.verify  # looked up per call so a stub takes effect
     if verify is not _ORIGINAL_VERIFY:
@@ -1581,6 +1646,12 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
         raise UnboundAnswer(
             f"confirmed, and its contents hash to block {block_hash}, but {why}; "
             f"nothing it asserts beyond the hash is that block's"
+        )
+    moved = _bound_amount(post, rpc_url, reply["contents"])
+    if moved != receipt.amount_raw:
+        raise UnboundAnswer(
+            f"confirmed, and its contents hash to block {block_hash}, but it says the "
+            f"block moved {receipt.amount_raw} raw while the hashed balances move {moved}"
         )
     return (
         "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)

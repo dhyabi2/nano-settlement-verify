@@ -33,10 +33,21 @@ PAID = 10**24
 # Complete state-block contents, so the quorum can recompute the block hash
 # (a reply too sparse to hash is not a witness); BLOCK is the hash they give.
 _SENDER = _address_of_key(bytes(range(1, 33)))
-CONTENTS = {
+# The block before it, complete: the quorum asks each node for it and takes the
+# amount as its hashed balance less the send's (6 * PAID - 5 * PAID = PAID).
+PREVIOUS_CONTENTS = {
     "type": "state",
     "account": _SENDER,
     "previous": "11" * 32,
+    "representative": _SENDER,
+    "balance": str(6 * PAID),
+    "link": "00" * 32,
+}
+PREVIOUS = block_hash_of(PREVIOUS_CONTENTS)
+CONTENTS = {
+    "type": "state",
+    "account": _SENDER,
+    "previous": PREVIOUS,
     "representative": _SENDER,
     "balance": str(5 * PAID),
     "link": nano_settlement_verify.public_key_from_address(SELLER).hex().upper(),
@@ -81,6 +92,8 @@ def serve(behaviour):
 def honest(body):
     if body["action"] == "account_info":
         return 200, {"confirmed_balance": str(PAID), "confirmed_receivable": "0"}
+    if body.get("hash") == PREVIOUS:
+        return 200, {"confirmed": "true", "contents": PREVIOUS_CONTENTS}
     return 200, send()
 
 
@@ -95,6 +108,8 @@ def liar(body):
     """Confirms the same hash with a different height. Both cannot be true."""
     if body["action"] == "account_info":
         return 200, {"confirmed_balance": str(PAID * 2), "confirmed_receivable": "0"}
+    if body.get("hash") == PREVIOUS:
+        return 200, {"confirmed": "true", "contents": PREVIOUS_CONTENTS}
     return 200, send(height="999")
 
 

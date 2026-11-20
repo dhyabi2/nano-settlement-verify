@@ -31,10 +31,22 @@ ONE_XNO = 10**30
 # Complete state-block contents, as a real node's json_block returns, so the
 # quorum can recompute the block hash; HASH is the block they describe.
 _SENDER = _address_of_key(bytes(range(1, 33)))
-CONTENTS = {
+# The block before the send, complete, so the quorum can derive the amount from
+# the two hashed balances (6 XNO before, 5 XNO after: ONE_XNO moved).
+PREVIOUS_CONTENTS = {
     "type": "state",
     "account": _SENDER,
     "previous": "11" * 32,
+    "representative": _SENDER,
+    "balance": str(6 * ONE_XNO),
+    "link": "00" * 32,
+}
+PREVIOUS_HASH = block_hash_of(PREVIOUS_CONTENTS)
+PREVIOUS_BLOCK = {"confirmed": "true", "subtype": "change", "contents": PREVIOUS_CONTENTS}
+CONTENTS = {
+    "type": "state",
+    "account": _SENDER,
+    "previous": PREVIOUS_HASH,
     "representative": _SENDER,
     "balance": str(5 * ONE_XNO),
     "link": _PAYEE_KEY.hex().upper(),
@@ -62,10 +74,17 @@ def send_block(confirmed="true"):
 
 
 def nodes(monkeypatch, replies):
-    """Wire each endpoint to a reply or an exception; return the calls, in order."""
+    """Wire each endpoint to a reply or an exception; return the calls, in order.
+
+    The calls are the requests for the block asked about. The request a node's
+    answer leads to for the block before it (PREVIOUS_HASH, the amount's
+    binding) is answered with PREVIOUS_BLOCK and is not listed.
+    """
     called = []
 
     def post_json(rpc_url, payload):
+        if payload.get("hash") == PREVIOUS_HASH:
+            return PREVIOUS_BLOCK
         called.append(rpc_url)
         reply = replies[rpc_url]
         if isinstance(reply, BaseException):

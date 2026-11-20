@@ -127,3 +127,15 @@ node's rendering of `link`; compare `link` itself), and, for an older send block
 `block_account` - the source, which that block's contents do not name. Those are
 node-asserted, which is why there are two nodes and why they must agree, and why an
 older send's source is never checked against an exclusion list on a node's word.
+
+Two nodes agreeing on `amount` is still two nodes' word: two that collude can name any
+amount for a real send. The amount can be bound without trusting either. Ask the same
+node for `block_info` on the hash in `contents.previous` (the same request as above,
+with that hash), recompute that block's hash with the recipe above and check it equals
+`contents.previous`, then take its `contents.balance` less this block's (decimal for a
+state block, 32 hex characters for an older send block). That difference is the amount
+the block moved, and it must equal the `amount` both nodes reported. If the node cannot
+give that block, or its contents do not hash to `previous`, the amount is unbound:
+`unknown`, not `ok`. `nano_settlement_verify.quorum.verify_corroborated` does this for
+each answer (error kind `UnboundAnswer`); this module's `exact_amount` field still
+compares the nodes' `amount` and does not.
