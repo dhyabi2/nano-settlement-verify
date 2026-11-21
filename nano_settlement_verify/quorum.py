@@ -29,6 +29,7 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import re
@@ -604,6 +605,13 @@ RECEIPT_SCHEMA = "nano_quorum.corroboration/5"
 # "node_states", so a reader of a stored receipt needs no code to tell the states
 # apart - above all "not-seen" (the node ANSWERED, and has no such block) from
 # "unreadable" (the node gave NO answer about the block at all).
+# "Unreadable" also covers a node that did answer "confirmed" but whose answer
+# is no witness: contents too sparse to hash (error kind "UnhashableContents"),
+# or contents that hash to the block while the payee, payer chain, subtype or
+# amount it asserts are not that block's (error kind "UnboundAnswer"). Such a
+# node told us nothing we could tie to the block; `error_kind` and `error` say
+# which. The table text is pinned (NODE_STATES_SHA256), so this is said here,
+# not in it.
 NODE_STATES = {
     "confirmed": "the node answered: it has the block, confirmed, and it matches the expected payment",
     "unconfirmed": "the node answered: it has the block, but has not confirmed it yet",
@@ -1388,9 +1396,11 @@ def distinct_endpoints(rpc_urls, agree: int = AGREE_DEFAULT) -> tuple[str, ...]:
 # an error envelope with no `confirmed`, which `verify` refuses by design rather
 # than read as settled or unsettled. KeyError is kept because
 # `balance_corroborated` below still reads a balance reply directly, and
-# TypeError for a reply whose fields are the wrong type. All of them mean the
-# same thing here: this endpoint told us nothing, ask the next one.
-_UNREADABLE = (OSError, ValueError, KeyError, TypeError)
+# TypeError for a reply whose fields are the wrong type. http.client.HTTPException
+# is a body cut short (IncompleteRead) or a status line that is not HTTP: it is
+# not an OSError, and it is still no answer. All of them mean the same thing
+# here: this endpoint told us nothing, ask the next one.
+_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException)
 
 
 def post_json_failover(rpc_urls, payload: dict):
@@ -1517,19 +1527,76 @@ def _unbound(reply: dict, contents: dict, paid: str) -> str | None:
 _NO_PREVIOUS = "0" * 64
 
 
-def _hashed_balance(contents: dict) -> int | None:
+# The live network's genesis block: a legacy open whose hash is fixed by the
+# protocol, and which opens the genesis account with the whole supply. It is the
+# one legacy open, receive or change block whose balance is known without a
+# node's word, so a send whose previous block it is can still be bound.
+_GENESIS_OPEN_HASH = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948"
+_GENESIS_BALANCE = 2**128 - 1
+
+_LEGACY_HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
+
+# The fields a legacy open, receive or change block hashes, in order, and how
+# each one is read into bytes: a block hash (64 hex characters) or an account.
+_LEGACY_UNSENT = {
+    "open": (("source", "hash"), ("representative", "account"), ("account", "account")),
+    "receive": (("previous", "hash"), ("source", "hash")),
+    "change": (("previous", "hash"), ("representative", "account")),
+}
+
+
+def _legacy_hash_of(contents: object) -> str | None:
+    """The hash of a legacy open, receive or change block, recomputed, or None.
+
+    blake2b-256 of the fields `_LEGACY_UNSENT` lists. `five_fields.block_hash_of`
+    does not hash these kinds - none of them is a send - but the block BEFORE a
+    send can be one, and it must still be told apart from a forgery: a block
+    whose contents recompute to `previous` is that block, whatever its kind.
+    """
+    if not isinstance(contents, dict) or contents.get("type") not in _LEGACY_UNSENT:
+        return None
+    digest = hashlib.blake2b(digest_size=32)
+    for name, kind in _LEGACY_UNSENT[contents["type"]]:
+        value = contents.get(name)
+        if kind == "hash":
+            if not (isinstance(value, str) and _LEGACY_HEX64.fullmatch(value)):
+                return None
+            digest.update(bytes.fromhex(value))
+        else:
+            key = nano_settlement_verify.public_key_from_address(value)
+            if key is None:
+                return None
+            digest.update(key)
+    return digest.hexdigest().upper()
+
+
+def _hashed_balance(contents: dict, hashed_as: str | None = None) -> int | None:
     """The balance a block's hashed contents leave its chain with, in raw, or None.
 
-    Called only on contents `block_hash_of` has hashed, so the field already
-    parses: a state block hashes `balance` as a decimal string, a legacy send
-    as 32 hex characters. A legacy receive, open or change block hashes no
-    balance at all, so its balance is only a node's word: None.
+    Called only on contents already hashed to `hashed_as`, so the field parses:
+    a state block hashes `balance` as a decimal string, a legacy send as 32 hex
+    characters. A legacy receive, open or change block hashes no balance at all,
+    so its balance is only a node's word: None - except the genesis open, whose
+    balance is the protocol's whole supply.
     """
     kind, balance = contents.get("type"), contents.get("balance")
     if kind == "state":
         return int(str(balance))
     if kind == "send":
         return int(balance, 16)
+    if kind == "open" and hashed_as == _GENESIS_OPEN_HASH:
+        return _GENESIS_BALANCE
+    return None
+
+
+def _hashed_account(contents: dict) -> str | None:
+    """The account a block's hashed contents name, or None: a state or legacy open's `account`.
+
+    A legacy send, receive or change block does not hash its account (only its
+    signature binds it), so there is none to compare.
+    """
+    if contents.get("type") in ("state", "open"):
+        return contents.get("account")
     return None
 
 
@@ -1540,13 +1607,22 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
     its own word - only the balance after the send is hashed - so it is derived
     here instead: the block before it (`contents.previous`) is asked for from
     the same endpoint, its contents must hash to exactly `contents.previous`,
-    and the amount is that block's hashed balance less this one's. A previous
-    block the endpoint cannot give, whose contents do not hash to `previous`,
-    or that hashes no balance (a legacy receive, open or change block) binds
-    nothing, and the answer is not a witness: it raises `UnboundAnswer` and
-    never falls back to the node's `amount`. A transport failure on that second
-    request propagates as it is (OSError, NotANodeReply) and is recorded
-    "unreadable" in the same way.
+    and the amount is that block's hashed balance less this one's. When both
+    blocks' hashed contents name an account (a state block, a legacy open), it
+    must be the same account: a previous block on another chain is not this
+    send's, and its balance says nothing about what this send moved.
+
+    The previous block may be a legacy open, receive or change block: its hash
+    is recomputed too (`_legacy_hash_of`), so a real one is told apart from a
+    forgery. But such a block hashes no balance, so unless it is the genesis
+    open (whose balance is the protocol's whole supply) the amount cannot be
+    bound from the hash, and the answer says exactly that - a limit of what a
+    hash can prove, not a forgery. A previous block the endpoint cannot give,
+    whose contents do not hash to `previous`, on another chain, or that hashes
+    no balance binds nothing, and the answer is not a witness: it raises
+    `UnboundAnswer` and never falls back to the node's `amount`. A transport
+    failure on that second request propagates as it is (OSError,
+    NotANodeReply) and is recorded "unreadable" in the same way.
     """
     from .five_fields import block_hash_of  # here, not at the top: it imports this module
 
@@ -1559,15 +1635,25 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
             f"the endpoint gave no previous block {previous}, so the amount is only its word"
         )
     before_contents = before_reply.get("contents")
-    if block_hash_of(before_contents) != previous:
+    hashed_as = block_hash_of(before_contents) or _legacy_hash_of(before_contents)
+    if hashed_as != previous:
         raise UnboundAnswer(
             f"the previous block it gave does not hash to {previous}, "
             f"so the amount is only its word"
         )
-    before = _hashed_balance(before_contents)
+    before_account, account = _hashed_account(before_contents), _hashed_account(contents)
+    if (before_account is not None and account is not None
+            and not nano_settlement_verify._same_account(before_account, account)):
+        raise UnboundAnswer(
+            f"the previous block {previous} is on account {before_account!r}, not "
+            f"{account!r}, the account the hashed contents name, so its balance is "
+            f"not this send's"
+        )
+    before = _hashed_balance(before_contents, hashed_as)
     if before is None:
         raise UnboundAnswer(
-            f"the previous block {previous} hashes no balance, so the amount is only its word"
+            f"the previous block {previous} is a legacy {before_contents.get('type')} block, "
+            f"which hashes no balance, so the amount cannot be bound from the hash"
         )
     return before - _hashed_balance(contents)
 
