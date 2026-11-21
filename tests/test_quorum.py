@@ -2821,11 +2821,118 @@ def test_a_send_after_a_legacy_block_is_refused_as_unbindable_not_as_forged(monk
                          (A, before): previous, (B, before): previous})
     with pytest.raises(NotCorroborated) as caught:
         verify_corroborated(asked, ONE_XNO, PAYEE, [A, B])
-    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert {o.error_kind for o in caught.value.observations} == {"UnbindableAmount"}
     why = caught.value.failures[A]
     assert f"is a legacy {kind} block" in why
     assert "amount cannot be bound from the hash" in why
     assert "does not hash" not in why
+
+
+def _send_after_legacy_receive(monkeypatch, not_seen_on=()):
+    """A genuine legacy send after a (non-genesis) legacy receive.
+
+    Served by A and B, except that the endpoints in `not_seen_on` answer that
+    they have no such block; C is wired only when it is one of them.
+    """
+    before_contents, before = _legacy_unsent("receive")
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    previous = {"confirmed": "true", "contents": before_contents}
+    served = {(A, asked): reply, (B, asked): reply, (A, before): previous, (B, before): previous}
+    for url in not_seen_on:
+        served[(url, asked)] = {"error": "Block not found"}
+    _chain(monkeypatch, served)
+    return asked
+
+
+def test_a_send_after_a_legacy_block_is_permanent_and_says_do_not_retry(monkeypatch):
+    """Block 18563C81... settled on its node's word before 2.1.0 and can never
+    settle now: its previous block is fixed by its hash, so asking again cannot
+    help. The refusal says so - `permanent`, no `not_before` - and its message
+    does not claim that nobody answered, since both endpoints answered confirmed."""
+    asked = _send_after_legacy_receive(monkeypatch)
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B], retry_after=30)
+    out = caught.value
+    assert out.permanent is True
+    assert out.not_before is None
+    assert out.witnessless == 2
+    assert out.answered == 0
+    text = str(out)
+    assert "PERMANENT" in text and "do not retry" in text
+    assert "0 of 2 endpoints answered," not in text
+    assert "2 more answered confirmed" in text
+    assert "(permanent: no node can ever bind it, do not retry)" in out.failures[A]
+
+
+def test_one_endpoint_showing_the_legacy_previous_makes_the_unsettled_receipt_permanent(monkeypatch):
+    """With a third endpoint that has not seen the block, enough endpoints answered,
+    so an unsettled Corroboration comes back instead - and it says permanent too."""
+    asked = _send_after_legacy_receive(monkeypatch, not_seen_on=(B, C))
+    out = verify_corroborated(asked, ONE_XNO, PAYEE, [A, B, C], retry_after=30)
+    assert out.receipt.settled is False
+    assert out.permanent is True
+    assert out.not_before is None
+
+
+def test_an_ordinary_not_corroborated_is_not_permanent_and_keeps_its_message(monkeypatch):
+    """The control: endpoints that gave nothing are a retry, as before."""
+    nodes(monkeypatch, {A: OSError("refused"), B: OSError("refused")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=30)
+    assert caught.value.permanent is False
+    assert caught.value.witnessless == 0
+    assert caught.value.not_before is not None
+    assert str(caught.value).startswith("0 of 2 endpoints answered, 2 needed to agree (")
+
+
+def test_a_bindable_refusal_is_not_permanent(monkeypatch):
+    """A previous block that does not hash is a node's fault, not the block's: retry."""
+    before_contents, before = _legacy_unsent("receive")
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    altered = {"confirmed": "true", "contents": {**before_contents, "source": "66" * 32}}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): altered, (B, before): altered})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B])
+    assert caught.value.permanent is False
+    assert caught.value.not_before is not None
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+
+
+def test_a_legacy_open_on_the_genesis_account_that_is_not_the_genesis_open_is_unbindable(monkeypatch):
+    """The genesis exception is matched by the recomputed hash, never by the
+    account: another legacy open naming the genesis account hashes no balance,
+    and taking the whole supply as its balance would bind any amount at all."""
+    import hashlib
+
+    from nano_settlement_verify.five_fields import public_key_from_address
+
+    key = public_key_from_address(GENESIS_ACCOUNT)
+    fake_open = {"type": "open", "source": "44" * 32, "representative": GENESIS_ACCOUNT,
+                 "account": GENESIS_ACCOUNT}
+    before = hashlib.blake2b(bytes.fromhex("44" * 32) + key + key,
+                             digest_size=32).hexdigest().upper()
+    assert before != GENESIS_OPEN_HASH
+    balance = 5
+    claimed = 2**128 - 1 - balance
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(balance, "032X")}
+    reply = {"block_account": GENESIS_ACCOUNT, "amount": str(claimed), "height": "2",
+             "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    previous = {"block_account": GENESIS_ACCOUNT, "confirmed": "true", "contents": fake_open}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): previous, (B, before): previous})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, claimed, PAYEE, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnbindableAmount"}
+    assert "is a legacy open block" in caught.value.failures[A]
 
 
 def test_a_legacy_previous_block_that_does_not_hash_is_still_refused_as_not_hashing(monkeypatch):
@@ -2873,6 +2980,106 @@ def test_a_previous_block_on_another_account_is_not_this_sends_balance(monkeypat
     assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
     assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
     assert "is on account" in caught.value.failures[A]
+
+
+def _ed_keypair(seed: bytes):
+    """A test-only ed25519/blake2b key (it holds nothing): (scalar, prefix, public key)."""
+    import hashlib
+
+    from nano_settlement_verify import offline as off
+
+    d = hashlib.blake2b(seed, digest_size=64).digest()
+    a = int.from_bytes(d[:32], "little")
+    a = (a & ((1 << 254) - 8)) | (1 << 254)
+    x, y, z, _ = off._mul(a, off._BASE)
+    zi = pow(z, off.P - 2, off.P)
+    x, y = x * zi % off.P, y * zi % off.P
+    return a, d[32:], (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_sign(seed: bytes, block_hash: str) -> str:
+    """The signature of `block_hash` by the test key `seed`, as Nano block contents carry it."""
+    import hashlib
+
+    from nano_settlement_verify import offline as off
+
+    def h(*parts):
+        return int.from_bytes(hashlib.blake2b(b"".join(parts), digest_size=64).digest(), "little")
+
+    a, prefix, pub = _ed_keypair(seed)
+    msg = bytes.fromhex(block_hash)
+    r = h(prefix, msg) % off.L
+    x, y, z, _ = off._mul(r, off._BASE)
+    zi = pow(z, off.P - 2, off.P)
+    x, y = x * zi % off.P, y * zi % off.P
+    big_r = (y | ((x & 1) << 255)).to_bytes(32, "little")
+    s = (r + h(big_r, pub, msg) % off.L * a) % off.L
+    return (big_r + s.to_bytes(32, "little")).hex().upper()
+
+
+def _state_send_after_legacy_send(monkeypatch, signer_seed, sign=True):
+    """A state send on chain X whose previous block is a legacy send signed by `signer_seed`.
+
+    X is the key of seed b"chain X". The legacy send leaves 6 XNO, the state
+    send 5, so the hashed balances move exactly the 1 XNO both nodes claim,
+    whichever chain the legacy send is on.
+    """
+    from nano_settlement_verify.five_fields import block_hash_of
+
+    payer = _key_address(_ed_keypair(b"chain X")[2])
+    legacy = {"type": "send", "previous": "77" * 32,
+              "destination": _key_address(bytes.fromhex("EE" * 32)),
+              "balance": format(6 * ONE_XNO, "032X")}
+    before = block_hash_of(legacy)
+    if sign:
+        legacy["signature"] = _ed_sign(signer_seed, before)
+    contents = {
+        "type": "state",
+        "account": payer,
+        "previous": before,
+        "representative": payer,
+        "balance": str(5 * ONE_XNO),
+        "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
+        "link_as_account": HOLDER,
+    }
+    reply = {"block_account": payer, "amount": str(ONE_XNO), "height": "7",
+             "confirmed": "true", "subtype": "send", "contents": contents}
+    asked = block_hash_of(contents)
+    # The nodes say the legacy send is on X: that is only their word.
+    previous = {"block_account": payer, "confirmed": "true", "contents": legacy}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): previous, (B, before): previous})
+    return asked
+
+
+def test_a_state_send_after_a_legacy_send_on_another_chain_does_not_settle(monkeypatch):
+    """Forgery: a state send on chain X whose `previous` is a legacy send on chain
+    Y. A legacy send hashes no account, so the hashed-account comparison has
+    nothing to compare; the nodes call it X's. Its signature is Y's, so its
+    balance is not X's and nothing is bound."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain Y")
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert "hashes no account" in caught.value.failures[A]
+    assert caught.value.permanent is False
+
+
+def test_a_state_send_after_an_unsigned_legacy_send_does_not_settle(monkeypatch):
+    """With no signature, the legacy send's chain is only the node's word: refused."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain X", sign=False)
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert "hashes no account" in caught.value.failures[A]
+
+
+def test_a_state_send_after_its_own_chains_legacy_send_settles(monkeypatch):
+    """The control: the first state block after an account's last legacy send,
+    signed by that account's own key, binds its amount and settles."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain X")
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == ONE_XNO
 
 
 @pytest.mark.parametrize("error", [

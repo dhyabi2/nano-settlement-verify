@@ -54,6 +54,7 @@ __all__ = [
     "STOP_REASONS",
     "STOP_REASONS_SHA256",
     "Stop",
+    "UnbindableAmount",
     "UnboundAnswer",
     "UnhashableContents",
     "balance_corroborated",
@@ -72,29 +73,78 @@ __all__ = [
 AGREE_DEFAULT = 2
 
 
-class NotCorroborated(Exception):
-    """Too few endpoints answered to decide anything. NOTHING was checked.
+# The error kinds of an endpoint that answered "confirmed" but is no witness:
+# it is recorded "unreadable", yet it did answer. `UnbindableAmount` is the one
+# that is permanent - see `NotCorroborated.permanent`.
+_NO_WITNESS_KINDS = ("UnhashableContents", "UnboundAnswer", "UnbindableAmount")
+_PERMANENT_KIND = "UnbindableAmount"
 
-    This is the multi-endpoint form of `verify`'s transport errors, and it means
-    the same thing: not "the payment is bad" but "we could not look". A seller
-    that refuses a call on this has refused a call the buyer may well have paid
-    for, and XNO does not come back. Hold the call and ask again.
+
+def _is_permanent(observations) -> bool:
+    """Whether any endpoint showed the block can never be bound (`UnbindableAmount`)."""
+    return any(getattr(seen, "error_kind", "") == _PERMANENT_KIND for seen in observations)
+
+
+class NotCorroborated(Exception):
+    """Too few endpoints gave a usable answer to decide anything.
+
+    This is the multi-endpoint form of `verify`'s transport errors, and in the
+    usual case it means the same thing: not "the payment is bad" but "we could
+    not look". A seller that refuses a call on this has refused a call the buyer
+    may well have paid for, and XNO does not come back. Hold the call and ask
+    again - unless `permanent` is True.
+
+    "Unreadable" is not always silence. An endpoint that answered "confirmed"
+    with contents that cannot be tied to the block (error kinds
+    `UnhashableContents`, `UnboundAnswer`, `UnbindableAmount`) did answer, and
+    is counted in `witnessless`, not in `answered`; the message says so.
+
+    `permanent` is True when an endpoint showed, from contents that hash to the
+    block, that the block's previous block is a legacy open, receive or change
+    block that hashes no balance (`UnbindableAmount`). A block's previous is
+    fixed by its hash, so no endpoint, now or later, can bind that send's
+    amount: asking again can never settle it. Do not retry a permanent
+    `NotCorroborated`; `not_before` is then None. Check such a payment some
+    other way, or not at all.
     """
 
     def __init__(self, answered: int, agree: int, failures: dict, observations=()) -> None:
+        observations = tuple(observations)
         detail = "; ".join(f"{url}: {why}" for url, why in failures.items())
-        super().__init__(
-            f"{answered} of {answered + len(failures)} endpoints answered, "
-            f"{agree} needed to agree ({detail})"
+        witnessless = sum(
+            1 for seen in observations
+            if getattr(seen, "state", "") == "unreadable"
+            and getattr(seen, "error_kind", "") in _NO_WITNESS_KINDS
         )
+        permanent = _is_permanent(observations)
+        asked = answered + len(failures)
+        if witnessless:
+            head = (
+                f"{answered} of {asked} endpoints answered as a witness "
+                f"({witnessless} more answered confirmed, but could not be tied to the block), "
+                f"{agree} needed to agree"
+            )
+        else:
+            head = f"{answered} of {asked} endpoints answered, {agree} needed to agree"
+        if permanent:
+            head += (
+                "; PERMANENT: the block's previous block is a legacy block that hashes no "
+                "balance, so its amount can never be bound - do not retry"
+            )
+        super().__init__(f"{head} ({detail})")
         self.answered = answered
         self.agree = agree
         self.failures = dict(failures)
         # One `Observation` per endpoint asked, in the order asked. Empty when
         # the caller is not `verify_corroborated` (failover, balances).
-        self.observations = tuple(observations)
+        self.observations = observations
+        # Endpoints that answered "confirmed" but are no witness, and whether
+        # asking again can ever settle the block (see the class docstring).
+        self.witnessless = witnessless
+        self.permanent = permanent
         # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None,
-        # and when to ask again: `stop.at` plus the call's `retry_after`.
+        # and when to ask again: `stop.at` plus the call's `retry_after` - None
+        # when `permanent`, since asking again cannot help.
         self.stop = None
         self.not_before = None
 
@@ -1232,11 +1282,23 @@ class Corroboration:
         (`verify_corroborated(retry_after=...)`, default 0). This module knows
         nothing about when a node will confirm a block, so with the default the
         earliest time is simply when this check stopped; any longer wait is the
-        caller's, stated in the record as "retry_after_s".
+        caller's, stated in the record as "retry_after_s". None, too, when
+        `permanent`: asking again cannot settle the block.
         """
-        if self.receipt.settled or self.stop is None:
+        if self.receipt.settled or self.stop is None or self.permanent:
             return None
         return _not_before(self.stop.at, self.retry_after)
+
+    @property
+    def permanent(self) -> bool:
+        """Whether asking again can never settle this block, as for `NotCorroborated.permanent`.
+
+        True only for an unsettled receipt with an observation of error kind
+        `UnbindableAmount`: an endpoint showed, from contents that hash to the
+        block, that its previous block is a legacy block hashing no balance.
+        Do not wait and ask again on such a receipt.
+        """
+        return not self.receipt.settled and _is_permanent(self.observations)
 
     def _identity(self) -> tuple:
         return (
@@ -1483,6 +1545,20 @@ class UnboundAnswer(ValueError):
     """
 
 
+class UnbindableAmount(UnboundAnswer):
+    """A confirmed answer that can NEVER be bound: its previous block hashes no balance.
+
+    The contents hash to the block asked for, and the block before it hashes
+    to the contents' `previous`, so both are genuine - but that block is a
+    legacy open, receive or change block (not the genesis open), which hashes
+    no balance. A block's `previous` is fixed by its hash, so this is true of
+    the block itself, not of one node: no endpoint, now or later, can give an
+    amount bound to hashes. It is an `UnboundAnswer` (and so a `ValueError`,
+    recorded "unreadable"), and it makes `NotCorroborated.permanent` and
+    `Corroboration.permanent` True: do not retry such a block.
+    """
+
+
 def _unbound(reply: dict, contents: dict, paid: str) -> str | None:
     """Why `reply`'s reading of its hashed `contents` is not those contents, or None.
 
@@ -1610,17 +1686,25 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
     and the amount is that block's hashed balance less this one's. When both
     blocks' hashed contents name an account (a state block, a legacy open), it
     must be the same account: a previous block on another chain is not this
-    send's, and its balance says nothing about what this send moved.
+    send's, and its balance says nothing about what this send moved. When this
+    send is a state block and the previous block is a legacy send, which
+    hashes no account, the previous block's signature must verify under this
+    send's hashed `account` (`offline.verify_block_signature`); a missing or
+    other signature binds nothing. A legacy send after a legacy send names no
+    hashed account on either side, so no chain is compared.
 
     The previous block may be a legacy open, receive or change block: its hash
     is recomputed too (`_legacy_hash_of`), so a real one is told apart from a
     forgery. But such a block hashes no balance, so unless it is the genesis
-    open (whose balance is the protocol's whole supply) the amount cannot be
-    bound from the hash, and the answer says exactly that - a limit of what a
-    hash can prove, not a forgery. A previous block the endpoint cannot give,
+    open (whose balance is the protocol's whole supply, and which is matched by
+    its recomputed hash, never by its account) the amount cannot be bound from
+    the hash, and the answer says exactly that, as `UnbindableAmount` - a limit
+    of what a hash can prove, not a forgery, and a permanent one: the previous
+    block is fixed by the send's hash. A previous block the endpoint cannot give,
     whose contents do not hash to `previous`, on another chain, or that hashes
     no balance binds nothing, and the answer is not a witness: it raises
-    `UnboundAnswer` and never falls back to the node's `amount`. A transport
+    `UnboundAnswer` (or its subclass `UnbindableAmount`) and never falls back
+    to the node's `amount`. A transport
     failure on that second request propagates as it is (OSError,
     NotANodeReply) and is recorded "unreadable" in the same way.
     """
@@ -1641,19 +1725,37 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
             f"the previous block it gave does not hash to {previous}, "
             f"so the amount is only its word"
         )
+    before = _hashed_balance(before_contents, hashed_as)
+    if before is None:
+        # Checked before the account: the previous block's kind is fixed by
+        # the hash, so this is permanent for the block, whoever is asked.
+        raise UnbindableAmount(
+            f"the previous block {previous} is a legacy {before_contents.get('type')} block, "
+            f"which hashes no balance, so the amount cannot be bound from the hash "
+            f"(permanent: no node can ever bind it, do not retry)"
+        )
     before_account, account = _hashed_account(before_contents), _hashed_account(contents)
-    if (before_account is not None and account is not None
+    if account is not None and before_account is None:
+        # A state send after a legacy send: the legacy send hashes no account,
+        # so the node's `block_account` for it would be only its word. Its
+        # chain is bound instead by its signature - made by the account's own
+        # key over `previous`, already recomputed - checked against the
+        # send's hashed `account`.
+        from .offline import verify_block_signature  # here, not at the top: it imports five_fields
+
+        if not verify_block_signature(before_contents, before_contents.get("signature"),
+                                      account=account):
+            raise UnboundAnswer(
+                f"the previous block {previous} is a legacy send, which hashes no account, "
+                f"and its signature does not show it is on {account!r}, the account the "
+                f"hashed contents name, so its balance is not bound to this send"
+            )
+    elif (before_account is not None and account is not None
             and not nano_settlement_verify._same_account(before_account, account)):
         raise UnboundAnswer(
             f"the previous block {previous} is on account {before_account!r}, not "
             f"{account!r}, the account the hashed contents name, so its balance is "
             f"not this send's"
-        )
-    before = _hashed_balance(before_contents, hashed_as)
-    if before is None:
-        raise UnboundAnswer(
-            f"the previous block {previous} is a legacy {before_contents.get('type')} block, "
-            f"which hashes no balance, so the amount cannot be bound from the hash"
         )
     return before - _hashed_balance(contents)
 
@@ -1798,8 +1900,11 @@ def verify_corroborated(
         so this is not something a later endpoint can overturn.
       `Disagreement` - two endpoints each reported a confirmed send, and their
         receipts differ. Impossible between honest nodes; nothing is served.
-      `NotCorroborated` - fewer than `agree` endpoints answered at all. Nothing
-        was checked; hold the call and ask again rather than refuse it.
+      `NotCorroborated` - fewer than `agree` endpoints gave a usable answer.
+        Usually nothing could be checked; hold the call and ask again rather
+        than refuse it. When its `permanent` is True (an endpoint showed the
+        send's previous block is a legacy block that hashes no balance,
+        `UnbindableAmount`), asking again can never settle it: do not retry.
       `TypeError` - `expect_raw` is not an int, the same refusal `verify` makes,
         made here before any endpoint is called.
     """
@@ -2007,7 +2112,7 @@ def verify_corroborated(
             answered=len(answered), agree=agree, failures=failures, observations=observations
         )
         short.stop = stopped("exhausted")
-        short.not_before = _not_before(short.stop.at, retry_after)
+        short.not_before = None if short.permanent else _not_before(short.stop.at, retry_after)
         raise short
 
     # Enough endpoints answered, but fewer than `agree` of them reported the

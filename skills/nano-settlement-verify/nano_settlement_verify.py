@@ -38,7 +38,7 @@ __all__ = [
 ]
 
 # The distribution's version (pyproject.toml says the same).
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 # Seconds to wait on the node before giving up. Verification sits on a seller's
 # request path; an unbounded wait there is an outage, not patience.
