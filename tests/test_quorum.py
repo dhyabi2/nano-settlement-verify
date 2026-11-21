@@ -8,6 +8,7 @@ what is REFUSED - a duplicate endpoint, a contradiction, a silence mistaken for
 a "no" - rather than about the happy path.
 """
 
+import http.client
 import json
 import pathlib
 from collections.abc import Mapping
@@ -33,7 +34,12 @@ B = "http://127.0.0.1:7072"
 C = "http://127.0.0.1:7073"
 
 HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
-PAYEE = "nano_1payee"
+from nano_settlement_verify.five_fields import _address_of_key as _key_address  # noqa: E402
+
+# A real address: the account whose public key is send_block()'s `link`, so the
+# payee a reply names is the payee its hashed contents pay.
+_PAYEE_KEY = bytes.fromhex("AB" * 32)
+PAYEE = _key_address(_PAYEE_KEY)
 # balance_corroborated checks the address before any call, so it needs a real one.
 HOLDER = "nano_3pmhddz8g4gxhcqwxw68paibs89wb1o7bqgc6twyfkz1a37puf88pa9stsp8"
 ONE_XNO = 10**30
@@ -47,15 +53,90 @@ def no_sockets(monkeypatch):
     monkeypatch.setattr(nano_settlement_verify.urllib.request, "urlopen", refuse)
 
 
+# The block before each send a fixture builds, by hash, as every endpoint serves
+# it when asked: `verify_corroborated` derives a send's amount from the hashed
+# balance of the block before it less the send's own, so each send's `previous`
+# must be a block whose complete contents hash to it.
+PREVIOUS = {}
+
+
+def _previous_of(account, balance_raw, seed="11" * 32):
+    """Register the state block before a send, leaving `account` with `balance_raw`; its hash.
+
+    `seed` is that block's own `previous`, so two seeds give two different
+    blocks (and so two different sends after them).
+    """
+    from nano_settlement_verify.five_fields import block_hash_of
+
+    contents = {
+        "type": "state",
+        "account": account,
+        "previous": seed,
+        "representative": account,
+        "balance": str(balance_raw),
+        "link": "00" * 32,
+    }
+    hashed = block_hash_of(contents)
+    PREVIOUS[hashed] = {"confirmed": "true", "subtype": "change", "contents": contents}
+    return hashed
+
+
+def _legacy_previous_of(balance_raw, seed="11" * 32):
+    """Register the legacy send before a legacy send, leaving `balance_raw`; its hash."""
+    from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
+
+    contents = {
+        "type": "send",
+        "previous": seed,
+        "destination": _address_of_key(bytes.fromhex("EE" * 32)),
+        "balance": format(balance_raw, "032X"),
+    }
+    hashed = block_hash_of(contents)
+    PREVIOUS[hashed] = {"confirmed": "true", "contents": contents}
+    return hashed
+
+
+def _send_contents(payee=PAYEE):
+    """Complete state-block contents, so the block hash can be recomputed from them.
+
+    The hash covers `link` (PAYEE's key), not `link_as_account`, so `payee`
+    changes what the node says the block pays without changing which block it
+    is. Any `payee` but PAYEE is a reply contradicting its own hashed contents:
+    it is refused as a `Mismatch` (it names another payee) before the hash is
+    read.
+    """
+    from nano_settlement_verify.five_fields import _address_of_key
+
+    sender = _address_of_key(bytes(range(1, 33)))
+    return {
+        "type": "state",
+        "account": sender,
+        "previous": _previous_of(sender, 6 * ONE_XNO),
+        "representative": sender,
+        "balance": str(5 * ONE_XNO),
+        "link": _PAYEE_KEY.hex().upper(),
+        "link_as_account": payee,
+    }
+
+
 def send_block(amount=ONE_XNO, payee=PAYEE, height=7, confirmed="true"):
-    """A node's block_info reply for a confirmed send of `amount` to `payee`."""
+    """A node's block_info reply for a confirmed send of `amount` to `payee`.
+
+    Its contents are complete and hash to HASH, as a real node's json_block does.
+    """
     return {
         "amount": str(amount),
         "height": str(height),
         "confirmed": confirmed,
         "subtype": "send",
-        "contents": {"link_as_account": payee},
+        "contents": _send_contents(payee),
     }
+
+
+from nano_settlement_verify.five_fields import block_hash_of as _block_hash_of  # noqa: E402
+
+# The block every send_block() reply describes.
+HASH = _block_hash_of(_send_contents())
 
 
 def nodes(monkeypatch, replies):
@@ -65,10 +146,17 @@ def nodes(monkeypatch, replies):
     the map is an endpoint the test did not expect to be called at all, and
     calling it fails the test - which is how "stops asking once it has agreement"
     is proved rather than asserted.
+
+    `called` lists the requests for the block asked about. The request an
+    answer leads to for the block before it (a hash in PREVIOUS, the amount's
+    binding) is answered from PREVIOUS, by an endpoint already wired, and is
+    not listed.
     """
     called = []
 
     def post_json(rpc_url, payload):
+        if rpc_url in replies and payload.get("hash") in PREVIOUS:
+            return PREVIOUS[payload["hash"]]
         called.append(rpc_url)
         if rpc_url not in replies:
             raise AssertionError(f"unexpected call to {rpc_url}")
@@ -1011,6 +1099,8 @@ def state_send(previous="11" * 32, payer_key=bytes(range(1, 33)), height=7, bloc
 
     Its contents are complete, so `nano_five_fields.block_hash_of` recomputes the
     block's hash from them. Returns (reply, the hash its contents hash to).
+    `previous` is the `previous` of the block before it (registered in
+    PREVIOUS, 6 XNO), so two values give two different sends of ONE_XNO.
     """
     from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
 
@@ -1018,7 +1108,7 @@ def state_send(previous="11" * 32, payer_key=bytes(range(1, 33)), height=7, bloc
     contents = {
         "type": "state",
         "account": payer,
-        "previous": previous,
+        "previous": _previous_of(payer, 6 * ONE_XNO, seed=previous),
         "representative": payer,
         "balance": str(5 * ONE_XNO),
         "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
@@ -1086,18 +1176,199 @@ def test_the_requested_hash_is_compared_whatever_its_letter_case(monkeypatch):
     assert verify_corroborated(asked.lower(), ONE_XNO, HOLDER, [A, B]).receipt.settled is True
 
 
-def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):
-    """Same amount, payee and height, but the nodes name different chains the block
-    sits on: two different blocks, so not one payment seen twice."""
+def sparse_send(reply):
+    """`reply` with its contents cut to what cannot be hashed: payee only."""
+    return {**reply, "contents": {"link_as_account": reply["contents"]["link_as_account"]}}
+
+
+def test_answers_too_sparse_to_hash_are_not_witnesses_and_cannot_settle(monkeypatch):
+    """rossum's report. Two nodes answer `confirmed` with the right amount, payee and
+    height, but contents too sparse to recompute a block hash from. Nothing ties
+    their answers to the block asked for, so neither counts as an agreeing witness:
+    the check could not look, and nothing is served."""
+    reply, asked = state_send()
+    sparse = sparse_send(reply)
+    nodes(monkeypatch, {A: sparse, B: sparse})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
+    assert {o.error_kind for o in caught.value.observations} == {"UnhashableContents"}
+    assert set(caught.value.failures) == {A, B}
+
+
+def test_a_sparse_answer_does_not_help_one_full_answer_settle(monkeypatch):
+    """One honest full answer plus one sparse one is one witness, not two; a third
+    full answer then completes the quorum."""
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: sparse_send(reply), B: reply, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C])
+    assert out.receipt.settled is True
+    assert out.agreed == (B, C)
+    assert out.failed == (A,)
+
+
+# --- an answer is bound to its hashed contents, not only to their hash ----------------
+#
+# The block hash covers `link`/`destination` and `account`, not a node's rendering
+# of them. Two colluding nodes that return the REAL contents of a real block H -
+# so the hash check passes - but render another payee, operation or payer chain
+# must not settle H as a payment it is not. Each forgery below is replayed by
+# both nodes of a two-node quorum; none settles, and each is "unreadable" with
+# error kind "UnboundAnswer", not a witness.
+
+_STRANGER_KEY = bytes(range(40, 72))
+
+
+def _expect_not_a_witness(monkeypatch, forged, asked):
+    nodes(monkeypatch, {A: forged, B: forged})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert set(caught.value.failures) == {A, B}
+    return caught.value
+
+
+@pytest.mark.parametrize("where", ["contents", "top-level"])
+def test_a_state_send_to_someone_else_rendered_as_paying_the_seller_does_not_settle(
+    monkeypatch, where
+):
+    """Forgery 1. H is a real state send whose `link` pays a stranger; the nodes
+    render `link_as_account` as the seller. The hash is H's, the payee is not."""
+    from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
+
+    reply, _ = state_send()
+    contents = dict(reply["contents"])
+    contents["link"] = _STRANGER_KEY.hex().upper()
+    contents["link_as_account"] = _address_of_key(_STRANGER_KEY)
+    asked = block_hash_of(contents)
+    if where == "contents":
+        contents["link_as_account"] = HOLDER
+        forged = {**reply, "contents": contents}
+    else:
+        del contents["link_as_account"]
+        forged = {**reply, "contents": contents, "link_as_account": HOLDER}
+    assert block_hash_of(forged["contents"]) == asked
+    raised = _expect_not_a_witness(monkeypatch, forged, asked)
+    assert "hashed contents pay" in raised.failures[A]
+
+
+def test_a_legacy_send_with_an_extra_link_as_account_does_not_settle(monkeypatch):
+    """Forgery 2. H is a real legacy send to a stranger (`destination` is hashed);
+    the nodes add a `link_as_account` naming the seller, which a legacy block does
+    not have and the hash does not cover, and which is read before `destination`."""
+    from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
+
+    contents = {
+        "type": "send",
+        "previous": "11" * 32,
+        "destination": _address_of_key(_STRANGER_KEY),
+        "balance": "0" * 31 + "5",
+    }
+    asked = block_hash_of(contents)
+    forged = {
+        "amount": str(ONE_XNO),
+        "height": "7",
+        "confirmed": "true",
+        "contents": {**contents, "link_as_account": HOLDER},
+    }
+    assert block_hash_of(forged["contents"]) == asked
+    _expect_not_a_witness(monkeypatch, forged, asked)
+
+
+def test_a_receive_passed_off_as_a_send_does_not_settle(monkeypatch):
+    """Forgery 3. H is a real state RECEIVE on the seller's own chain: its `link`
+    is the source block's hash. The nodes call it a send and render its payee as
+    the seller. The hashed `link`, read as an account, is no seller's address."""
+    from nano_settlement_verify.five_fields import block_hash_of
+
+    contents = {
+        "type": "state",
+        "account": HOLDER,
+        "previous": "11" * 32,
+        "representative": HOLDER,
+        "balance": str(6 * ONE_XNO),
+        "link": "CD" * 32,  # the source send's hash, not a public key
+        "link_as_account": HOLDER,
+    }
+    asked = block_hash_of(contents)
+    forged = {
+        "block_account": HOLDER,
+        "amount": str(ONE_XNO),
+        "height": "7",
+        "confirmed": "true",
+        "subtype": "send",
+        "contents": contents,
+    }
+    _expect_not_a_witness(monkeypatch, forged, asked)
+
+
+def test_a_forged_block_account_on_a_state_send_is_not_a_witness(monkeypatch):
+    """Forgery 4. H is a real state send to the seller, but the nodes name another
+    chain as `block_account` than the `account` H's contents hash: the payer they
+    assert is not H's payer, so the answer is not one."""
     from nano_settlement_verify.five_fields import _address_of_key
 
-    one = send_block()
+    reply, asked = state_send()
+    forged = {**reply, "block_account": _address_of_key(_STRANGER_KEY)}
+    raised = _expect_not_a_witness(monkeypatch, forged, asked)
+    assert "block_account" in raised.failures[A]
+
+    # One forged answer beside two honest ones is not counted; the honest pair settles.
+    nodes(monkeypatch, {A: forged, B: reply, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C])
+    assert out.receipt.settled is True
+    assert out.agreed == (B, C)
+    assert out.failed == (A,)
+
+
+def test_a_state_reply_whose_block_account_is_the_hashed_account_still_settles(monkeypatch):
+    """The control for forgery 4: either spelling of the hashed account is that account."""
+    reply, asked = state_send()
+    xrb = {**reply, "block_account": "xrb_" + reply["block_account"][len("nano_"):]}
+    nodes(monkeypatch, {A: reply, B: xrb})
+    assert verify_corroborated(asked, ONE_XNO, HOLDER, [A, B]).receipt.settled is True
+
+
+def legacy_send_block(height=7):
+    """A node's block_info reply for a confirmed legacy (pre-state) send to PAYEE.
+
+    A legacy send hashes only `previous`, `destination` and `balance`: the chain
+    it sits on is not in the hash, so `block_account` is the node's word, and two
+    nodes naming different chains for one LEGACY_HASH is still a contradiction
+    the quorum must catch. (A state block hashes its `account`, so there a
+    `block_account` naming another chain is not a witness at all.)
+    """
+    return {
+        "amount": str(ONE_XNO),
+        "height": str(height),
+        "confirmed": "true",
+        "contents": {
+            "type": "send",
+            # The legacy send before it left ONE_XNO + 5 raw; this one leaves 5.
+            "previous": _legacy_previous_of(ONE_XNO + 5),
+            "destination": PAYEE,
+            "balance": "0" * 31 + "5",
+        },
+    }
+
+
+LEGACY_HASH = _block_hash_of(legacy_send_block()["contents"])
+
+
+def test_two_confirmed_sends_on_different_payer_chains_disagree(monkeypatch):
+    """Same amount, payee and height, but the nodes name different chains the block
+    sits on: two different blocks, so not one payment seen twice. (Legacy sends:
+    their chain is not hashed, so only the comparison can catch this.)"""
+    from nano_settlement_verify.five_fields import _address_of_key
+
+    one = legacy_send_block()
     one["block_account"] = _address_of_key(bytes(range(1, 33)))
-    two = send_block()
+    two = legacy_send_block()
     two["block_account"] = _address_of_key(bytes(range(2, 34)))
     nodes(monkeypatch, {A: one, B: two})
     with pytest.raises(Disagreement):
-        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+        verify_corroborated(LEGACY_HASH, ONE_XNO, PAYEE, [A, B])
 
 
 def test_both_spellings_of_one_payer_chain_still_agree(monkeypatch):
@@ -1122,13 +1393,13 @@ def test_a_payer_chain_disagreement_names_each_nodes_own_chain(monkeypatch):
 
     first = _address_of_key(bytes(range(1, 33)))
     second = _address_of_key(bytes(range(2, 34)))
-    one = send_block()
+    one = legacy_send_block()
     one["block_account"] = first
-    two = send_block()
+    two = legacy_send_block()
     two["block_account"] = "xrb_" + second[len("nano_"):]
     nodes(monkeypatch, {A: one, B: two})
     with pytest.raises(Disagreement) as raised:
-        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+        verify_corroborated(LEGACY_HASH, ONE_XNO, PAYEE, [A, B])
     seen = {o.rpc_url: o for o in raised.value.node_observations}
     assert seen[A].state == seen[B].state == "confirmed"
     assert seen[A].payer_account == first
@@ -1317,13 +1588,13 @@ def test_a_node_naming_no_payer_does_not_bridge_two_different_payers(monkeypatch
     so X and Y are still compared, and differ."""
     from nano_settlement_verify.five_fields import _address_of_key
 
-    one = send_block()
+    one = legacy_send_block()
     one["block_account"] = _address_of_key(bytes(range(1, 33)))
-    two = send_block()
+    two = legacy_send_block()
     two["block_account"] = _address_of_key(bytes(range(2, 34)))
-    nodes(monkeypatch, {A: one, B: send_block(), C: two})
+    nodes(monkeypatch, {A: one, B: legacy_send_block(), C: two})
     with pytest.raises(Disagreement) as caught:
-        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
+        verify_corroborated(LEGACY_HASH, ONE_XNO, PAYEE, [A, B, C], agree=3)
     assert set(caught.value.answers) == {A, C}
 
 
@@ -2310,3 +2581,516 @@ def test_a_retry_delay_that_is_not_a_time_is_refused_before_any_call(monkeypatch
     # "seconds" is in both refusals, and not in Python's own "unexpected keyword" error.
     with pytest.raises(error, match="retry_after must be a .*seconds"):
         verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=delay)
+
+
+# --- the amount is the hashed balances' difference, not a node's word ------------------
+
+
+def _send_after(previous_contents, balance_raw, amount_raw):
+    """A confirmed state send to HOLDER after `previous_contents`, leaving `balance_raw`.
+
+    The node says it moved `amount_raw`. Returns (reply, its hash, the hash of
+    the block before it). Nothing is registered in PREVIOUS: the endpoints of
+    these tests serve the block before it themselves, honestly or not.
+    """
+    from nano_settlement_verify.five_fields import block_hash_of
+
+    payer = previous_contents["account"]
+    before = block_hash_of(previous_contents)
+    contents = {
+        "type": "state",
+        "account": payer,
+        "previous": before,
+        "representative": payer,
+        "balance": str(balance_raw),
+        "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
+        "link_as_account": HOLDER,
+    }
+    reply = {
+        "block_account": payer,
+        "amount": str(amount_raw),
+        "height": "7",
+        "confirmed": "true",
+        "subtype": "send",
+        "contents": contents,
+    }
+    return reply, block_hash_of(contents), before
+
+
+def _state_block(balance_raw, seed="33" * 32):
+    payer = _key_address(bytes(range(1, 33)))
+    return {
+        "type": "state",
+        "account": payer,
+        "previous": seed,
+        "representative": payer,
+        "balance": str(balance_raw),
+        "link": "00" * 32,
+    }
+
+
+def _chain(monkeypatch, served):
+    """Wire `served[(endpoint, hash)]` as each endpoint's block_info answer; return the asks."""
+    asked = []
+
+    def post_json(rpc_url, payload):
+        asked.append((rpc_url, payload["hash"]))
+        reply = served[(rpc_url, payload["hash"])]
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(nano_settlement_verify, "post_json", post_json)
+    return asked
+
+
+def _forged_previous(kind, previous_contents):
+    """What two colluding nodes serve for the block before the send."""
+    if kind == "the genuine block":
+        return {"confirmed": "true", "subtype": "change", "contents": previous_contents}
+    if kind == "a block that does not hash to previous":
+        # The balance that would make their amount true, on contents that are not the block.
+        return {"confirmed": "true", "subtype": "change",
+                "contents": {**previous_contents, "balance": str(6 * ONE_XNO)}}
+    if kind == "no block":
+        return {"error": "Block not found"}
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", [
+    "the genuine block", "a block that does not hash to previous", "no block",
+])
+def test_two_colluding_nodes_forging_the_amount_do_not_settle(monkeypatch, kind):
+    """The block H really moved 1 raw: the block before it left 5 XNO + 1 raw, H
+    leaves 5 XNO. Two colluding nodes serve H's genuine, hashing contents and its
+    genuine payee, but say it moved ONE_XNO - the amount is not in H's hash, so
+    agreeing on it proved nothing. The amount is the hashed balances' difference:
+    a previous block whose balance does not give ONE_XNO, one that does not hash
+    to H's `previous`, or none at all, leaves the answer no witness, never one
+    settled on the nodes' word."""
+    previous_contents = _state_block(5 * ONE_XNO + 1)
+    forged, asked, before = _send_after(previous_contents, 5 * ONE_XNO, ONE_XNO)
+    previous = _forged_previous(kind, previous_contents)
+    _chain(monkeypatch, {(A, asked): forged, (B, asked): forged,
+                         (A, before): previous, (B, before): previous})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert set(caught.value.failures) == {A, B}
+    if kind == "the genuine block":
+        assert "hashed balances move 1" in caught.value.failures[A]
+
+
+def test_a_genuine_send_with_its_previous_block_settles_for_the_balances_difference(monkeypatch):
+    """The control: the block before H left 5 XNO + 7 raw, H leaves 2 XNO, both
+    nodes say 3 XNO + 7 raw. Each node is asked for H's `previous` itself, after
+    its answer about H, and the receipt is for exactly that difference."""
+    amount = 3 * ONE_XNO + 7
+    previous_contents = _state_block(5 * ONE_XNO + 7)
+    reply, asked, before = _send_after(previous_contents, 2 * ONE_XNO, amount)
+    previous = {"confirmed": "true", "subtype": "change", "contents": previous_contents}
+    calls = _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                                 (A, before): previous, (B, before): previous})
+    out = verify_corroborated(asked, amount, HOLDER, [A, B])
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == amount
+    assert out.agreed == (A, B)
+    assert calls == [(A, asked), (A, before), (B, asked), (B, before)]
+
+
+def test_a_legacy_send_settles_for_the_difference_from_the_legacy_send_before_it(monkeypatch):
+    """The same law for a legacy send: both balances are the hashed 32-hex fields."""
+    reply = legacy_send_block()
+    before = reply["contents"]["previous"]
+    calls = _chain(monkeypatch, {(A, LEGACY_HASH): reply, (B, LEGACY_HASH): reply,
+                                 (A, before): PREVIOUS[before], (B, before): PREVIOUS[before]})
+    out = verify_corroborated(LEGACY_HASH, ONE_XNO, PAYEE, [A, B])
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == ONE_XNO
+    assert calls == [(A, LEGACY_HASH), (A, before), (B, LEGACY_HASH), (B, before)]
+
+
+def test_the_two_new_refusals_are_exported():
+    assert {"UnboundAnswer", "UnhashableContents"} <= set(nano_quorum.__all__)
+
+
+# --- a send after a legacy open, receive or change block -----------------------------
+
+# Live-network blocks, as rpc.nano.to served them (2026-11-21): the genesis open,
+# and the legacy send after it (genesis account, height 2). The genesis open is a
+# legacy block, which hashes no balance; it is the one whose balance is known
+# anyway - the protocol's whole supply - so the send after it can be bound.
+GENESIS_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+GENESIS_OPEN = {
+    "block_account": GENESIS_ACCOUNT,
+    "amount": "340282366920938463463374607431768211455",
+    "height": "1",
+    "confirmed": "true",
+    "contents": {
+        "type": "open",
+        "source": "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA",
+        "representative": GENESIS_ACCOUNT,
+        "account": GENESIS_ACCOUNT,
+    },
+}
+GENESIS_OPEN_HASH = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948"
+SECOND_GENESIS_BLOCK = "A170D51B94E00371ACE76E35AC81DC9405D5D04D4CEBC399AEACE07AE05DD293"
+SECOND_GENESIS_PAYEE = "nano_13ezf4od79h1tgj9aiu4djzcmmguendtjfuhwfukhuucboua8cpoihmh8byo"
+SECOND_GENESIS_AMOUNT = 3271945835778254456378601994536232802
+SECOND_GENESIS_SEND = {
+    "block_account": GENESIS_ACCOUNT,
+    "amount": str(SECOND_GENESIS_AMOUNT),
+    "height": "2",
+    "confirmed": "true",
+    "contents": {
+        "type": "send",
+        "previous": GENESIS_OPEN_HASH,
+        "destination": SECOND_GENESIS_PAYEE,
+        "balance": "FD89D89D89D89D89D89D89D89D89D89D",
+    },
+}
+
+
+def test_the_live_genesis_blocks_hash_to_their_real_hashes():
+    assert nano_quorum._legacy_hash_of(GENESIS_OPEN["contents"]) == GENESIS_OPEN_HASH
+    assert _block_hash_of(SECOND_GENESIS_SEND["contents"]) == SECOND_GENESIS_BLOCK
+
+
+def test_a_real_send_after_the_genesis_open_settles(monkeypatch):
+    """Block A170D51B... settled before sparse answers stopped being witnesses; a
+    send whose previous block is the legacy genesis open must still settle, for
+    the amount the genesis supply less its hashed balance gives."""
+    asked = SECOND_GENESIS_BLOCK
+    _chain(monkeypatch, {(A, asked): SECOND_GENESIS_SEND, (B, asked): SECOND_GENESIS_SEND,
+                         (A, GENESIS_OPEN_HASH): GENESIS_OPEN, (B, GENESIS_OPEN_HASH): GENESIS_OPEN})
+    out = verify_corroborated(asked, SECOND_GENESIS_AMOUNT, SECOND_GENESIS_PAYEE, [A, B])
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == SECOND_GENESIS_AMOUNT
+    assert out.agreed == (A, B)
+
+
+def test_the_genesis_send_claimed_for_another_amount_does_not_settle(monkeypatch):
+    """The control: the genesis balance binds the amount, it does not wave it through."""
+    forged = {**SECOND_GENESIS_SEND, "amount": str(SECOND_GENESIS_AMOUNT + 1)}
+    asked = SECOND_GENESIS_BLOCK
+    _chain(monkeypatch, {(A, asked): forged, (B, asked): forged,
+                         (A, GENESIS_OPEN_HASH): GENESIS_OPEN, (B, GENESIS_OPEN_HASH): GENESIS_OPEN})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, SECOND_GENESIS_AMOUNT + 1, SECOND_GENESIS_PAYEE, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+
+
+def _legacy_unsent(kind):
+    """Contents of a legacy open, receive or change block (not genesis), and its hash.
+
+    The hash is computed here, independently of the library: blake2b-256 of
+    open (source, representative, account), receive (previous, source) or
+    change (previous, representative).
+    """
+    import hashlib
+
+    from nano_settlement_verify.five_fields import _address_of_key
+
+    owner_key = bytes(range(1, 33))
+    owner = _address_of_key(owner_key)
+    contents, parts = {
+        "open": ({"type": "open", "source": "44" * 32, "representative": owner, "account": owner},
+                 (bytes.fromhex("44" * 32), owner_key, owner_key)),
+        "receive": ({"type": "receive", "previous": "55" * 32, "source": "44" * 32},
+                    (bytes.fromhex("55" * 32), bytes.fromhex("44" * 32))),
+        "change": ({"type": "change", "previous": "55" * 32, "representative": owner},
+                   (bytes.fromhex("55" * 32), owner_key)),
+    }[kind]
+    return contents, hashlib.blake2b(b"".join(parts), digest_size=32).hexdigest().upper()
+
+
+@pytest.mark.parametrize("kind", ["open", "receive", "change"])
+def test_a_send_after_a_legacy_block_is_refused_as_unbindable_not_as_forged(monkeypatch, kind):
+    """A genuine legacy send whose previous block is a legacy open, receive or
+    change block: that block hashes, so it is genuine, but it hashes no balance.
+    The amount cannot be bound from the hash, so the answer is no witness - and
+    the reason says so; it does not say the previous block failed to hash."""
+    before_contents, before = _legacy_unsent(kind)
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    previous = {"confirmed": "true", "contents": before_contents}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): previous, (B, before): previous})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnbindableAmount"}
+    why = caught.value.failures[A]
+    assert f"is a legacy {kind} block" in why
+    assert "amount cannot be bound from the hash" in why
+    assert "does not hash" not in why
+
+
+def _send_after_legacy_receive(monkeypatch, not_seen_on=()):
+    """A genuine legacy send after a (non-genesis) legacy receive.
+
+    Served by A and B, except that the endpoints in `not_seen_on` answer that
+    they have no such block; C is wired only when it is one of them.
+    """
+    before_contents, before = _legacy_unsent("receive")
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    previous = {"confirmed": "true", "contents": before_contents}
+    served = {(A, asked): reply, (B, asked): reply, (A, before): previous, (B, before): previous}
+    for url in not_seen_on:
+        served[(url, asked)] = {"error": "Block not found"}
+    _chain(monkeypatch, served)
+    return asked
+
+
+def test_a_send_after_a_legacy_block_is_permanent_and_says_do_not_retry(monkeypatch):
+    """Block 18563C81... settled on its node's word before 2.1.0 and can never
+    settle now: its previous block is fixed by its hash, so asking again cannot
+    help. The refusal says so - `permanent`, no `not_before` - and its message
+    does not claim that nobody answered, since both endpoints answered confirmed."""
+    asked = _send_after_legacy_receive(monkeypatch)
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B], retry_after=30)
+    out = caught.value
+    assert out.permanent is True
+    assert out.not_before is None
+    assert out.witnessless == 2
+    assert out.answered == 0
+    text = str(out)
+    assert "PERMANENT" in text and "do not retry" in text
+    assert "0 of 2 endpoints answered," not in text
+    assert "2 more answered confirmed" in text
+    assert "(permanent: no node can ever bind it, do not retry)" in out.failures[A]
+
+
+def test_one_endpoint_showing_the_legacy_previous_makes_the_unsettled_receipt_permanent(monkeypatch):
+    """With a third endpoint that has not seen the block, enough endpoints answered,
+    so an unsettled Corroboration comes back instead - and it says permanent too."""
+    asked = _send_after_legacy_receive(monkeypatch, not_seen_on=(B, C))
+    out = verify_corroborated(asked, ONE_XNO, PAYEE, [A, B, C], retry_after=30)
+    assert out.receipt.settled is False
+    assert out.permanent is True
+    assert out.not_before is None
+
+
+def test_an_ordinary_not_corroborated_is_not_permanent_and_keeps_its_message(monkeypatch):
+    """The control: endpoints that gave nothing are a retry, as before."""
+    nodes(monkeypatch, {A: OSError("refused"), B: OSError("refused")})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B], retry_after=30)
+    assert caught.value.permanent is False
+    assert caught.value.witnessless == 0
+    assert caught.value.not_before is not None
+    assert str(caught.value).startswith("0 of 2 endpoints answered, 2 needed to agree (")
+
+
+def test_a_bindable_refusal_is_not_permanent(monkeypatch):
+    """A previous block that does not hash is a node's fault, not the block's: retry."""
+    before_contents, before = _legacy_unsent("receive")
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    altered = {"confirmed": "true", "contents": {**before_contents, "source": "66" * 32}}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): altered, (B, before): altered})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B])
+    assert caught.value.permanent is False
+    assert caught.value.not_before is not None
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+
+
+def test_a_legacy_open_on_the_genesis_account_that_is_not_the_genesis_open_is_unbindable(monkeypatch):
+    """The genesis exception is matched by the recomputed hash, never by the
+    account: another legacy open naming the genesis account hashes no balance,
+    and taking the whole supply as its balance would bind any amount at all."""
+    import hashlib
+
+    from nano_settlement_verify.five_fields import public_key_from_address
+
+    key = public_key_from_address(GENESIS_ACCOUNT)
+    fake_open = {"type": "open", "source": "44" * 32, "representative": GENESIS_ACCOUNT,
+                 "account": GENESIS_ACCOUNT}
+    before = hashlib.blake2b(bytes.fromhex("44" * 32) + key + key,
+                             digest_size=32).hexdigest().upper()
+    assert before != GENESIS_OPEN_HASH
+    balance = 5
+    claimed = 2**128 - 1 - balance
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(balance, "032X")}
+    reply = {"block_account": GENESIS_ACCOUNT, "amount": str(claimed), "height": "2",
+             "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    previous = {"block_account": GENESIS_ACCOUNT, "confirmed": "true", "contents": fake_open}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): previous, (B, before): previous})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, claimed, PAYEE, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnbindableAmount"}
+    assert "is a legacy open block" in caught.value.failures[A]
+
+
+def test_a_legacy_previous_block_that_does_not_hash_is_still_refused_as_not_hashing(monkeypatch):
+    """The control: a legacy block whose contents were altered is not the previous block."""
+    before_contents, before = _legacy_unsent("receive")
+    contents = {"type": "send", "previous": before, "destination": PAYEE,
+                "balance": format(5, "032X")}
+    reply = {"amount": str(ONE_XNO), "height": "3", "confirmed": "true", "contents": contents}
+    asked = _block_hash_of(contents)
+    altered = {"confirmed": "true", "contents": {**before_contents, "source": "66" * 32}}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): altered, (B, before): altered})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, PAYEE, [A, B])
+    assert "does not hash to" in caught.value.failures[A]
+
+
+def test_a_previous_block_on_another_account_is_not_this_sends_balance(monkeypatch):
+    """Forgery: a state send on chain X whose `previous` is a block on chain Y.
+    Both blocks hash, and Y's balance less the send's gives exactly the amount
+    the nodes claim - but Y's balance is not X's, so nothing is bound."""
+    from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
+
+    other_chain = {**_state_block(6 * ONE_XNO), "account": _address_of_key(_STRANGER_KEY),
+                   "representative": _address_of_key(_STRANGER_KEY)}
+    before = block_hash_of(other_chain)
+    payer = _key_address(bytes(range(1, 33)))
+    contents = {
+        "type": "state",
+        "account": payer,
+        "previous": before,
+        "representative": payer,
+        "balance": str(5 * ONE_XNO),
+        "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
+        "link_as_account": HOLDER,
+    }
+    forged = {"block_account": payer, "amount": str(ONE_XNO), "height": "7",
+              "confirmed": "true", "subtype": "send", "contents": contents}
+    asked = block_hash_of(contents)
+    previous = {"confirmed": "true", "subtype": "change", "contents": other_chain}
+    _chain(monkeypatch, {(A, asked): forged, (B, asked): forged,
+                         (A, before): previous, (B, before): previous})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert [o.state for o in caught.value.observations] == ["unreadable", "unreadable"]
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert "is on account" in caught.value.failures[A]
+
+
+def _ed_keypair(seed: bytes):
+    """A test-only ed25519/blake2b key (it holds nothing): (scalar, prefix, public key)."""
+    import hashlib
+
+    from nano_settlement_verify import offline as off
+
+    d = hashlib.blake2b(seed, digest_size=64).digest()
+    a = int.from_bytes(d[:32], "little")
+    a = (a & ((1 << 254) - 8)) | (1 << 254)
+    x, y, z, _ = off._mul(a, off._BASE)
+    zi = pow(z, off.P - 2, off.P)
+    x, y = x * zi % off.P, y * zi % off.P
+    return a, d[32:], (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_sign(seed: bytes, block_hash: str) -> str:
+    """The signature of `block_hash` by the test key `seed`, as Nano block contents carry it."""
+    import hashlib
+
+    from nano_settlement_verify import offline as off
+
+    def h(*parts):
+        return int.from_bytes(hashlib.blake2b(b"".join(parts), digest_size=64).digest(), "little")
+
+    a, prefix, pub = _ed_keypair(seed)
+    msg = bytes.fromhex(block_hash)
+    r = h(prefix, msg) % off.L
+    x, y, z, _ = off._mul(r, off._BASE)
+    zi = pow(z, off.P - 2, off.P)
+    x, y = x * zi % off.P, y * zi % off.P
+    big_r = (y | ((x & 1) << 255)).to_bytes(32, "little")
+    s = (r + h(big_r, pub, msg) % off.L * a) % off.L
+    return (big_r + s.to_bytes(32, "little")).hex().upper()
+
+
+def _state_send_after_legacy_send(monkeypatch, signer_seed, sign=True):
+    """A state send on chain X whose previous block is a legacy send signed by `signer_seed`.
+
+    X is the key of seed b"chain X". The legacy send leaves 6 XNO, the state
+    send 5, so the hashed balances move exactly the 1 XNO both nodes claim,
+    whichever chain the legacy send is on.
+    """
+    from nano_settlement_verify.five_fields import block_hash_of
+
+    payer = _key_address(_ed_keypair(b"chain X")[2])
+    legacy = {"type": "send", "previous": "77" * 32,
+              "destination": _key_address(bytes.fromhex("EE" * 32)),
+              "balance": format(6 * ONE_XNO, "032X")}
+    before = block_hash_of(legacy)
+    if sign:
+        legacy["signature"] = _ed_sign(signer_seed, before)
+    contents = {
+        "type": "state",
+        "account": payer,
+        "previous": before,
+        "representative": payer,
+        "balance": str(5 * ONE_XNO),
+        "link": nano_settlement_verify.public_key_from_address(HOLDER).hex().upper(),
+        "link_as_account": HOLDER,
+    }
+    reply = {"block_account": payer, "amount": str(ONE_XNO), "height": "7",
+             "confirmed": "true", "subtype": "send", "contents": contents}
+    asked = block_hash_of(contents)
+    # The nodes say the legacy send is on X: that is only their word.
+    previous = {"block_account": payer, "confirmed": "true", "contents": legacy}
+    _chain(monkeypatch, {(A, asked): reply, (B, asked): reply,
+                         (A, before): previous, (B, before): previous})
+    return asked
+
+
+def test_a_state_send_after_a_legacy_send_on_another_chain_does_not_settle(monkeypatch):
+    """Forgery: a state send on chain X whose `previous` is a legacy send on chain
+    Y. A legacy send hashes no account, so the hashed-account comparison has
+    nothing to compare; the nodes call it X's. Its signature is Y's, so its
+    balance is not X's and nothing is bound."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain Y")
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert {o.error_kind for o in caught.value.observations} == {"UnboundAnswer"}
+    assert "hashes no account" in caught.value.failures[A]
+    assert caught.value.permanent is False
+
+
+def test_a_state_send_after_an_unsigned_legacy_send_does_not_settle(monkeypatch):
+    """With no signature, the legacy send's chain is only the node's word: refused."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain X", sign=False)
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert "hashes no account" in caught.value.failures[A]
+
+
+def test_a_state_send_after_its_own_chains_legacy_send_settles(monkeypatch):
+    """The control: the first state block after an account's last legacy send,
+    signed by that account's own key, binds its amount and settles."""
+    asked = _state_send_after_legacy_send(monkeypatch, b"chain X")
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B])
+    assert out.receipt.settled is True
+    assert out.receipt.amount_raw == ONE_XNO
+
+
+@pytest.mark.parametrize("error", [
+    http.client.IncompleteRead(b"{\"conf", 40),
+    http.client.BadStatusLine("garbage"),
+])
+def test_a_body_cut_short_is_an_unreadable_node_not_a_crash(monkeypatch, error):
+    """http.client.HTTPException is not an OSError; a node whose reply is cut off
+    mid-body is still a node that told us nothing, and the others still settle."""
+    nodes(monkeypatch, {A: error, B: send_block(), C: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])
+    assert out.receipt.settled is True
+    assert out.failed == (A,)
+    assert out.agreed == (B, C)

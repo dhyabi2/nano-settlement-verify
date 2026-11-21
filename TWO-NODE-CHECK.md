@@ -32,7 +32,9 @@ costs one more line.
 
 ## 3. The local recompute
 
-A node's `contents` are only worth reading if they hash to the hash you asked about. Save one reply
+A node's `contents` are only worth reading if they hash to the hash you asked about. A reply whose
+contents are too sparse to hash (amount, payee and height only) is not an agreeing node: count it as
+not read. Save one reply
 as `reply.json` and run this (standard library only; it decodes the account and prints the hash the
 contents actually have):
 

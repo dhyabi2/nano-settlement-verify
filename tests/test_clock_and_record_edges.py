@@ -20,6 +20,7 @@ import pytest
 
 from nano_settlement_verify import quorum as nano_quorum
 import nano_settlement_verify
+from nano_settlement_verify.five_fields import _address_of_key, block_hash_of
 from nano_settlement_verify.quorum import Observation, verify_corroborated
 
 A = "http://127.0.0.1:7071"
@@ -27,9 +28,37 @@ B = "http://127.0.0.1:7072"
 C = "http://127.0.0.1:7073"
 D = "http://127.0.0.1:7074"
 
-HASH = "B2EC1E2A1F2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDE"
-PAYEE = "nano_1payee"
+# A real address: the account whose public key is the block's `link`, so the
+# payee the reply names is the payee the hashed contents pay.
+_PAYEE_KEY = bytes.fromhex("AB" * 32)
+PAYEE = _address_of_key(_PAYEE_KEY)
 ONE_XNO = 10**30
+
+# Complete state-block contents, as a real node's json_block returns, so the
+# quorum can recompute the block hash; HASH is the block they describe.
+_SENDER = _address_of_key(bytes(range(1, 33)))
+# The block before the send, complete, so the quorum can derive the amount from
+# the two hashed balances (6 XNO before, 5 XNO after: ONE_XNO moved).
+PREVIOUS_CONTENTS = {
+    "type": "state",
+    "account": _SENDER,
+    "previous": "11" * 32,
+    "representative": _SENDER,
+    "balance": str(6 * ONE_XNO),
+    "link": "00" * 32,
+}
+PREVIOUS_HASH = block_hash_of(PREVIOUS_CONTENTS)
+PREVIOUS_BLOCK = {"confirmed": "true", "subtype": "change", "contents": PREVIOUS_CONTENTS}
+CONTENTS = {
+    "type": "state",
+    "account": _SENDER,
+    "previous": PREVIOUS_HASH,
+    "representative": _SENDER,
+    "balance": str(5 * ONE_XNO),
+    "link": _PAYEE_KEY.hex().upper(),
+    "link_as_account": PAYEE,
+}
+HASH = block_hash_of(CONTENTS)
 T0 = datetime(2026, 11, 9, 0, 0, 0, tzinfo=timezone.utc)
 
 
@@ -47,12 +76,14 @@ def send_block(confirmed="true", amount=ONE_XNO):
         "height": "7",
         "confirmed": confirmed,
         "subtype": "send",
-        "contents": {"link_as_account": PAYEE},
+        "contents": dict(CONTENTS),
     }
 
 
 def nodes(monkeypatch, replies):
     def post_json(rpc_url, payload):
+        if payload.get("hash") == PREVIOUS_HASH:  # the block before the send: the amount's binding
+            return PREVIOUS_BLOCK
         reply = replies[rpc_url]
         if isinstance(reply, BaseException):
             raise reply

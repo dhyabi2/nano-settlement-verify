@@ -127,3 +127,34 @@ node's rendering of `link`; compare `link` itself), and, for an older send block
 `block_account` - the source, which that block's contents do not name. Those are
 node-asserted, which is why there are two nodes and why they must agree, and why an
 older send's source is never checked against an exclusion list on a node's word.
+
+Two nodes agreeing on `amount` is still two nodes' word: two that collude can name any
+amount for a real send. The amount can be bound without trusting either. Ask the same
+node for `block_info` on the hash in `contents.previous` (the same request as above,
+with that hash), recompute that block's hash with the recipe above and check it equals
+`contents.previous`, then take its `contents.balance` less this block's (decimal for a
+state block, 32 hex characters for an older send block). That difference is the amount
+the block moved, and it must equal the `amount` both nodes reported. If the node cannot
+give that block, or its contents do not hash to `previous`, the amount is unbound:
+`unknown`, not `ok`. When both blocks name an account in their hashed contents (a state
+block's or a legacy open's `account`), it must be the same account, or the previous
+block is another chain's and the amount is unbound too. When this block is a state block
+and the previous one is an older send block, which hashes no account, the previous
+block's `signature` must verify under this block's `account` (see
+`nano_settlement_verify.offline.verify_block_signature`); without that, the previous
+block's chain is only the node's word and the amount is unbound.
+`nano_settlement_verify.quorum.verify_corroborated` does this for each answer (error kind
+`UnboundAnswer`); this module's `exact_amount` field still compares the nodes' `amount`
+and does not.
+
+The limit of this: an older open, receive or change block hashes no balance (an open
+hashes `source`, `representative`, `account`; a receive `previous`, `source`; a change
+`previous`, `representative`). When the previous block is one of those, its hash can still
+be recomputed - so a genuine one is told from a forgery - but the amount the send moved
+cannot be bound from hashes, and it stays unbound. That is a limit of the check, not a
+sign of forgery, and it is permanent: the previous block is fixed by the send's hash, so
+asking again, or asking other nodes, never binds it (`verify_corroborated` records error
+kind `UnbindableAmount` and sets `permanent`; do not retry). The one exception is the live
+network's genesis open (`991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948`,
+matched by its recomputed hash, not by its account), whose balance is the whole supply,
+2^128 - 1 raw.

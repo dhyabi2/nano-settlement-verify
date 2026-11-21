@@ -29,6 +29,7 @@ Amounts stay integers of raw throughout, as everywhere else in this package:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import re
@@ -53,6 +54,9 @@ __all__ = [
     "STOP_REASONS",
     "STOP_REASONS_SHA256",
     "Stop",
+    "UnbindableAmount",
+    "UnboundAnswer",
+    "UnhashableContents",
     "balance_corroborated",
     "canonical_json",
     "distinct_endpoints",
@@ -69,29 +73,78 @@ __all__ = [
 AGREE_DEFAULT = 2
 
 
-class NotCorroborated(Exception):
-    """Too few endpoints answered to decide anything. NOTHING was checked.
+# The error kinds of an endpoint that answered "confirmed" but is no witness:
+# it is recorded "unreadable", yet it did answer. `UnbindableAmount` is the one
+# that is permanent - see `NotCorroborated.permanent`.
+_NO_WITNESS_KINDS = ("UnhashableContents", "UnboundAnswer", "UnbindableAmount")
+_PERMANENT_KIND = "UnbindableAmount"
 
-    This is the multi-endpoint form of `verify`'s transport errors, and it means
-    the same thing: not "the payment is bad" but "we could not look". A seller
-    that refuses a call on this has refused a call the buyer may well have paid
-    for, and XNO does not come back. Hold the call and ask again.
+
+def _is_permanent(observations) -> bool:
+    """Whether any endpoint showed the block can never be bound (`UnbindableAmount`)."""
+    return any(getattr(seen, "error_kind", "") == _PERMANENT_KIND for seen in observations)
+
+
+class NotCorroborated(Exception):
+    """Too few endpoints gave a usable answer to decide anything.
+
+    This is the multi-endpoint form of `verify`'s transport errors, and in the
+    usual case it means the same thing: not "the payment is bad" but "we could
+    not look". A seller that refuses a call on this has refused a call the buyer
+    may well have paid for, and XNO does not come back. Hold the call and ask
+    again - unless `permanent` is True.
+
+    "Unreadable" is not always silence. An endpoint that answered "confirmed"
+    with contents that cannot be tied to the block (error kinds
+    `UnhashableContents`, `UnboundAnswer`, `UnbindableAmount`) did answer, and
+    is counted in `witnessless`, not in `answered`; the message says so.
+
+    `permanent` is True when an endpoint showed, from contents that hash to the
+    block, that the block's previous block is a legacy open, receive or change
+    block that hashes no balance (`UnbindableAmount`). A block's previous is
+    fixed by its hash, so no endpoint, now or later, can bind that send's
+    amount: asking again can never settle it. Do not retry a permanent
+    `NotCorroborated`; `not_before` is then None. Check such a payment some
+    other way, or not at all.
     """
 
     def __init__(self, answered: int, agree: int, failures: dict, observations=()) -> None:
+        observations = tuple(observations)
         detail = "; ".join(f"{url}: {why}" for url, why in failures.items())
-        super().__init__(
-            f"{answered} of {answered + len(failures)} endpoints answered, "
-            f"{agree} needed to agree ({detail})"
+        witnessless = sum(
+            1 for seen in observations
+            if getattr(seen, "state", "") == "unreadable"
+            and getattr(seen, "error_kind", "") in _NO_WITNESS_KINDS
         )
+        permanent = _is_permanent(observations)
+        asked = answered + len(failures)
+        if witnessless:
+            head = (
+                f"{answered} of {asked} endpoints answered as a witness "
+                f"({witnessless} more answered confirmed, but could not be tied to the block), "
+                f"{agree} needed to agree"
+            )
+        else:
+            head = f"{answered} of {asked} endpoints answered, {agree} needed to agree"
+        if permanent:
+            head += (
+                "; PERMANENT: the block's previous block is a legacy block that hashes no "
+                "balance, so its amount can never be bound - do not retry"
+            )
+        super().__init__(f"{head} ({detail})")
         self.answered = answered
         self.agree = agree
         self.failures = dict(failures)
         # One `Observation` per endpoint asked, in the order asked. Empty when
         # the caller is not `verify_corroborated` (failover, balances).
-        self.observations = tuple(observations)
+        self.observations = observations
+        # Endpoints that answered "confirmed" but are no witness, and whether
+        # asking again can ever settle the block (see the class docstring).
+        self.witnessless = witnessless
+        self.permanent = permanent
         # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None,
-        # and when to ask again: `stop.at` plus the call's `retry_after`.
+        # and when to ask again: `stop.at` plus the call's `retry_after` - None
+        # when `permanent`, since asking again cannot help.
         self.stop = None
         self.not_before = None
 
@@ -602,6 +655,13 @@ RECEIPT_SCHEMA = "nano_quorum.corroboration/5"
 # "node_states", so a reader of a stored receipt needs no code to tell the states
 # apart - above all "not-seen" (the node ANSWERED, and has no such block) from
 # "unreadable" (the node gave NO answer about the block at all).
+# "Unreadable" also covers a node that did answer "confirmed" but whose answer
+# is no witness: contents too sparse to hash (error kind "UnhashableContents"),
+# or contents that hash to the block while the payee, payer chain, subtype or
+# amount it asserts are not that block's (error kind "UnboundAnswer"). Such a
+# node told us nothing we could tie to the block; `error_kind` and `error` say
+# which. The table text is pinned (NODE_STATES_SHA256), so this is said here,
+# not in it.
 NODE_STATES = {
     "confirmed": "the node answered: it has the block, confirmed, and it matches the expected payment",
     "unconfirmed": "the node answered: it has the block, but has not confirmed it yet",
@@ -1222,11 +1282,23 @@ class Corroboration:
         (`verify_corroborated(retry_after=...)`, default 0). This module knows
         nothing about when a node will confirm a block, so with the default the
         earliest time is simply when this check stopped; any longer wait is the
-        caller's, stated in the record as "retry_after_s".
+        caller's, stated in the record as "retry_after_s". None, too, when
+        `permanent`: asking again cannot settle the block.
         """
-        if self.receipt.settled or self.stop is None:
+        if self.receipt.settled or self.stop is None or self.permanent:
             return None
         return _not_before(self.stop.at, self.retry_after)
+
+    @property
+    def permanent(self) -> bool:
+        """Whether asking again can never settle this block, as for `NotCorroborated.permanent`.
+
+        True only for an unsettled receipt with an observation of error kind
+        `UnbindableAmount`: an endpoint showed, from contents that hash to the
+        block, that its previous block is a legacy block hashing no balance.
+        Do not wait and ask again on such a receipt.
+        """
+        return not self.receipt.settled and _is_permanent(self.observations)
 
     def _identity(self) -> tuple:
         return (
@@ -1386,9 +1458,11 @@ def distinct_endpoints(rpc_urls, agree: int = AGREE_DEFAULT) -> tuple[str, ...]:
 # an error envelope with no `confirmed`, which `verify` refuses by design rather
 # than read as settled or unsettled. KeyError is kept because
 # `balance_corroborated` below still reads a balance reply directly, and
-# TypeError for a reply whose fields are the wrong type. All of them mean the
-# same thing here: this endpoint told us nothing, ask the next one.
-_UNREADABLE = (OSError, ValueError, KeyError, TypeError)
+# TypeError for a reply whose fields are the wrong type. http.client.HTTPException
+# is a body cut short (IncompleteRead) or a status line that is not HTTP: it is
+# not an OSError, and it is still no answer. All of them mean the same thing
+# here: this endpoint told us nothing, ask the next one.
+_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException)
 
 
 def post_json_failover(rpc_urls, payload: dict):
@@ -1447,6 +1521,245 @@ def _payer_of(reply: object):
 _ORIGINAL_VERIFY = nano_settlement_verify.verify
 
 
+class UnhashableContents(ValueError):
+    """A confirmed answer whose contents are too sparse to recompute the block hash.
+
+    Amount, payee and height alone do not say WHICH block a node is describing,
+    so such an answer is not a witness. It is a `ValueError`, so the check reads
+    the node as "unreadable" - it told us nothing we could tie to the block -
+    rather than as agreeing or as contradicting.
+    """
+
+
+class UnboundAnswer(ValueError):
+    """A confirmed answer whose contents hash to the block, but whose reading of it does not.
+
+    The block hash covers the contents' `link` (a legacy send's `destination`)
+    and `account`, not the node's rendering of them: `link_as_account`, a
+    top-level `destination`, `block_account` and `subtype` are the node's word.
+    When that word names a payee the hashed contents do not pay, a payer chain
+    other than the hashed `account`, or an operation the hashed block is not, the
+    hash ties the answer to the right block but the facts it asserts are not that
+    block's. Such an answer is not a witness: like `UnhashableContents` it is a
+    `ValueError`, recorded "unreadable", neither agreement nor disagreement.
+    """
+
+
+class UnbindableAmount(UnboundAnswer):
+    """A confirmed answer that can NEVER be bound: its previous block hashes no balance.
+
+    The contents hash to the block asked for, and the block before it hashes
+    to the contents' `previous`, so both are genuine - but that block is a
+    legacy open, receive or change block (not the genesis open), which hashes
+    no balance. A block's `previous` is fixed by its hash, so this is true of
+    the block itself, not of one node: no endpoint, now or later, can give an
+    amount bound to hashes. It is an `UnboundAnswer` (and so a `ValueError`,
+    recorded "unreadable"), and it makes `NotCorroborated.permanent` and
+    `Corroboration.permanent` True: do not retry such a block.
+    """
+
+
+def _unbound(reply: dict, contents: dict, paid: str) -> str | None:
+    """Why `reply`'s reading of its hashed `contents` is not those contents, or None.
+
+    `contents` already hash to the block asked for. `paid` is the payee the
+    receipt was built from. The payee is the one the hashed fields pay
+    (`five_fields._hashed_destination`): a state block's `link` read as an
+    account, a legacy send's `destination`; every rendering of a payee in the
+    reply must be that account. A state receive's `link` is a source block hash,
+    so read as an account it is no seller's address - the payee check is what
+    refuses a receive passed off as a send. A legacy block hashes only as a
+    "send", so a `subtype` naming anything else contradicts it; a state block
+    must say "send". A state block's `account` is hashed, so a `block_account`
+    naming another chain contradicts it; one naming no valid address names no
+    payer, as `_payer_of` reads it, and is not compared.
+    """
+    from .five_fields import _hashed_destination  # here, not at the top: it imports this module
+
+    same = nano_settlement_verify._same_account
+    destination = _hashed_destination(contents)
+    if destination is None:
+        return "the hashed contents name no payee"
+    if not same(paid, destination):
+        return f"it says the block paid {paid!r}, but the hashed contents pay {destination!r}"
+    for where, rendered in (("contents", contents), ("reply", reply)):
+        for name in ("link_as_account", "destination"):
+            if name in rendered and not same(rendered[name], destination):
+                return (f"its {where} {name} {rendered[name]!r} is not {destination!r}, "
+                        f"the account the hashed contents pay")
+    kind, subtype = contents.get("type"), reply.get("subtype")
+    if kind == "state" and subtype != "send":
+        return f"its subtype is {subtype!r}; only a state send pays anyone"
+    if kind == "send" and subtype not in (None, "", "send"):
+        return f"its subtype is {subtype!r}, but the hashed contents are a legacy send"
+    if kind == "state":
+        payer = _payer_of(reply)
+        if payer is not None and not same(payer, contents.get("account")):
+            return (f"its block_account {payer!r} is not {contents.get('account')!r}, "
+                    f"the account the hashed contents name")
+    return None
+
+
+_NO_PREVIOUS = "0" * 64
+
+
+# The live network's genesis block: a legacy open whose hash is fixed by the
+# protocol, and which opens the genesis account with the whole supply. It is the
+# one legacy open, receive or change block whose balance is known without a
+# node's word, so a send whose previous block it is can still be bound.
+_GENESIS_OPEN_HASH = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948"
+_GENESIS_BALANCE = 2**128 - 1
+
+_LEGACY_HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
+
+# The fields a legacy open, receive or change block hashes, in order, and how
+# each one is read into bytes: a block hash (64 hex characters) or an account.
+_LEGACY_UNSENT = {
+    "open": (("source", "hash"), ("representative", "account"), ("account", "account")),
+    "receive": (("previous", "hash"), ("source", "hash")),
+    "change": (("previous", "hash"), ("representative", "account")),
+}
+
+
+def _legacy_hash_of(contents: object) -> str | None:
+    """The hash of a legacy open, receive or change block, recomputed, or None.
+
+    blake2b-256 of the fields `_LEGACY_UNSENT` lists. `five_fields.block_hash_of`
+    does not hash these kinds - none of them is a send - but the block BEFORE a
+    send can be one, and it must still be told apart from a forgery: a block
+    whose contents recompute to `previous` is that block, whatever its kind.
+    """
+    if not isinstance(contents, dict) or contents.get("type") not in _LEGACY_UNSENT:
+        return None
+    digest = hashlib.blake2b(digest_size=32)
+    for name, kind in _LEGACY_UNSENT[contents["type"]]:
+        value = contents.get(name)
+        if kind == "hash":
+            if not (isinstance(value, str) and _LEGACY_HEX64.fullmatch(value)):
+                return None
+            digest.update(bytes.fromhex(value))
+        else:
+            key = nano_settlement_verify.public_key_from_address(value)
+            if key is None:
+                return None
+            digest.update(key)
+    return digest.hexdigest().upper()
+
+
+def _hashed_balance(contents: dict, hashed_as: str | None = None) -> int | None:
+    """The balance a block's hashed contents leave its chain with, in raw, or None.
+
+    Called only on contents already hashed to `hashed_as`, so the field parses:
+    a state block hashes `balance` as a decimal string, a legacy send as 32 hex
+    characters. A legacy receive, open or change block hashes no balance at all,
+    so its balance is only a node's word: None - except the genesis open, whose
+    balance is the protocol's whole supply.
+    """
+    kind, balance = contents.get("type"), contents.get("balance")
+    if kind == "state":
+        return int(str(balance))
+    if kind == "send":
+        return int(balance, 16)
+    if kind == "open" and hashed_as == _GENESIS_OPEN_HASH:
+        return _GENESIS_BALANCE
+    return None
+
+
+def _hashed_account(contents: dict) -> str | None:
+    """The account a block's hashed contents name, or None: a state or legacy open's `account`.
+
+    A legacy send, receive or change block does not hash its account (only its
+    signature binds it), so there is none to compare.
+    """
+    if contents.get("type") in ("state", "open"):
+        return contents.get("account")
+    return None
+
+
+def _bound_amount(post, rpc_url: str, contents: dict) -> int:
+    """The amount a send moved, from hashed balances alone, or `UnboundAnswer`.
+
+    `contents` already hash to the block asked for. The amount a node reports is
+    its own word - only the balance after the send is hashed - so it is derived
+    here instead: the block before it (`contents.previous`) is asked for from
+    the same endpoint, its contents must hash to exactly `contents.previous`,
+    and the amount is that block's hashed balance less this one's. When both
+    blocks' hashed contents name an account (a state block, a legacy open), it
+    must be the same account: a previous block on another chain is not this
+    send's, and its balance says nothing about what this send moved. When this
+    send is a state block and the previous block is a legacy send, which
+    hashes no account, the previous block's signature must verify under this
+    send's hashed `account` (`offline.verify_block_signature`); a missing or
+    other signature binds nothing. A legacy send after a legacy send names no
+    hashed account on either side, so no chain is compared.
+
+    The previous block may be a legacy open, receive or change block: its hash
+    is recomputed too (`_legacy_hash_of`), so a real one is told apart from a
+    forgery. But such a block hashes no balance, so unless it is the genesis
+    open (whose balance is the protocol's whole supply, and which is matched by
+    its recomputed hash, never by its account) the amount cannot be bound from
+    the hash, and the answer says exactly that, as `UnbindableAmount` - a limit
+    of what a hash can prove, not a forgery, and a permanent one: the previous
+    block is fixed by the send's hash. A previous block the endpoint cannot give,
+    whose contents do not hash to `previous`, on another chain, or that hashes
+    no balance binds nothing, and the answer is not a witness: it raises
+    `UnboundAnswer` (or its subclass `UnbindableAmount`) and never falls back
+    to the node's `amount`. A transport
+    failure on that second request propagates as it is (OSError,
+    NotANodeReply) and is recorded "unreadable" in the same way.
+    """
+    from .five_fields import block_hash_of  # here, not at the top: it imports this module
+
+    previous = str(contents.get("previous", "")).upper()
+    if previous == _NO_PREVIOUS:
+        raise UnboundAnswer("its hashed contents name no previous block to derive the amount from")
+    before_reply = post(rpc_url, {"action": "block_info", "json_block": "true", "hash": previous})
+    if not isinstance(before_reply, dict) or "error" in before_reply:
+        raise UnboundAnswer(
+            f"the endpoint gave no previous block {previous}, so the amount is only its word"
+        )
+    before_contents = before_reply.get("contents")
+    hashed_as = block_hash_of(before_contents) or _legacy_hash_of(before_contents)
+    if hashed_as != previous:
+        raise UnboundAnswer(
+            f"the previous block it gave does not hash to {previous}, "
+            f"so the amount is only its word"
+        )
+    before = _hashed_balance(before_contents, hashed_as)
+    if before is None:
+        # Checked before the account: the previous block's kind is fixed by
+        # the hash, so this is permanent for the block, whoever is asked.
+        raise UnbindableAmount(
+            f"the previous block {previous} is a legacy {before_contents.get('type')} block, "
+            f"which hashes no balance, so the amount cannot be bound from the hash "
+            f"(permanent: no node can ever bind it, do not retry)"
+        )
+    before_account, account = _hashed_account(before_contents), _hashed_account(contents)
+    if account is not None and before_account is None:
+        # A state send after a legacy send: the legacy send hashes no account,
+        # so the node's `block_account` for it would be only its word. Its
+        # chain is bound instead by its signature - made by the account's own
+        # key over `previous`, already recomputed - checked against the
+        # send's hashed `account`.
+        from .offline import verify_block_signature  # here, not at the top: it imports five_fields
+
+        if not verify_block_signature(before_contents, before_contents.get("signature"),
+                                      account=account):
+            raise UnboundAnswer(
+                f"the previous block {previous} is a legacy send, which hashes no account, "
+                f"and its signature does not show it is on {account!r}, the account the "
+                f"hashed contents name, so its balance is not bound to this send"
+            )
+    elif (before_account is not None and account is not None
+            and not nano_settlement_verify._same_account(before_account, account)):
+        raise UnboundAnswer(
+            f"the previous block {previous} is on account {before_account!r}, not "
+            f"{account!r}, the account the hashed contents name, so its balance is "
+            f"not this send's"
+        )
+    return before - _hashed_balance(contents)
+
+
 def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     """One endpoint's answer, as something two answers can be compared by.
 
@@ -1462,12 +1775,29 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     (`nano_five_fields.block_hash_of`) and that hash is not the one asked for,
     the node has answered about a DIFFERENT block: that is tagged "other-block",
     never "settled", however well its amount and payee match. Contents too
-    sparse to hash are not a hash checked, and are read as before.
+    sparse to hash are not a hash checked either: that answer raises
+    `UnhashableContents`, so it is recorded "unreadable" (error kind
+    "UnhashableContents") and is neither agreement nor disagreement. A quorum
+    of sparse answers cannot settle; it is `NotCorroborated`. Contents that do
+    hash to the block bind what the answer may assert: a payee, payer chain or
+    subtype the hashed contents contradict (`_unbound`) raises `UnboundAnswer`,
+    recorded "unreadable" in the same way. The amount is not in the hashed
+    contents (only the resulting balance is), so it is not taken on the node's
+    word: the previous block is asked for from the same endpoint, must hash to
+    `contents.previous`, and its hashed balance less this block's must be the
+    amount the node reported (`_bound_amount`). Anything else - no previous
+    block, one that hashes to something else or hashes no balance, or balances
+    that move another amount - raises `UnboundAnswer`.
+
+    A `Mismatch` is reached before the hash is read, so one node naming another
+    payee or amount still refuses at once, hashable contents or not: that
+    ordering is kept, since a refusal fails closed.
 
     If `nano_settlement_verify.verify` is no longer the original function, it
     is called as before this module read replies itself, and the answer is
     built from the Receipt it returns; there is then no reply in hand, so no
-    block hash and no payer are checked.
+    block hash, payee binding, amount binding or payer is checked: a quorum of
+    such answers settles on the replacement's word.
     """
     verify = nano_settlement_verify.verify  # looked up per call so a stub takes effect
     if verify is not _ORIGINAL_VERIFY:
@@ -1492,8 +1822,25 @@ def _answer(block_hash: str, expect_raw: int, account: str, rpc_url: str):
     from .five_fields import block_hash_of  # here, not at the top: it imports this module
 
     answered_for = block_hash_of(reply.get("contents"))
-    if answered_for is not None and answered_for != str(block_hash).strip().upper():
+    if answered_for is None:
+        raise UnhashableContents(
+            f"confirmed, but its contents are too sparse to recompute a block hash from, "
+            f"so nothing ties the answer to block {block_hash}"
+        )
+    if answered_for != str(block_hash).strip().upper():
         return ("other-block", answered_for, str(block_hash)), None
+    why = _unbound(reply, reply["contents"], receipt.account)
+    if why is not None:
+        raise UnboundAnswer(
+            f"confirmed, and its contents hash to block {block_hash}, but {why}; "
+            f"nothing it asserts beyond the hash is that block's"
+        )
+    moved = _bound_amount(post, rpc_url, reply["contents"])
+    if moved != receipt.amount_raw:
+        raise UnboundAnswer(
+            f"confirmed, and its contents hash to block {block_hash}, but it says the "
+            f"block moved {receipt.amount_raw} raw while the hashed balances move {moved}"
+        )
     return (
         "settled", receipt.amount_raw, receipt.height, receipt.account, _payer_of(reply)
     ), receipt
@@ -1553,8 +1900,11 @@ def verify_corroborated(
         so this is not something a later endpoint can overturn.
       `Disagreement` - two endpoints each reported a confirmed send, and their
         receipts differ. Impossible between honest nodes; nothing is served.
-      `NotCorroborated` - fewer than `agree` endpoints answered at all. Nothing
-        was checked; hold the call and ask again rather than refuse it.
+      `NotCorroborated` - fewer than `agree` endpoints gave a usable answer.
+        Usually nothing could be checked; hold the call and ask again rather
+        than refuse it. When its `permanent` is True (an endpoint showed the
+        send's previous block is a legacy block that hashes no balance,
+        `UnbindableAmount`), asking again can never settle it: do not retry.
       `TypeError` - `expect_raw` is not an int, the same refusal `verify` makes,
         made here before any endpoint is called.
     """
@@ -1762,7 +2112,7 @@ def verify_corroborated(
             answered=len(answered), agree=agree, failures=failures, observations=observations
         )
         short.stop = stopped("exhausted")
-        short.not_before = _not_before(short.stop.at, retry_after)
+        short.not_before = None if short.permanent else _not_before(short.stop.at, retry_after)
         raise short
 
     # Enough endpoints answered, but fewer than `agree` of them reported the

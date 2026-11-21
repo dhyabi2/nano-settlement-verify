@@ -96,6 +96,39 @@ bundle ships exactly that file). The other modules (`quorum`, `payers`, ...) nee
 Do not keep that copy beside an installed 2.0.0: a local `nano_settlement_verify.py` shadows the package, and
 `import nano_settlement_verify.quorum` then fails.
 
+### 2.1.0: a confirmed answer must be bound to the block
+
+2.1.0 changes outcomes of `nano_settlement_verify.quorum.verify_corroborated` for existing
+callers, which is why it is a minor release and not a patch. Every change refuses or holds
+what 2.0.0 settled; none settles what 2.0.0 refused. In short (the details are under
+*Changes from the previous release* below):
+
+- A `confirmed` answer whose contents are too sparse to recompute the block hash
+  (amount, payee and height only) is no witness: it is `unreadable` (error kind
+  `UnhashableContents`). A quorum of such answers, which 2.0.0 settled, is now
+  `NotCorroborated`.
+- A `confirmed` answer whose hashed contents pay someone else, are not a send, or are on
+  another chain than its `block_account` names is no witness (`UnboundAnswer`).
+- The amount is bound to hashed balances, not taken on the node's word: each answering
+  endpoint is now asked for **two** `block_info` requests per check - the block, then
+  its `contents.previous` - and a `post_json` stub must answer both. A previous block that
+  is missing, does not hash to `previous`, is on another chain (for a legacy send before a
+  state send: whose signature is not the send's account's), or whose balance moves
+  another amount is `UnboundAnswer`.
+- **Permanent refusals.** A send whose previous block is a legacy open, receive or change
+  block (other than the genesis open) can never be bound: that block hashes no balance,
+  and the send's hash fixes which block it is. Such a send settled in 2.0.0 (for example
+  `18563C81...` on the live network) and is now `NotCorroborated` with error kind
+  `UnbindableAmount`, `permanent` True and `not_before` None, and its message says
+  "PERMANENT ... do not retry". A caller that holds and retries every `NotCorroborated`
+  must check `permanent` first, or it retries such a send forever. An unsettled
+  `Corroboration` has the same `permanent` property.
+- `NotCorroborated`'s message no longer says "0 of 2 endpoints answered" when both
+  answered `confirmed` but are no witness: it counts them apart (`witnessless`).
+- A reply cut short (`http.client.HTTPException`) is an unreadable endpoint in
+  `verify_corroborated`, `balance_corroborated`, `post_json_failover` and
+  `five_fields.read_nodes` / `five_field_verdict`, instead of an exception.
+
 ### 2.0.0: one package
 
 Up to 1.3.0 the distribution installed 13 top-level modules and two top-level packages,
@@ -126,7 +159,7 @@ public node list after a pip install instead of an empty list.
 | `python3 node_set/probe.py ...` | `python3 -m nano_settlement_verify.node_set.probe ...` |
 | `python3 -m links.public_check ...` | `python3 -m nano_settlement_verify.links.public_check ...` |
 
-`nano_settlement_verify.__version__` is new and reads `2.0.0`. Stored records keep their
+`nano_settlement_verify.__version__` is new in 2.0.0 (it reads `2.1.0` from this release). Stored records keep their
 schema names (`"nano_quorum.corroboration/5"` and the rest): those are data, not import paths.
 
 The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
@@ -422,7 +455,65 @@ slack, or pass `not_after=None` to have no deadline.
   or one that is not a valid address, names no payer chain and is compared as before. When
   `nano_settlement_verify.verify` has been replaced (stubbed or wrapped), `verify_corroborated`
   still calls it for each endpoint, as before; it then has no reply in hand, so neither of
-  these two checks is made.
+  these two checks is made, nor any of the hash, payee or amount checks below: a quorum
+  through a replaced `verify` settles on the replacement's word.
+- A node that answers `confirmed` with contents too sparse to recompute a block hash from
+  no longer counts toward agreement. It is recorded `unreadable` (error kind
+  `UnhashableContents`, a `ValueError`), so two such answers raise `NotCorroborated`
+  instead of settling.
+- A node whose contents hash to the block asked for, but whose reply names a payee the
+  hashed contents do not pay (a `link_as_account` or `destination` that is not the hashed
+  `link` or legacy `destination`), a `subtype` other than `send`, or, for a state block, a
+  valid `block_account` other than the hashed `account`, no longer counts toward
+  agreement either. It is recorded `unreadable` (error kind `UnboundAnswer`, a
+  `ValueError`): the hash ties it to the block, but what it asserts is not that block's.
+  Two colluding nodes can no longer settle a real send to someone else, or a receive, as
+  a payment to the seller. A legacy send's chain is not hashed and is still compared only
+  when two answers name one.
+- The amount is no longer a node's word. A block's hash covers the balance it leaves, not
+  the amount it moved, so for each confirmed answer whose contents hash to the block,
+  `verify_corroborated` now makes a second `block_info` request to the same endpoint, for
+  the block's `contents.previous`. That block's contents must hash to exactly `previous`,
+  and its hashed balance less the send's must equal the `amount` the node reported. An
+  endpoint that cannot give that block, gives one that hashes to anything else (or to
+  nothing), or whose balances move another amount, is recorded `unreadable` (error kind
+  `UnboundAnswer`), never settled on its `amount`: two colluding nodes can no longer
+  settle a real send for an amount it did not move. Each answering endpoint is now asked
+  twice per check, and a stub of `post_json` must answer the second request too.
+  When both blocks' hashed contents name an account (a state block, a legacy open), it
+  must be the same one: a previous block on another chain is not this send's balance, and
+  the answer is recorded `UnboundAnswer`. When a state send's previous block is a legacy
+  send, which hashes no account, that block's `signature` must verify under the state
+  send's hashed `account`; a missing or other signature is `UnboundAnswer` too.
+- **Limit: a send whose previous block is a legacy open, receive or change block.** Those
+  older block kinds hash no balance, so the amount such a send moved cannot be bound from
+  hashes alone. The previous block's hash is still recomputed, so a genuine one is told
+  apart from a forgery, and the answer is recorded `unreadable` (error kind
+  `UnbindableAmount`, a subclass of `UnboundAnswer`) with the reason "the previous block
+  ... is a legacy receive block, which hashes no balance, so the amount cannot be bound
+  from the hash" - a limit of the check, not a forgery. Such a send is `NotCorroborated`,
+  never settled on the node's `amount`, and the refusal is **permanent**: the send's hash
+  fixes its previous block, so no node can ever bind it. `NotCorroborated.permanent` (and
+  `Corroboration.permanent`) is True, `not_before` is None, and the message says "do not
+  retry"; a caller that retries every `NotCorroborated` would otherwise retry forever.
+  The genesis exception is matched by the previous block's recomputed hash, never by its
+  account.
+  The one exception is the live network's genesis open
+  (`991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948`), whose balance
+  is the protocol's whole supply: the send after it (`A170D51B...`, height 2 of the
+  genesis account) still settles. Every state block hashes its balance, so a send after
+  any state block is unaffected.
+- A reply cut short mid-body (`http.client.IncompleteRead`) or any other
+  `http.client.HTTPException` is now an `unreadable` endpoint, like a timeout; it used to
+  escape `verify_corroborated`, `balance_corroborated` and `post_json_failover` as an exception.
+  The same holds for `five_fields.read_nodes` (kept as that node's failure) and
+  `five_field_verdict`.
+- The `unreadable` node state also covers a node that answered `confirmed` but is no
+  witness (error kind `UnhashableContents`, `UnboundAnswer` or `UnbindableAmount`).
+  `NotCorroborated` counts those apart as `witnessless`, and its message says "0 of 2
+  endpoints answered as a witness (2 more answered confirmed, but could not be tied to the
+  block)" rather than "0 of 2 endpoints answered". The pinned node-state
+  table's text, and so its hash, is unchanged; `error_kind` says which kind of unreadable.
 - A `confirmed` observation whose reply named a valid payer chain now carries it as
   `payer_account` (a nano_ address, also written by `to_dict()` and part of equality), and
   a payer-chain `Disagreement`'s `answers` name the chains as nano_ addresses, not key hex.
@@ -622,11 +713,16 @@ except Mismatch:
     refuse()            # a node has it confirmed, and it did not pay you
 except Disagreement:
     refuse()            # two nodes, two different stories — one of them is wrong
-except NotCorroborated:
-    hold_and_retry()    # too few endpoints answered; NOTHING was checked
+except NotCorroborated as short:
+    if short.permanent:
+        refuse_or_check_by_hand()   # can NEVER settle here (legacy previous block): do not retry
+    else:
+        hold_and_retry()    # too few usable answers; nothing could be checked yet
 else:
     if out.receipt.settled:
         serve_the_call()        # out.agreed names the endpoints that concurred
+    elif out.permanent:
+        refuse_or_check_by_hand()   # as above: asking again cannot settle it
     else:
         wait_and_ask_again()    # answered, but not confirmed by enough of them yet
 ```
@@ -646,21 +742,39 @@ The rules it holds to, each of which is a way of failing closed:
   asked for, it raises `Disagreement` at once, even if amount, payee and height all match.
   Two confirmed answers that each name a valid payer chain (`block_account`), and name
   different ones, also disagree; an answer that names none, or names something that is not
-  an address, is not compared on it. Contents too sparse to hash are not a hash checked;
-  they are compared on amount, payee and height as before, and on the payer chain only
-  when both answers name one.
+  an address, is not compared on it. A confirmed answer whose contents are too sparse to
+  hash (amount, payee and height only) is not a witness either: it is recorded as
+  `unreadable` with error kind `UnhashableContents`, neither agreement nor disagreement,
+  so a quorum of sparse answers is `NotCorroborated` and never settles (while
+  `nano_settlement_verify.verify` is the library's own; a replaced, stubbed or wrapped
+  `verify` hands back a receipt with no reply in hand, and none of these hash, payee or
+  amount checks is made on it). Contents that do
+  hash to the block bind the answer: a payee other than the hashed `link`/`destination`,
+  a `subtype` other than `send`, or a state block's `block_account` other than its hashed
+  `account` is `unreadable` with error kind `UnboundAnswer`, not a witness. So is an
+  amount the hashed balances do not move: the hash covers the balance a send leaves, not
+  the amount, so the same endpoint is asked for the block's `previous`, whose contents
+  must hash to it, and that block's balance less the send's must be the amount the node
+  reported. No such block, one that hashes to anything else, or another difference, and
+  the answer is `UnboundAnswer` - never settled on the node's `amount`. So each endpoint
+  that answers `confirmed` is sent two `block_info` requests per check, not one. A send
+  whose previous block is a legacy open, receive or change block (not the genesis open)
+  can never be bound: it is `UnbindableAmount`, and the `NotCorroborated` (or unsettled
+  `Corroboration`) has `permanent` True and `not_before` None. Do not retry it.
 - **One `Mismatch` refuses at once.** A node that has the block *confirmed* and says it
   paid a different amount or a different account is reporting something a later node
   cannot overturn — a confirmed block's contents are fixed by its hash.
 - **Silence is never a "no".** An endpoint that is refused, times out, or serves an HTML
   maintenance page has told you nothing. Fewer than `agree` endpoints answering raises
-  `NotCorroborated`, which means *hold the call*, not *refuse the buyer*. Refusing a call
+  `NotCorroborated`, which means *hold the call*, not *refuse the buyer* - unless its
+  `permanent` is True (see above), which means asking again can never settle it. Refusing a call
   that was paid for costs the sale, and XNO does not come back. An endpoint whose reply
   is not a JSON object (a proxy's `"error"`, a bare number) is silence too: it counts as
   failed, not as answered. It used to count as a "not seen" answer, so a quorum that
   returned an unsettled `Corroboration` can now raise `NotCorroborated` instead.
 - **It does not retry.** A failed endpoint is skipped, not asked again. Waiting is yours
-  to decide, as it is for `verify`.
+  to decide, as it is for `verify`. Budget two `block_info` requests per endpoint that
+  answers `confirmed` (the block and its previous block), against a rate-limited node.
 - **It never sends.** `process` is deliberately absent; this reads, like the rest of the
   package.
 
@@ -810,7 +924,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1227 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1261 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -855,7 +969,7 @@ acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
 `nano_settlement_verify.independence`, the funding chain and the independent-payer grouping; for
-`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
+`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, a confirmed answer too sparse to hash, a confirmed answer whose hashed contents contradict the payee, operation or payer chain it names (a forged `link_as_account`, an extra one on a legacy send, a receive called a send, a forged `block_account`), a confirmed answer whose amount the hashed balances do not move (two colluding nodes forging it, a previous block that does not hash to `previous`, is not given or is on another account, a previous legacy open, receive or change block refused as unbindable, and the genuine state and legacy sends, the live genesis send among them, that still settle for the balances' difference), a reply cut short (`IncompleteRead`), the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring
