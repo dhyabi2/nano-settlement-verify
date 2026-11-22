@@ -648,7 +648,14 @@ def _repr(value) -> str:
 # order; a not-asked node keeps its planned place), and the receipt gains
 # "configured_order", "ask_order", "order_rule" and "order_seed". Neither
 # vocabulary changed, so both pinned hashes are the ones /4 pinned.
-RECEIPT_SCHEMA = "nano_quorum.corroboration/5"
+#
+# /6 adds the receipt-level "permanent" (true when asking again can never settle
+# the block, see `Corroboration.permanent`), and "ask_again" is now false for a
+# permanent unsettled receipt. The "exhausted" stop reason says so, so the
+# stop-reason vocabulary, and STOP_REASONS_SHA256, changed with it; /4 and /5
+# records keep the hash they pinned (`_STOP_REASONS_SHA256_4_5`). The node-state
+# vocabulary is unchanged.
+RECEIPT_SCHEMA = "nano_quorum.corroboration/6"
 
 # The only states an `Observation` can carry, in a fixed order, each with what it
 # means. This exact mapping is written into every `to_json()` record as
@@ -715,9 +722,9 @@ def canonical_json(value) -> str:
 # The hash of `NODE_STATES` that RECEIPT_SCHEMA names, pinned. Editing any state
 # or its meaning changes the hash, and the check below then refuses to import
 # the module until RECEIPT_SCHEMA is bumped and this value re-pinned with it -
-# so "nano_quorum.corroboration/5" cannot quietly come to mean something else.
+# so "nano_quorum.corroboration/6" cannot quietly come to mean something else.
 # (/2, without "not-asked", pinned f2d10f78a2b6aa1c705bfdfcf28092261d1f0d837e50ec292c80668d6d9f9c77;
-# /3 and /4 pinned this same value.)
+# /3, /4 and /5 pinned this same value.)
 NODE_STATES_SHA256 = "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
 
 
@@ -749,8 +756,9 @@ STOP_REASONS = {
     ),
     "exhausted": (
         "every configured endpoint was asked and fewer than k reported the same confirmed "
-        "send: the receipt is unsettled (ask again), or NotCorroborated is raised when fewer "
-        "than k answered at all"
+        "send: the receipt is unsettled (ask again, unless permanent is true: an endpoint "
+        "showed the block can never be bound, so ask_again is false - do not retry), or "
+        "NotCorroborated is raised when fewer than k answered at all"
     ),
     "mismatch": (
         "an endpoint reported the block confirmed and not the expected payment: Mismatch is "
@@ -764,7 +772,10 @@ STOP_REASONS = {
 }
 
 # The hash of `STOP_REASONS` that RECEIPT_SCHEMA names, pinned as NODE_STATES_SHA256 is.
-STOP_REASONS_SHA256 = "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
+# Re-pinned for /6, whose "exhausted" text says a permanent receipt is not asked again.
+STOP_REASONS_SHA256 = "9a507588586951769eccae134186cefe5915f6afaf7e8b79eeaa86eac6b7a983"
+# The stop-reason table /4 and /5 wrote, before "exhausted" named `permanent`.
+_STOP_REASONS_SHA256_4_5 = "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
 
 _check_vocabulary_pin(STOP_REASONS, STOP_REASONS_SHA256, "STOP_REASONS")
 
@@ -809,13 +820,19 @@ def _ask_order(endpoints, seed) -> tuple:
 
 
 # The stored schemas `verify_receipt_vocabulary` reads, each with the vocabulary
-# tables a record of it carries. All three use the node-state vocabulary /3
-# pinned (NODE_STATES_SHA256 is unchanged since /3); /4 added "stop_reasons",
-# unchanged in /5. Any other schema is refused.
+# tables a record of it carries and the hash each must have. All four use the
+# node-state vocabulary /3 pinned (NODE_STATES_SHA256 is unchanged since /3); /4
+# added "stop_reasons", unchanged in /5 and re-pinned in /6. Any other schema is
+# refused.
 _VOCABULARY_TABLES_OF_SCHEMA = {
-    "nano_quorum.corroboration/3": ("node_states",),
-    "nano_quorum.corroboration/4": ("node_states", "stop_reasons"),
-    RECEIPT_SCHEMA: ("node_states", "stop_reasons"),
+    "nano_quorum.corroboration/3": {"node_states": NODE_STATES_SHA256},
+    "nano_quorum.corroboration/4": {
+        "node_states": NODE_STATES_SHA256, "stop_reasons": _STOP_REASONS_SHA256_4_5,
+    },
+    "nano_quorum.corroboration/5": {
+        "node_states": NODE_STATES_SHA256, "stop_reasons": _STOP_REASONS_SHA256_4_5,
+    },
+    RECEIPT_SCHEMA: {"node_states": NODE_STATES_SHA256, "stop_reasons": STOP_REASONS_SHA256},
 }
 
 
@@ -826,14 +843,18 @@ def verify_receipt_vocabulary(record) -> bool:
     the record's inline "node_states" table hashes (see `node_states_sha256`)
     to the record's own "node_states_sha256" AND to `NODE_STATES_SHA256`, its
     inline "stop_reasons" table likewise hashes to its "stop_reasons_sha256"
-    AND to `STOP_REASONS_SHA256`, and its "schema" is one of
-    "nano_quorum.corroboration/3", "nano_quorum.corroboration/4" or
-    `RECEIPT_SCHEMA` ("nano_quorum.corroboration/5"). All three carry the
-    node-state vocabulary /3 pinned; a /3 record predates "stop_reasons", so
-    for /3 only "node_states" and its hash are checked. False for an edited
-    table, an edited or missing hash, or a record of any other schema (/2, a
-    later /6, a missing or non-string "schema"). Nothing is raised for a
-    well-formed JSON object; a string that is not JSON raises ValueError.
+    AND to the stop-reason hash its schema pinned, and its "schema" is one of
+    "nano_quorum.corroboration/3", "nano_quorum.corroboration/4",
+    "nano_quorum.corroboration/5" or `RECEIPT_SCHEMA`
+    ("nano_quorum.corroboration/6"). All four carry the node-state vocabulary
+    /3 pinned; a /3 record predates "stop_reasons", so for /3 only
+    "node_states" and its hash are checked. /4 and /5 carry the stop-reason
+    table they pinned (10cd1fcb...); /6 carries `STOP_REASONS_SHA256`, whose
+    "exhausted" text names `permanent`. False for an edited table, an edited
+    or missing hash, a stop-reason table of another schema, or a record of any
+    other schema (/2, a later /7, a missing or non-string "schema"). Nothing
+    is raised for a well-formed JSON object; a string that is not JSON raises
+    ValueError.
     """
     if isinstance(record, (str, bytes)):
         record = json.loads(record)
@@ -842,8 +863,7 @@ def verify_receipt_vocabulary(record) -> bool:
     tables = _VOCABULARY_TABLES_OF_SCHEMA.get(record["schema"])
     if tables is None:
         return False
-    pins = {"node_states": NODE_STATES_SHA256, "stop_reasons": STOP_REASONS_SHA256}
-    for key, pinned in ((name, pins[name]) for name in tables):
+    for key, pinned in tables.items():
         table = record.get(key)
         if not isinstance(table, dict):
             return False
@@ -1215,10 +1235,13 @@ class Corroboration:
     A `Corroboration` is never a refusal - a refusal raises (`Mismatch`,
     `Disagreement`). `to_json()` says so in the record itself: `"refusal":
     false` always, and `"ask_again": true` exactly when the receipt is
-    unsettled, so a cached unsettled receipt cannot be read as "rejected".
-    Beside it, `"ask_again_not_before"` (see `not_before`) says from when, and
-    `"retry_after_s"` the delay it was computed with. `retry_after` is not
-    part of equality.
+    unsettled and not `permanent`, so a cached unsettled receipt cannot be
+    read as "rejected". `"permanent"` (see `permanent`) is written beside it:
+    a permanent unsettled receipt has `"ask_again": false` - asking again can
+    never settle it - and is still no refusal. `"ask_again_not_before"` (see
+    `not_before`) says from when to ask again, null exactly when
+    `"ask_again"` is false or no stop was recorded, and `"retry_after_s"` the
+    delay it was computed with. `retry_after` is not part of equality.
 
     `stop` is the `Stop` that ended the check: "quorum-reached" for a settled
     receipt, "exhausted" for an unsettled one, with the k of n in force and
@@ -1329,13 +1352,17 @@ class Corroboration:
                 "schema": RECEIPT_SCHEMA,
                 "settled": self.receipt.settled,
                 # Unsettled means "not yet / could not decide", never "no":
-                # whoever reads a cached record must ask again, not refuse.
+                # whoever reads a cached record must not refuse on it, and asks
+                # again unless it is permanent.
                 "refusal": False,
-                "ask_again": not self.receipt.settled,
+                # False for a permanent unsettled receipt: an endpoint showed
+                # the block can never be bound, so asking again cannot help.
+                "ask_again": not self.receipt.settled and not self.permanent,
+                "permanent": self.permanent,
                 # When to ask again: the moment the check stopped plus the
-                # configured delay. `ask_again` stays the boolean it was, for
-                # readers that test it; null here exactly when it is false (or
-                # when no stop was recorded).
+                # configured delay. `ask_again` stays a boolean, for readers
+                # that test it; null here exactly when it is false (or when no
+                # stop was recorded).
                 "ask_again_not_before": self.not_before,
                 "retry_after_s": self.retry_after,
                 # Why the loop stopped and the k-of-n rule in force; null for a
@@ -1460,9 +1487,11 @@ def distinct_endpoints(rpc_urls, agree: int = AGREE_DEFAULT) -> tuple[str, ...]:
 # `balance_corroborated` below still reads a balance reply directly, and
 # TypeError for a reply whose fields are the wrong type. http.client.HTTPException
 # is a body cut short (IncompleteRead) or a status line that is not HTTP: it is
-# not an OSError, and it is still no answer. All of them mean the same thing
-# here: this endpoint told us nothing, ask the next one.
-_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException)
+# not an OSError, and it is still no answer. RecursionError is a body nested
+# too deeply for `json.loads` to parse: a RuntimeError, not a ValueError, and
+# no answer either. All of them mean the same thing here: this endpoint told us
+# nothing, ask the next one.
+_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException, RecursionError)
 
 
 def post_json_failover(rpc_urls, payload: dict):

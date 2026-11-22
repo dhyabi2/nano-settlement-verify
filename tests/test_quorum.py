@@ -2318,23 +2318,57 @@ def test_attempt_and_return_times_that_contradict_the_read_are_refused(state, kw
         nano_quorum.Observation(A, state, at(2), **kwargs)
 
 
-def test_the_record_with_ask_order_is_schema_5(monkeypatch):
-    """The per-node record changed shape again (ask_index, and the receipt's
-    ask_order), so the schema string says so; both vocabulary pins are the ones
-    /4 pinned, so the same tables under /4 or /3 still read as that vocabulary,
-    and under any other schema do not."""
+# The "exhausted" stop reason as /4 and /5 wrote it, before it named `permanent`.
+EXHAUSTED_4_5 = (
+    "every configured endpoint was asked and fewer than k reported the same confirmed "
+    "send: the receipt is unsettled (ask again), or NotCorroborated is raised when fewer "
+    "than k answered at all"
+)
+STOP_REASONS_SHA256_4_5 = "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
+
+
+def as_schema_4_or_5(record, schema):
+    """`record` as 2.0.0 (/5) or /4 wrote it: the old stop-reason table, no "permanent"."""
+    record = json.loads(json.dumps(record))
+    record["schema"] = schema
+    record["stop_reasons"]["exhausted"] = EXHAUSTED_4_5
+    record["stop_reasons_sha256"] = STOP_REASONS_SHA256_4_5
+    del record["permanent"]
+    return record
+
+
+def test_the_record_with_permanent_is_schema_6(monkeypatch):
+    """The record gained "permanent", and the "exhausted" stop reason now says a
+    permanent receipt is not asked again, so the schema string says so and the
+    stop-reason table is re-pinned (deliberately: 10cd1fcb... -> 9a507588...).
+    The node-state pin is the one /3 pinned, so the same record relabelled /3
+    still reads as that vocabulary; relabelled /4 or /5 it carries the wrong
+    stop-reason table, and under any other schema it does not read at all."""
     nodes(monkeypatch, {A: send_block(), B: send_block()})
     record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
-    assert record["schema"] == "nano_quorum.corroboration/5"
+    assert record["schema"] == "nano_quorum.corroboration/6"
     assert nano_quorum.verify_receipt_vocabulary(record) is True
     assert record["node_states_sha256"] == "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
-    assert record["stop_reasons_sha256"] == "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
-    for older in ("nano_quorum.corroboration/4", "nano_quorum.corroboration/3"):
-        record["schema"] = older
-        assert nano_quorum.verify_receipt_vocabulary(record) is True
-    for other in ("nano_quorum.corroboration/2", "nano_quorum.corroboration/6", "", None, 5):
+    assert record["stop_reasons_sha256"] == "9a507588586951769eccae134186cefe5915f6afaf7e8b79eeaa86eac6b7a983"
+    record["schema"] = "nano_quorum.corroboration/3"
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    for other in ("nano_quorum.corroboration/4", "nano_quorum.corroboration/5",
+                  "nano_quorum.corroboration/2", "nano_quorum.corroboration/7", "", None, 6):
         record["schema"] = other
         assert nano_quorum.verify_receipt_vocabulary(record) is False
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/4", "nano_quorum.corroboration/5"])
+def test_a_stored_schema_4_or_5_receipt_still_verifies_with_its_own_stop_reasons(monkeypatch, schema):
+    """A /5 receipt 2.0.0 wrote carries the stop-reason table it pinned; it still
+    reads as /5 (and /4), and not as /6, whose table is a different one."""
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = as_schema_4_or_5(
+        json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json()), schema)
+    assert nano_quorum.node_states_sha256(record["stop_reasons"]) == STOP_REASONS_SHA256_4_5
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+    record["schema"] = "nano_quorum.corroboration/6"
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
 
 
 # A receipt exactly as main (schema /3) wrote it: verify_corroborated on main
@@ -2354,7 +2388,7 @@ def test_a_stored_schema_3_receipt_from_main_still_verifies():
 
 
 @pytest.mark.parametrize("schema", [
-    "nano_quorum.corroboration/2", "nano_quorum.corroboration/6", "nano_quorum.corroboration/30",
+    "nano_quorum.corroboration/2", "nano_quorum.corroboration/7", "nano_quorum.corroboration/30",
     "nano_quorum.corroboration/3 ", "other/3", None, 3,
 ])
 def test_a_schema_3_receipt_under_an_unknown_schema_is_refused(schema):
@@ -2389,11 +2423,14 @@ def test_a_schema_3_receipt_with_an_altered_vocabulary_is_refused(edit):
         assert nano_quorum.verify_receipt_vocabulary(record) is False
 
 
-@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/4", "nano_quorum.corroboration/5"])
+@pytest.mark.parametrize("schema", [
+    "nano_quorum.corroboration/4", "nano_quorum.corroboration/5", "nano_quorum.corroboration/6",
+])
 def test_a_schema_4_or_5_receipt_still_needs_its_stop_reasons_table(monkeypatch, schema):
     nodes(monkeypatch, {A: send_block(), B: send_block()})
     record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
-    record["schema"] = schema
+    if schema != "nano_quorum.corroboration/6":
+        record = as_schema_4_or_5(record, schema)
     assert nano_quorum.verify_receipt_vocabulary(record) is True
     record["stop_reasons"]["quorum-reached"] += " (edited)"
     assert nano_quorum.verify_receipt_vocabulary(record) is False
@@ -2877,6 +2914,45 @@ def test_one_endpoint_showing_the_legacy_previous_makes_the_unsettled_receipt_pe
     assert out.not_before is None
 
 
+def test_a_permanent_unsettled_record_does_not_say_ask_again(monkeypatch):
+    """The stored record of a permanent unsettled receipt says so in itself:
+    "permanent" true, "ask_again" false (asking again can never settle it), and
+    "ask_again_not_before" null exactly because "ask_again" is false. It is
+    still no refusal, and its vocabulary still verifies."""
+    asked = _send_after_legacy_receive(monkeypatch, not_seen_on=(B, C))
+    record = json.loads(verify_corroborated(asked, ONE_XNO, PAYEE, [A, B, C], retry_after=30).to_json())
+    assert record["settled"] is False
+    assert record["refusal"] is False
+    assert record["permanent"] is True
+    assert record["ask_again"] is False
+    assert record["ask_again_not_before"] is None
+    assert record["stop"]["reason"] == "exhausted"
+    assert nano_quorum.verify_receipt_vocabulary(record) is True
+
+
+def test_an_ordinary_unsettled_record_is_not_permanent_and_says_ask_again(monkeypatch):
+    """The control: an unsettled receipt nobody showed to be unbindable is a
+    retry, and its record says so; a settled one is neither."""
+    nodes(monkeypatch, {A: send_block(), B: send_block(confirmed="false"), C: OSError("refused")})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], retry_after=30).to_json())
+    assert record["settled"] is False
+    assert record["permanent"] is False
+    assert record["ask_again"] is True
+    assert record["ask_again_not_before"] is not None
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    record = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert record["settled"] is True
+    assert record["permanent"] is False
+    assert record["ask_again"] is False
+
+
+def test_the_exhausted_stop_reason_does_not_tell_a_permanent_receipt_to_ask_again():
+    text = nano_quorum.STOP_REASONS["exhausted"]
+    assert "unless permanent is true" in text
+    assert "ask_again is false" in text
+    assert "do not retry" in text
+
+
 def test_an_ordinary_not_corroborated_is_not_permanent_and_keeps_its_message(monkeypatch):
     """The control: endpoints that gave nothing are a retry, as before."""
     nodes(monkeypatch, {A: OSError("refused"), B: OSError("refused")})
@@ -3094,3 +3170,17 @@ def test_a_body_cut_short_is_an_unreadable_node_not_a_crash(monkeypatch, error):
     assert out.receipt.settled is True
     assert out.failed == (A,)
     assert out.agreed == (B, C)
+
+
+def test_a_body_nested_too_deeply_to_parse_is_an_unreadable_node_not_a_crash(monkeypatch):
+    """`json.loads` raises RecursionError (not ValueError) on a deeply nested
+    body; that node told us nothing, and the others still settle."""
+    def too_deep(payload):
+        return json.loads("[" * 200000 + "]" * 200000)
+
+    nodes(monkeypatch, {A: too_deep, B: send_block(), C: send_block()})
+    out = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C])
+    assert out.receipt.settled is True
+    assert out.failed == (A,)
+    assert out.observations[0].error_kind == "RecursionError"
+    assert nano_quorum.post_json_failover([A, B], {"action": "block_info"})[1] == B

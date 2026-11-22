@@ -106,7 +106,10 @@ what 2.0.0 settled; none settles what 2.0.0 refused. In short (the details are u
 - A `confirmed` answer whose contents are too sparse to recompute the block hash
   (amount, payee and height only) is no witness: it is `unreadable` (error kind
   `UnhashableContents`). A quorum of such answers, which 2.0.0 settled, is now
-  `NotCorroborated`.
+  `NotCorroborated`. Being no witness, such an answer can no longer contradict another
+  either: where 2.0.0 raised `Disagreement` (refuse) because a sparse answer differed from
+  a full one, 2.1.0 may raise `NotCorroborated` (hold) instead. That is the one way 2.1.0
+  turns a refusal into a hold; it still settles nothing 2.0.0 refused.
 - A `confirmed` answer whose hashed contents pay someone else, are not a send, or are on
   another chain than its `block_account` names is no witness (`UnboundAnswer`).
 - The amount is bound to hashed balances, not taken on the node's word: each answering
@@ -122,7 +125,8 @@ what 2.0.0 settled; none settles what 2.0.0 refused. In short (the details are u
   `UnbindableAmount`, `permanent` True and `not_before` None, and its message says
   "PERMANENT ... do not retry". A caller that holds and retries every `NotCorroborated`
   must check `permanent` first, or it retries such a send forever. An unsettled
-  `Corroboration` has the same `permanent` property.
+  `Corroboration` has the same `permanent` property, and its `to_json()` record (schema
+  `/6`) writes `"permanent": true` with `"ask_again": false`.
 - `NotCorroborated`'s message no longer says "0 of 2 endpoints answered" when both
   answered `confirmed` but are no witness: it counts them apart (`witnessless`).
 - A reply cut short (`http.client.HTTPException`) is an unreadable endpoint in
@@ -160,7 +164,7 @@ public node list after a pip install instead of an empty list.
 | `python3 -m links.public_check ...` | `python3 -m nano_settlement_verify.links.public_check ...` |
 
 `nano_settlement_verify.__version__` is new in 2.0.0 (it reads `2.1.0` from this release). Stored records keep their
-schema names (`"nano_quorum.corroboration/5"` and the rest): those are data, not import paths.
+schema names (`"nano_quorum.corroboration/5"`, `/6` and the rest): those are data, not import paths.
 
 The skill's CLI (`skills/nano-settlement-verify/verify_cli.py`) asks the node in
 `$NANO_RPC_URL` when no `RPC_URL` argument is given - so if you export that variable for
@@ -429,16 +433,20 @@ slack, or pass `not_after=None` to have no deadline.
   `read_at` out: two calls whose nodes said the same things are still equal and hash alike.
 - `Corroboration.to_json()` is larger: it now embeds the `observations` list, the full
   `node_states` table (each state with its meaning) and `node_states_sha256`.
-- `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/5"`). Code
-  that compared the record as text, or read keys by position, sees a different string. (`/2`
-  existed only on an unreleased branch.) `verify_receipt_vocabulary` accepts exactly three
-  schemas: `"nano_quorum.corroboration/3"`, `"nano_quorum.corroboration/4"` and
-  `"nano_quorum.corroboration/5"`. All three carry the same node-state vocabulary, so a stored
-  `/3` record written by main still returns True when its `"node_states"` table hashes to its
+- `to_json()` now starts with a new key, `"schema"` (`"nano_quorum.corroboration/6"` from
+  2.1.0; 2.0.0 wrote `/5`). Code that compared the record as text, or read keys by position,
+  sees a different string. (`/2` existed only on an unreleased branch.)
+  `verify_receipt_vocabulary` accepts exactly four schemas: `"nano_quorum.corroboration/3"`,
+  `/4`, `/5` and `/6`. All four carry the same node-state vocabulary, so a stored `/3`
+  record written by main still returns True when its `"node_states"` table hashes to its
   own `"node_states_sha256"` and to `NODE_STATES_SHA256`; a `/3` record predates
-  `"stop_reasons"`, so that table is checked only for `/4` and `/5`. Any other schema (`/2`,
-  a later `/6`, a missing or non-string `"schema"`), and any record whose table or hash
-  differs from the pinned one, still returns False.
+  `"stop_reasons"`, so that table is checked only for `/4` to `/6`, each against the hash
+  its schema pinned (`/4` and `/5`: `10cd1fcb...`; `/6`: `STOP_REASONS_SHA256`). Any other
+  schema (`/2`, a later `/7`, a missing or non-string `"schema"`), and any record whose table
+  or hash differs from the one its schema pinned, still returns False.
+- Schema `/6` (2.1.0) writes `"permanent"` after `"ask_again"` (see `Corroboration.permanent`),
+  and `"ask_again"` is false for a permanent unsettled receipt. The `"exhausted"` stop reason
+  now says so, so the stop-reason table and its pin changed with it.
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
@@ -524,8 +532,10 @@ slack, or pass `not_after=None` to have no deadline.
   raised by `verify_corroborated` gain `.observations`, and `Disagreement` gains
   `.node_observations`, with the same per-endpoint entries; `Disagreement.observations` is unchanged.
 - `to_json()` writes `"refusal": false` and `"ask_again"` (true exactly when the receipt is
-  unsettled) after `"settled"`, so a cached unsettled receipt says in itself that it is
-  "not yet, ask again" and not a rejection. A refusal is never a receipt: it raises.
+  unsettled and not permanent) after `"settled"`, so a cached unsettled receipt says in
+  itself that it is "not yet, ask again" and not a rejection - or, with `"permanent": true`
+  and `"ask_again": false`, that asking again can never settle it, which is still no
+  rejection. A refusal is never a receipt: it raises.
 - An `Observation` in any state but `not-asked` now raises `ValueError` when its `read_at`
   is empty or is not a UTC time of the one shape a record carries: extended date, `T`,
   hours, minutes and seconds, an optional fraction of 1 to 6 digits, and `Z` or `+00:00`
@@ -568,13 +578,15 @@ slack, or pass `not_after=None` to have no deadline.
   check has no deadline and no budget, so neither is a reason. The table of reasons and their
   meanings is written inline as `"stop_reasons"` with `"stop_reasons_sha256"` (computed like
   `node_states_sha256`, pinned as `nano_settlement_verify.quorum.STOP_REASONS_SHA256` =
-  `10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342`), and
+  `9a507588586951769eccae134186cefe5915f6afaf7e8b79eeaa86eac6b7a983` for `/6`; `/4` and `/5`
+  pinned `10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342`), and
   `verify_receipt_vocabulary` now checks it too. `Corroboration.stop` holds it (null in the
   JSON for one built by hand; not part of `==`), and a raised `Mismatch`, `Disagreement` or
   `NotCorroborated` carries it as `.stop`.
-- `"ask_again"` keeps its boolean (true exactly when unsettled), and schema `/4` writes
-  beside it `"ask_again_not_before"`: when to ask again, as UTC ISO-8601, null when the
-  receipt is settled. The rule is `stop.at + retry_after` seconds, and the record writes the
+- `"ask_again"` keeps its boolean (true exactly when unsettled and not permanent), and
+  schema `/4` writes beside it `"ask_again_not_before"`: when to ask again, as UTC ISO-8601,
+  null exactly when `"ask_again"` is false (the receipt is settled, or permanent) or no stop
+  was recorded. The rule is `stop.at + retry_after` seconds, and the record writes the
   delay as `"retry_after_s"`, so a reader can recompute it. `retry_after` is a new keyword of
   `verify_corroborated` (default 0, a finite number from 0 to 10\*\*9, refused before any
   call otherwise). The library still waits for nothing and retries nothing: it does not know
@@ -796,17 +808,17 @@ carries it as `.observations`, and `Disagreement` as `.node_observations` (its
 `not-seen` is an answer (the node has no such block); `unreadable` is the absence of one
 (the node errored, timed out or sent something that is not a node reply), and an
 `unreadable` entry carries `"error": {"kind", "message"}` that no other state has. The
-record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/5"` and
+record pins this itself: `to_json()` writes `"schema": "nano_quorum.corroboration/6"` and
 `"node_states"`, the full state vocabulary (`nano_settlement_verify.quorum.NODE_STATES`) with a one-line
 meaning for each, so a stored receipt can be read without this code. Beside them it
 writes `"node_states_sha256"`: the SHA-256 hex of
 `json.dumps(node_states, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
-encoded as UTF-8. For schema `/5` (and `/4` and `/3` before it: the state table did not change) that is
+encoded as UTF-8. For schema `/6` (and `/5`, `/4` and `/3` before it: the state table did not change) that is
 `3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c`
 (`nano_settlement_verify.quorum.NODE_STATES_SHA256`; the module refuses to import if the table and this
 value disagree). `nano_settlement_verify.quorum.verify_receipt_vocabulary(record)` recomputes it from a
 stored record's own table and returns True only if it matches both the record's field
-and the pinned value, so an edited table, or a `/5` record with a different vocabulary,
+and the pinned value, so an edited table, or a `/6` record with a different vocabulary,
 is caught.
 
 `node_states_sha256` covers the `node_states` table and nothing else. It does not protect
@@ -924,7 +936,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1261 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1268 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
