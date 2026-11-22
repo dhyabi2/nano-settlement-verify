@@ -113,8 +113,9 @@ _STATE_PREAMBLE = (6).to_bytes(32, "big")
 
 # "This node told us nothing usable" - the family nano_quorum uses. A body cut
 # short (http.client.IncompleteRead) or a status line that is not HTTP is an
-# http.client.HTTPException, not an OSError, and is still no answer.
-_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException)
+# http.client.HTTPException, not an OSError, and is still no answer. So is a
+# body nested too deeply for json.loads, which raises RecursionError.
+_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException, RecursionError)
 
 
 def block_hash_of(contents: object) -> str | None:

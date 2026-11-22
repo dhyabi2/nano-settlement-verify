@@ -415,6 +415,23 @@ def test_read_nodes_keeps_a_body_cut_short_as_a_failed_node_not_a_crash(error):
     assert verdict(block_hash, reads)["missing"] == ["nodes_read"]
 
 
+def test_read_nodes_keeps_a_body_nested_too_deeply_as_a_failed_node_not_a_crash():
+    """json.loads raises RecursionError (not ValueError) on a deeply nested body:
+    that node is kept as a failure, and the verdict is still computed."""
+    block_hash, reply = state_send()
+
+    def fetch(url, payload):
+        if url == NODE_B:
+            return json.loads("[" * 200000 + "]" * 200000)
+        return reply
+
+    reads = read_nodes(block_hash, [NODE_A, NODE_B], fetch=fetch)
+
+    assert reads[0] == (NODE_A, reply)
+    assert isinstance(reads[1][1], RecursionError)
+    assert verdict(block_hash, reads)["missing"] == ["nodes_read"]
+
+
 def test_read_nodes_refuses_one_url_string():
     with pytest.raises(TypeError):
         read_nodes("AB" * 32, NODE_A, fetch=lambda u, p: {})

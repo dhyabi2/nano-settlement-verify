@@ -221,8 +221,10 @@ try:
     # Everything in here needs the public node. A sandbox with no egress, a
     # rate limit or a bad minute at the node must read as "not checked" and
     # leave the nine loopback cases above standing - never as a failure of the
-    # library. NotCorroborated is in this list for the same reason: it is what
-    # a throttled endpoint looks like from the inside.
+    # library. NotCorroborated is caught for the same reason: it is what a
+    # throttled endpoint looks like from the inside - unless it is permanent
+    # (an endpoint answered and showed the send can never be bound), which is
+    # reported as permanent/unbindable, never as "not reachable".
     out = verify_corroborated(LIVE_HASH, LIVE_RAW, LIVE_PAYEE, [LIVE_RPC, RELAY])
     print(f"    -> {out.to_json()}")
     assert out.receipt.settled is True
@@ -239,7 +241,17 @@ try:
     balance = balance_corroborated(LIVE_PAYEE, [LIVE_RPC, RELAY])
     print(f"    live confirmed (balance_raw, receivable_raw) -> {balance}")
     assert isinstance(balance[0], int) and balance[0] > 0
-except (OSError, ValueError, NotCorroborated) as error:
+except NotCorroborated as error:
+    if error.permanent:
+        # The node answered: it showed the block's previous block is a legacy
+        # block hashing no balance, so the send is unbindable - asking again can
+        # never settle it. That is no reachability problem, and this block is
+        # expected to settle, so it fails rather than reading as "not checked".
+        raise SystemExit(
+            f"FAIL: the live block is permanently unbindable (NotCorroborated, permanent): {error}"
+        )
+    print(f"    skipped, the node is not reachable from here: {type(error).__name__}: {error}")
+except (OSError, ValueError) as error:
     print(f"    skipped, the node is not reachable from here: {type(error).__name__}: {error}")
 finally:
     s6.shutdown()

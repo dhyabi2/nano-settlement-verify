@@ -650,11 +650,14 @@ def _repr(value) -> str:
 # vocabulary changed, so both pinned hashes are the ones /4 pinned.
 #
 # /6 adds the receipt-level "permanent" (true when asking again can never settle
-# the block, see `Corroboration.permanent`), and "ask_again" is now false for a
-# permanent unsettled receipt. The "exhausted" stop reason says so, so the
+# the block, see `Corroboration.permanent`). "ask_again" keeps its /3 meaning,
+# true exactly when the receipt is unsettled, so a /5 reader that serves only
+# when neither "refusal" nor "ask_again" is true never serves an unsettled /6
+# record; "permanent" alone says "do not retry", and "ask_again_not_before" is
+# null for a permanent receipt. The "exhausted" stop reason says so, so the
 # stop-reason vocabulary, and STOP_REASONS_SHA256, changed with it; /4 and /5
-# records keep the hash they pinned (`_STOP_REASONS_SHA256_4_5`). The node-state
-# vocabulary is unchanged.
+# records keep the hash they pinned (`_STOP_REASONS_SHA256_4_5`), and carry no
+# "permanent" key. The node-state vocabulary is unchanged.
 RECEIPT_SCHEMA = "nano_quorum.corroboration/6"
 
 # The only states an `Observation` can carry, in a fixed order, each with what it
@@ -665,10 +668,15 @@ RECEIPT_SCHEMA = "nano_quorum.corroboration/6"
 # "Unreadable" also covers a node that did answer "confirmed" but whose answer
 # is no witness: contents too sparse to hash (error kind "UnhashableContents"),
 # or contents that hash to the block while the payee, payer chain, subtype or
-# amount it asserts are not that block's (error kind "UnboundAnswer"). Such a
-# node told us nothing we could tie to the block; `error_kind` and `error` say
-# which. The table text is pinned (NODE_STATES_SHA256), so this is said here,
-# not in it.
+# amount it asserts are not that block's (error kind "UnboundAnswer"), or a
+# send whose previous block is a legacy block hashing no balance (error kind
+# "UnbindableAmount", which makes the receipt `permanent`). Such a node told us
+# nothing we could tie to the block; `error_kind` and `error` say which. This
+# widens "unreadable" from "gave no answer" to "gave no answer, or answered but
+# unbindable"; a reader that needs the difference reads the error kind. No new
+# state was added, so the table text and its pin (NODE_STATES_SHA256), shared by
+# /3 to /6 records, are unchanged and existing readers keep working; that is why
+# this is said here, not in the table.
 NODE_STATES = {
     "confirmed": "the node answered: it has the block, confirmed, and it matches the expected payment",
     "unconfirmed": "the node answered: it has the block, but has not confirmed it yet",
@@ -756,9 +764,10 @@ STOP_REASONS = {
     ),
     "exhausted": (
         "every configured endpoint was asked and fewer than k reported the same confirmed "
-        "send: the receipt is unsettled (ask again, unless permanent is true: an endpoint "
-        "showed the block can never be bound, so ask_again is false - do not retry), or "
-        "NotCorroborated is raised when fewer than k answered at all"
+        "send: the receipt is unsettled and ask_again is true (never serve it; when "
+        "permanent is also true, an endpoint showed the block can never be bound: do not "
+        "retry, and ask_again_not_before is null), or NotCorroborated is raised when fewer "
+        "than k answered at all"
     ),
     "mismatch": (
         "an endpoint reported the block confirmed and not the expected payment: Mismatch is "
@@ -772,8 +781,9 @@ STOP_REASONS = {
 }
 
 # The hash of `STOP_REASONS` that RECEIPT_SCHEMA names, pinned as NODE_STATES_SHA256 is.
-# Re-pinned for /6, whose "exhausted" text says a permanent receipt is not asked again.
-STOP_REASONS_SHA256 = "9a507588586951769eccae134186cefe5915f6afaf7e8b79eeaa86eac6b7a983"
+# Re-pinned for /6, whose "exhausted" text names `permanent` (do not retry) while
+# keeping ask_again true for every unsettled receipt.
+STOP_REASONS_SHA256 = "0eb556db32c7b048ecc1c49b4aba72bfc5d44fdcbc72eb26e97832849278a55e"
 # The stop-reason table /4 and /5 wrote, before "exhausted" named `permanent`.
 _STOP_REASONS_SHA256_4_5 = "10cd1fcb6b1e1d6d8c3669184a2be0d47697364bd6b13b246ad33cae8c1e1342"
 
@@ -851,7 +861,8 @@ def verify_receipt_vocabulary(record) -> bool:
     "node_states" and its hash are checked. /4 and /5 carry the stop-reason
     table they pinned (10cd1fcb...); /6 carries `STOP_REASONS_SHA256`, whose
     "exhausted" text names `permanent`. False for an edited table, an edited
-    or missing hash, a stop-reason table of another schema, or a record of any
+    or missing hash, a stop-reason table of another schema, a /3, /4 or /5
+    record that carries the /6-only key "permanent", or a record of any
     other schema (/2, a later /7, a missing or non-string "schema"). Nothing
     is raised for a well-formed JSON object; a string that is not JSON raises
     ValueError.
@@ -862,6 +873,11 @@ def verify_receipt_vocabulary(record) -> bool:
         return False
     tables = _VOCABULARY_TABLES_OF_SCHEMA.get(record["schema"])
     if tables is None:
+        return False
+    # "permanent" is a /6 key: a record labelled /3, /4 or /5 that carries it
+    # was not written in that vocabulary (a /5 reader would not know that
+    # "permanent": true means "do not retry").
+    if record["schema"] != RECEIPT_SCHEMA and "permanent" in record:
         return False
     for key, pinned in tables.items():
         table = record.get(key)
@@ -1235,12 +1251,13 @@ class Corroboration:
     A `Corroboration` is never a refusal - a refusal raises (`Mismatch`,
     `Disagreement`). `to_json()` says so in the record itself: `"refusal":
     false` always, and `"ask_again": true` exactly when the receipt is
-    unsettled and not `permanent`, so a cached unsettled receipt cannot be
-    read as "rejected". `"permanent"` (see `permanent`) is written beside it:
-    a permanent unsettled receipt has `"ask_again": false` - asking again can
-    never settle it - and is still no refusal. `"ask_again_not_before"` (see
-    `not_before`) says from when to ask again, null exactly when
-    `"ask_again"` is false or no stop was recorded, and `"retry_after_s"` the
+    unsettled - permanent or not - so a cached unsettled receipt can be read
+    neither as "rejected" nor, by a reader that serves when neither flag is
+    set, as "settled". `"permanent"` (see `permanent`) is written beside it:
+    true means asking again can never settle the block, so do not retry -
+    and still do not serve, and it is still no refusal. `"ask_again_not_before"`
+    (see `not_before`) says from when to ask again, null when the receipt is
+    settled or permanent or no stop was recorded, and `"retry_after_s"` the
     delay it was computed with. `retry_after` is not part of equality.
 
     `stop` is the `Stop` that ended the check: "quorum-reached" for a settled
@@ -1352,17 +1369,20 @@ class Corroboration:
                 "schema": RECEIPT_SCHEMA,
                 "settled": self.receipt.settled,
                 # Unsettled means "not yet / could not decide", never "no":
-                # whoever reads a cached record must not refuse on it, and asks
-                # again unless it is permanent.
+                # whoever reads a cached record must not refuse on it, and
+                # must not serve on it either.
                 "refusal": False,
-                # False for a permanent unsettled receipt: an endpoint showed
-                # the block can never be bound, so asking again cannot help.
-                "ask_again": not self.receipt.settled and not self.permanent,
+                # True exactly when unsettled, permanent or not: a reader that
+                # serves when neither "refusal" nor "ask_again" is set must
+                # never serve an unsettled receipt (fail closed).
+                "ask_again": not self.receipt.settled,
+                # True when asking again can never settle the block: do not
+                # retry (and still do not serve).
                 "permanent": self.permanent,
                 # When to ask again: the moment the check stopped plus the
                 # configured delay. `ask_again` stays a boolean, for readers
-                # that test it; null here exactly when it is false (or when no
-                # stop was recorded).
+                # that test it; null when the receipt is settled or permanent
+                # (or when no stop was recorded).
                 "ask_again_not_before": self.not_before,
                 "retry_after_s": self.retry_after,
                 # Why the loop stopped and the k-of-n rule in force; null for a
@@ -2335,6 +2355,15 @@ def replay_receipt(record) -> dict:
     every node up to it must not be, and the record's "stop" reason and
     moment, "settled" and "agreed" must be what that walk gives.
 
+    The retry fields are re-derived from the observations, never taken from
+    the record: "ask_again" must be true exactly when the walk leaves the
+    receipt unsettled; "permanent" (schema /6 only, where it is required) must
+    be true exactly when the receipt is unsettled and an "unreadable"
+    observation has error kind "UnbindableAmount"; and "ask_again_not_before"
+    must be null when the receipt is settled or permanent, else "stop.at" plus
+    "retry_after_s" seconds. A /3, /4 or /5 record carrying "permanent" is a
+    mismatch.
+
     Returns `{"verdict": "match" | "mismatch", "problems": [...],
     "expected_stop": reason or None, "expected_not_asked": [...]}`. It checks
     order and stopping only - not amounts, not signatures, not whether any
@@ -2430,6 +2459,44 @@ def replay_receipt(record) -> dict:
         problems.append(f"settled is {record['settled']!r}, the replay stops on {reason!r}")
     if "agreed" in record and record["agreed"] != (agreed if reason == "quorum-reached" else []):
         problems.append("agreed is not the confirmed nodes the replay counts toward the quorum")
+
+    # 4. The retry fields follow from the walk and the observations, not from
+    # what the record says about itself.
+    settled = reason == "quorum-reached"
+    permanent = not settled and any(
+        entry.get("state") == "unreadable"
+        and isinstance(entry.get("error"), dict)
+        and entry["error"].get("kind") == _PERMANENT_KIND
+        for entry in seen
+    )
+    schema = record.get("schema")
+    if schema == RECEIPT_SCHEMA or "permanent" in record:
+        if schema in _VOCABULARY_TABLES_OF_SCHEMA and schema != RECEIPT_SCHEMA:
+            problems.append(f"permanent is a {RECEIPT_SCHEMA} key, but the record is {schema!r}")
+        elif record.get("permanent", None) is not permanent:
+            problems.append(
+                f"permanent is {record.get('permanent', '<missing>')!r}, "
+                f"the observations give {permanent!r}"
+            )
+    if schema == RECEIPT_SCHEMA or "ask_again" in record:
+        if record.get("ask_again", None) is not (not settled):
+            problems.append(
+                f"ask_again is {record.get('ask_again', '<missing>')!r}, but it is true "
+                f"exactly when unsettled, and the replay stops on {reason!r}"
+            )
+    if schema == RECEIPT_SCHEMA or "ask_again_not_before" in record:
+        if settled or permanent:
+            expected_not_before = None
+        else:
+            try:
+                expected_not_before = _not_before(stop.get("at"), _retry_after(record.get("retry_after_s")))
+            except (TypeError, ValueError, AttributeError) as error:
+                expected_not_before = "<not computable: %s>" % error
+        if record.get("ask_again_not_before", "<missing>") != expected_not_before:
+            problems.append(
+                f"ask_again_not_before is {record.get('ask_again_not_before', '<missing>')!r}, "
+                f"the replay gives {expected_not_before!r}"
+            )
     return result(reason, expected_not_asked)
 
 

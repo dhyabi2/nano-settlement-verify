@@ -2340,7 +2340,7 @@ def as_schema_4_or_5(record, schema):
 def test_the_record_with_permanent_is_schema_6(monkeypatch):
     """The record gained "permanent", and the "exhausted" stop reason now says a
     permanent receipt is not asked again, so the schema string says so and the
-    stop-reason table is re-pinned (deliberately: 10cd1fcb... -> 9a507588...).
+    stop-reason table is re-pinned (deliberately: 10cd1fcb... -> 0eb556db...; 2.1.0 drafts pinned 9a507588...).
     The node-state pin is the one /3 pinned, so the same record relabelled /3
     still reads as that vocabulary; relabelled /4 or /5 it carries the wrong
     stop-reason table, and under any other schema it does not read at all."""
@@ -2349,9 +2349,14 @@ def test_the_record_with_permanent_is_schema_6(monkeypatch):
     assert record["schema"] == "nano_quorum.corroboration/6"
     assert nano_quorum.verify_receipt_vocabulary(record) is True
     assert record["node_states_sha256"] == "3db25e35737038c4d04d16d1306184d7b70746ab726794e6473bf4c51ad4448c"
-    assert record["stop_reasons_sha256"] == "9a507588586951769eccae134186cefe5915f6afaf7e8b79eeaa86eac6b7a983"
+    assert record["stop_reasons_sha256"] == "0eb556db32c7b048ecc1c49b4aba72bfc5d44fdcbc72eb26e97832849278a55e"
     record["schema"] = "nano_quorum.corroboration/3"
+    # Relabelled /3 it still carries the /6-only "permanent" key, so it does not
+    # read as /3; without that key it does.
+    assert nano_quorum.verify_receipt_vocabulary(record) is False
+    permanent = record.pop("permanent")
     assert nano_quorum.verify_receipt_vocabulary(record) is True
+    record["permanent"] = permanent
     for other in ("nano_quorum.corroboration/4", "nano_quorum.corroboration/5",
                   "nano_quorum.corroboration/2", "nano_quorum.corroboration/7", "", None, 6):
         record["schema"] = other
@@ -2914,17 +2919,18 @@ def test_one_endpoint_showing_the_legacy_previous_makes_the_unsettled_receipt_pe
     assert out.not_before is None
 
 
-def test_a_permanent_unsettled_record_does_not_say_ask_again(monkeypatch):
+def test_a_permanent_unsettled_record_says_permanent_and_keeps_ask_again_true(monkeypatch):
     """The stored record of a permanent unsettled receipt says so in itself:
-    "permanent" true, "ask_again" false (asking again can never settle it), and
-    "ask_again_not_before" null exactly because "ask_again" is false. It is
-    still no refusal, and its vocabulary still verifies."""
+    "permanent" true (do not retry) and "ask_again_not_before" null, while
+    "ask_again" stays true exactly because it is unsettled - so a /5 reader that
+    serves when neither "refusal" nor "ask_again" is set holds it. It is still
+    no refusal, and its vocabulary still verifies."""
     asked = _send_after_legacy_receive(monkeypatch, not_seen_on=(B, C))
     record = json.loads(verify_corroborated(asked, ONE_XNO, PAYEE, [A, B, C], retry_after=30).to_json())
     assert record["settled"] is False
     assert record["refusal"] is False
     assert record["permanent"] is True
-    assert record["ask_again"] is False
+    assert record["ask_again"] is True
     assert record["ask_again_not_before"] is None
     assert record["stop"]["reason"] == "exhausted"
     assert nano_quorum.verify_receipt_vocabulary(record) is True
@@ -2946,11 +2952,13 @@ def test_an_ordinary_unsettled_record_is_not_permanent_and_says_ask_again(monkey
     assert record["ask_again"] is False
 
 
-def test_the_exhausted_stop_reason_does_not_tell_a_permanent_receipt_to_ask_again():
+def test_the_exhausted_stop_reason_keeps_ask_again_true_and_says_permanent_is_do_not_retry():
     text = nano_quorum.STOP_REASONS["exhausted"]
-    assert "unless permanent is true" in text
-    assert "ask_again is false" in text
+    assert "ask_again is true" in text
+    assert "never serve" in text
+    assert "permanent is also true" in text
     assert "do not retry" in text
+    assert "ask_again is false" not in text
 
 
 def test_an_ordinary_not_corroborated_is_not_permanent_and_keeps_its_message(monkeypatch):
@@ -3184,3 +3192,96 @@ def test_a_body_nested_too_deeply_to_parse_is_an_unreadable_node_not_a_crash(mon
     assert out.failed == (A,)
     assert out.observations[0].error_kind == "RecursionError"
     assert nano_quorum.post_json_failover([A, B], {"action": "block_info"})[1] == B
+
+
+# --- a /5 reader never serves an unsettled /6 record -------------------------------------
+#
+# main's README promised "ask_again true exactly when unsettled", so a reader
+# written against /5 may decide with `refusal ? refuse : ask_again ? retry : serve`.
+# A draft of /6 wrote "ask_again": false for a permanent unsettled receipt, and
+# that reader then SERVED it. Every unsettled shape must keep it from serving.
+
+
+def _reader_of_schema_5(record):
+    """A reader written against /5: it knows "refusal" and "ask_again", nothing else."""
+    if record["refusal"]:
+        return "refuse"
+    if record["ask_again"]:
+        return "retry"
+    return "serve"
+
+
+def _unsettled_records(monkeypatch):
+    """One stored record of each unsettled shape the check returns, by name."""
+    shapes = {}
+    nodes(monkeypatch, {A: send_block(), B: send_block(confirmed="false"), C: OSError("refused")})
+    shapes["unconfirmed"] = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B, C], retry_after=30)
+    nodes(monkeypatch, {A: {"error": "Block not found"}, B: send_block(confirmed="false")})
+    shapes["not_seen"] = verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B])
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: sparse_send(reply), B: {"error": "Block not found"}, C: {"error": "Block not found"}})
+    shapes["sparse"] = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C])
+    asked = _send_after_legacy_receive(monkeypatch, not_seen_on=(B, C))
+    shapes["legacy_three"] = verify_corroborated(asked, ONE_XNO, PAYEE, [A, B, C], retry_after=30)
+    return {name: json.loads(out.to_json()) for name, out in shapes.items()}
+
+
+def test_a_schema_5_reader_never_serves_an_unsettled_record_permanent_or_not(monkeypatch):
+    records = _unsettled_records(monkeypatch)
+    assert records["legacy_three"]["permanent"] is True
+    assert records["sparse"]["observations"][0]["error"]["kind"] == "UnhashableContents"
+    for name, record in records.items():
+        assert record["settled"] is False, name
+        assert _reader_of_schema_5(record) != "serve", name
+        assert record["ask_again"] is True, name
+    # The control: a settled record is served.
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    settled = json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+    assert _reader_of_schema_5(settled) == "serve"
+
+
+def test_ask_again_is_unsettled_and_not_before_is_null_when_settled_or_permanent(monkeypatch):
+    for name, record in _unsettled_records(monkeypatch).items():
+        assert record["ask_again"] is (not record["settled"]), name
+        assert (record["ask_again_not_before"] is None) is record["permanent"], name
+    record = _unsettled_records(monkeypatch)["legacy_three"]
+    assert record["permanent"] is True and record["ask_again_not_before"] is None
+
+
+def test_replay_re_derives_the_retry_fields_and_does_not_trust_the_record(monkeypatch):
+    """replay_receipt matches each untouched record, and catches any edit of
+    "permanent", "ask_again" or "ask_again_not_before" the observations do not give."""
+    records = _unsettled_records(monkeypatch)
+    for name, record in records.items():
+        assert nano_quorum.replay_receipt(record)["verdict"] == "match", (name, nano_quorum.replay_receipt(record))
+    edits = {
+        "legacy_three": [("permanent", False), ("ask_again", False),
+                         ("ask_again_not_before", "2026-11-09T12:00:00.000Z")],
+        "unconfirmed": [("permanent", True), ("ask_again", False), ("ask_again_not_before", None)],
+        "sparse": [("permanent", True), ("ask_again_not_before", None)],
+    }
+    for name, changes in edits.items():
+        for key, value in changes:
+            tampered = json.loads(json.dumps(records[name]))
+            tampered[key] = value
+            out = nano_quorum.replay_receipt(tampered)
+            assert out["verdict"] == "mismatch", (name, key)
+            assert any(key in problem for problem in out["problems"]), (name, key, out["problems"])
+    # A /6 record without "permanent" is no /6 record.
+    missing = json.loads(json.dumps(records["legacy_three"]))
+    del missing["permanent"]
+    assert nano_quorum.replay_receipt(missing)["verdict"] == "mismatch"
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/4", "nano_quorum.corroboration/5"])
+def test_a_schema_4_or_5_record_carrying_permanent_is_refused(monkeypatch, schema):
+    """"permanent" is a /6 key: a record labelled /4 or /5 that carries it is not
+    in that vocabulary, and does not replay; without it, it does both."""
+    record = _unsettled_records(monkeypatch)["unconfirmed"]
+    old = as_schema_4_or_5(record, schema)
+    assert nano_quorum.verify_receipt_vocabulary(old) is True
+    assert nano_quorum.replay_receipt(old)["verdict"] == "match"
+    for value in (False, True):
+        old["permanent"] = value
+        assert nano_quorum.verify_receipt_vocabulary(old) is False
+        assert nano_quorum.replay_receipt(old)["verdict"] == "mismatch"
