@@ -2355,11 +2355,16 @@ def replay_receipt(record) -> dict:
     every node up to it must not be, and the record's "stop" reason and
     moment, "settled" and "agreed" must be what that walk gives.
 
+    "settled", "refusal" and "ask_again" are required in every schema: a
+    record missing any of them is a mismatch, and so is one whose "refusal" is
+    not false (a Corroboration is never a refusal, settled or not).
+
     The retry fields are re-derived from the observations, never taken from
     the record: "ask_again" must be true exactly when the walk leaves the
     receipt unsettled; "permanent" (schema /6 only, where it is required) must
     be true exactly when the receipt is unsettled and an "unreadable"
-    observation has error kind "UnbindableAmount"; and "ask_again_not_before"
+    observation has error kind "UnbindableAmount" and a "detail" that starts
+    "UnbindableAmount: "; and "ask_again_not_before"
     must be null when the receipt is settled or permanent, else "stop.at" plus
     "retry_after_s" seconds. A /3, /4 or /5 record carrying "permanent" is a
     mismatch.
@@ -2455,18 +2460,34 @@ def replay_receipt(record) -> dict:
         problems.append(f"stop.reason is {stop.get('reason')!r}, the replay stops on {reason!r}")
     if seen and stop.get("at") != seen[at].get("read_at"):
         problems.append(f"stop.at is {stop.get('at')!r}, the last node asked was read at {seen[at].get('read_at')!r}")
-    if "settled" in record and record["settled"] is not (reason == "quorum-reached"):
+    # "settled", "refusal" and "ask_again" are what a reader decides on, so
+    # every schema that replays must carry all three, as the check wrote them:
+    # a record with one deleted or edited is no record of this check. A
+    # Corroboration is never a refusal, so "refusal" is false, settled or not.
+    if "settled" not in record:
+        problems.append("settled is missing; every record says whether it settled")
+    elif record["settled"] is not (reason == "quorum-reached"):
         problems.append(f"settled is {record['settled']!r}, the replay stops on {reason!r}")
+    if record.get("refusal", "<missing>") is not False:
+        problems.append(
+            f"refusal is {record.get('refusal', '<missing>')!r}, but a Corroboration is never "
+            "a refusal: it is false, settled or not"
+        )
     if "agreed" in record and record["agreed"] != (agreed if reason == "quorum-reached" else []):
         problems.append("agreed is not the confirmed nodes the replay counts toward the quorum")
 
     # 4. The retry fields follow from the walk and the observations, not from
     # what the record says about itself.
+    # An observation counts as permanent only as the check writes one: error
+    # kind "UnbindableAmount" and a detail that starts with that kind. This is
+    # consistency within the record, not proof: an observation edited in full
+    # (kind, detail and message) cannot be told from one the check wrote.
     settled = reason == "quorum-reached"
     permanent = not settled and any(
         entry.get("state") == "unreadable"
         and isinstance(entry.get("error"), dict)
         and entry["error"].get("kind") == _PERMANENT_KIND
+        and str(entry.get("detail", "")).startswith(_PERMANENT_KIND + ": ")
         for entry in seen
     )
     schema = record.get("schema")
@@ -2478,12 +2499,12 @@ def replay_receipt(record) -> dict:
                 f"permanent is {record.get('permanent', '<missing>')!r}, "
                 f"the observations give {permanent!r}"
             )
-    if schema == RECEIPT_SCHEMA or "ask_again" in record:
-        if record.get("ask_again", None) is not (not settled):
-            problems.append(
-                f"ask_again is {record.get('ask_again', '<missing>')!r}, but it is true "
-                f"exactly when unsettled, and the replay stops on {reason!r}"
-            )
+    # Required in every schema that replays (/3 introduced it).
+    if record.get("ask_again", None) is not (not settled):
+        problems.append(
+            f"ask_again is {record.get('ask_again', '<missing>')!r}, but it is true "
+            f"exactly when unsettled, and the replay stops on {reason!r}"
+        )
     if schema == RECEIPT_SCHEMA or "ask_again_not_before" in record:
         if settled or permanent:
             expected_not_before = None

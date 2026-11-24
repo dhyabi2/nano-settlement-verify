@@ -3285,3 +3285,163 @@ def test_a_schema_4_or_5_record_carrying_permanent_is_refused(monkeypatch, schem
         old["permanent"] = value
         assert nano_quorum.verify_receipt_vocabulary(old) is False
         assert nano_quorum.replay_receipt(old)["verdict"] == "mismatch"
+
+
+# --- 2.1.0 settles one case 2.0.0 refused ------------------------------------------------
+
+
+def test_a_sparse_answer_between_two_bound_answers_settles_where_2_0_0_disagreed(monkeypatch):
+    """The README's one exception, pinned. A and C answer in full, bound to the block,
+    at height 7; B answers sparse, at height 8. 2.0.0 compared B's height with A's and
+    raised `Disagreement`. 2.1.0 holds B as no witness (`UnhashableContents`), neither
+    agreement nor disagreement, and settles on A and C."""
+    reply, asked = state_send(height=7)
+    sparse_at_8 = sparse_send({**reply, "height": "8"})
+    assert sparse_at_8["height"] == "8"
+    nodes(monkeypatch, {A: reply, B: sparse_at_8, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C], agree=2)
+    assert out.receipt.settled is True
+    assert out.receipt.height == 7
+    assert out.agreed == (A, C)
+    assert out.failed == (B,)
+    assert [o.state for o in out.observations] == ["confirmed", "unreadable", "confirmed"]
+    assert out.observations[1].error_kind == "UnhashableContents"
+
+
+# --- replay: the keys a reader decides on are required, in every schema ------------------
+
+
+def _settled_record(monkeypatch):
+    nodes(monkeypatch, {A: send_block(), B: send_block()})
+    return json.loads(verify_corroborated(HASH, ONE_XNO, PAYEE, [A, B]).to_json())
+
+
+def _get_style_reader(record):
+    """A reader that defaults a missing key to false: it serves on silence."""
+    if record.get("refusal"):
+        return "refuse"
+    if record.get("ask_again"):
+        return "retry"
+    return "serve"
+
+
+def test_a_schema_5_unsettled_record_with_refusal_and_ask_again_deleted_does_not_replay(monkeypatch):
+    """The serve-unpaid path: a main /5 unsettled record with "ask_again" and
+    "refusal" deleted is served by a .get-style reader, so it must not replay as
+    a match."""
+    record = as_schema_4_or_5(_unsettled_records(monkeypatch)["unconfirmed"],
+                              "nano_quorum.corroboration/5")
+    assert nano_quorum.replay_receipt(record)["verdict"] == "match"
+    del record["refusal"], record["ask_again"]
+    assert record["settled"] is False
+    assert _get_style_reader(record) == "serve"
+    out = nano_quorum.replay_receipt(record)
+    assert out["verdict"] == "mismatch"
+    assert any("refusal" in problem for problem in out["problems"]), out["problems"]
+    assert any("ask_again" in problem for problem in out["problems"]), out["problems"]
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/5", "nano_quorum.corroboration/6"])
+@pytest.mark.parametrize("shape", ["settled", "unsettled"])
+@pytest.mark.parametrize("key", ["settled", "refusal", "ask_again"])
+def test_replay_requires_settled_refusal_and_ask_again(monkeypatch, schema, shape, key):
+    if shape == "settled":
+        record = _settled_record(monkeypatch)
+    else:
+        record = _unsettled_records(monkeypatch)["unconfirmed"]
+    if schema != nano_quorum.RECEIPT_SCHEMA:
+        record = as_schema_4_or_5(record, schema)
+    assert nano_quorum.replay_receipt(record)["verdict"] == "match"
+    del record[key]
+    out = nano_quorum.replay_receipt(record)
+    assert out["verdict"] == "mismatch", (schema, shape, key)
+    assert any(key in problem for problem in out["problems"]), out["problems"]
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/5", "nano_quorum.corroboration/6"])
+@pytest.mark.parametrize("shape", ["settled", "unsettled"])
+@pytest.mark.parametrize("value", [True, None, 0, "false", []])
+def test_replay_requires_refusal_to_be_false(monkeypatch, schema, shape, value):
+    """A Corroboration is never a refusal, settled or not: anything but false is an edit."""
+    if shape == "settled":
+        record = _settled_record(monkeypatch)
+    else:
+        record = _unsettled_records(monkeypatch)["unconfirmed"]
+    if schema != nano_quorum.RECEIPT_SCHEMA:
+        record = as_schema_4_or_5(record, schema)
+    record["refusal"] = value
+    out = nano_quorum.replay_receipt(record)
+    assert out["verdict"] == "mismatch", (schema, shape, value)
+    assert any("refusal" in problem for problem in out["problems"]), out["problems"]
+
+
+@pytest.mark.parametrize("schema", ["nano_quorum.corroboration/5", "nano_quorum.corroboration/6"])
+def test_replay_requires_ask_again_to_be_not_settled(monkeypatch, schema):
+    for shape, record in (("settled", _settled_record(monkeypatch)),
+                          ("unsettled", _unsettled_records(monkeypatch)["unconfirmed"])):
+        if schema != nano_quorum.RECEIPT_SCHEMA:
+            record = as_schema_4_or_5(record, schema)
+        record["ask_again"] = record["settled"]
+        out = nano_quorum.replay_receipt(record)
+        assert out["verdict"] == "mismatch", (schema, shape)
+        assert any("ask_again" in problem for problem in out["problems"]), out["problems"]
+
+
+# --- replay: what counts as a permanent observation -------------------------------------
+
+
+def test_replay_does_not_count_an_oserror_relabelled_unbindable_as_permanent(monkeypatch):
+    """An OSError observation edited to kind "UnbindableAmount", with "permanent" true
+    and "ask_again_not_before" null to match, is not an observation the check wrote:
+    its detail still says OSError. It does not replay as permanent."""
+    record = _unsettled_records(monkeypatch)["unconfirmed"]
+    failed = record["observations"][2]
+    assert failed["error"]["kind"] == "OSError" and failed["detail"].startswith("OSError: ")
+    failed["error"]["kind"] = "UnbindableAmount"
+    record["permanent"] = True
+    record["ask_again_not_before"] = None
+    out = nano_quorum.replay_receipt(record)
+    assert out["verdict"] == "mismatch"
+    assert any("permanent" in problem for problem in out["problems"]), out["problems"]
+
+
+def test_replay_is_consistency_not_proof_an_observation_edited_in_full_still_matches(monkeypatch):
+    """The README's scope, pinned: kind, detail and message edited together, and the
+    retry fields to match, replay as a match. replay_receipt cannot tell an edited
+    observation from a real one."""
+    record = _unsettled_records(monkeypatch)["unconfirmed"]
+    failed = record["observations"][2]
+    failed["error"] = {"kind": "UnbindableAmount", "message": "edited"}
+    failed["detail"] = "UnbindableAmount: edited"
+    record["permanent"] = True
+    record["ask_again_not_before"] = None
+    assert nano_quorum.replay_receipt(record)["verdict"] == "match"
+
+
+def test_a_settled_receipt_with_an_unbindable_observation_is_not_permanent(monkeypatch):
+    """`permanent` needs the receipt unsettled. A settled receipt with an
+    "UnbindableAmount" observation (built here by relabelling a sparse one) is not
+    permanent, its record says false, and replay agrees: neither
+    `Corroboration.permanent` nor the replay may drop "not settled"."""
+    import dataclasses
+
+    reply, asked = state_send()
+    nodes(monkeypatch, {A: sparse_send(reply), B: reply, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C], retry_after=30)
+    assert out.receipt.settled is True
+    first = dataclasses.replace(
+        out.observations[0], error_kind="UnbindableAmount",
+        error_message="relabelled", detail="UnbindableAmount: relabelled",
+    )
+    relabelled = dataclasses.replace(out, observations=(first, *out.observations[1:]))
+    assert nano_quorum._is_permanent(relabelled.observations) is True
+    assert relabelled.permanent is False
+    assert relabelled.not_before is None
+    record = json.loads(relabelled.to_json())
+    assert record["permanent"] is False
+    assert record["ask_again"] is False
+    assert record["observations"][0]["error"]["kind"] == "UnbindableAmount"
+    replay = nano_quorum.replay_receipt(record)
+    assert replay["verdict"] == "match", replay["problems"]
+    record["permanent"] = True
+    assert nano_quorum.replay_receipt(record)["verdict"] == "mismatch"
