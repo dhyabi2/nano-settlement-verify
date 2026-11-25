@@ -2367,7 +2367,8 @@ def replay_receipt(record) -> dict:
     "UnbindableAmount: "; and "ask_again_not_before"
     must be null when the receipt is settled or permanent, else "stop.at" plus
     "retry_after_s" seconds. A /3, /4 or /5 record carrying "permanent" is a
-    mismatch.
+    mismatch, and so is a record whose "schema" is missing or not one this
+    module knows (/3 to /6).
 
     Returns `{"verdict": "match" | "mismatch", "problems": [...],
     "expected_stop": reason or None, "expected_not_asked": [...]}`. It checks
@@ -2491,6 +2492,15 @@ def replay_receipt(record) -> dict:
         for entry in seen
     )
     schema = record.get("schema")
+    # A record replays only in a schema this module knows (/3 to /6): with the
+    # schema deleted or changed, the rules below for "permanent" and
+    # "ask_again_not_before" would be skipped, so such a record is no record
+    # of this check.
+    if not isinstance(schema, str) or schema not in _VOCABULARY_TABLES_OF_SCHEMA:
+        problems.append(
+            f"schema is {record.get('schema', '<missing>')!r}, not one of "
+            f"{sorted(_VOCABULARY_TABLES_OF_SCHEMA)}"
+        )
     if schema == RECEIPT_SCHEMA or "permanent" in record:
         if schema in _VOCABULARY_TABLES_OF_SCHEMA and schema != RECEIPT_SCHEMA:
             problems.append(f"permanent is a {RECEIPT_SCHEMA} key, but the record is {schema!r}")

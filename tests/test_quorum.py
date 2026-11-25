@@ -3287,11 +3287,11 @@ def test_a_schema_4_or_5_record_carrying_permanent_is_refused(monkeypatch, schem
         assert nano_quorum.replay_receipt(old)["verdict"] == "mismatch"
 
 
-# --- 2.1.0 settles one case 2.0.0 refused ------------------------------------------------
+# --- 2.1.0 settles two cases 2.0.0 refused ----------------------------------------------
 
 
 def test_a_sparse_answer_between_two_bound_answers_settles_where_2_0_0_disagreed(monkeypatch):
-    """The README's one exception, pinned. A and C answer in full, bound to the block,
+    """The README's first exception, pinned. A and C answer in full, bound to the block,
     at height 7; B answers sparse, at height 8. 2.0.0 compared B's height with A's and
     raised `Disagreement`. 2.1.0 holds B as no witness (`UnhashableContents`), neither
     agreement nor disagreement, and settles on A and C."""
@@ -3306,6 +3306,51 @@ def test_a_sparse_answer_between_two_bound_answers_settles_where_2_0_0_disagreed
     assert out.failed == (B,)
     assert [o.state for o in out.observations] == ["confirmed", "unreadable", "confirmed"]
     assert out.observations[1].error_kind == "UnhashableContents"
+
+
+def test_a_forged_block_account_between_two_bound_answers_settles_where_2_0_0_disagreed(monkeypatch):
+    """The README's second exception, pinned. A and C answer in full, bound to the block;
+    B gives the same hashed contents but names another chain as `block_account`.
+    2.0.0 saw two confirmed nodes naming different payers and raised `Disagreement`.
+    2.1.0 holds B as no witness (`UnboundAnswer`) and settles on A and C."""
+    from nano_settlement_verify.five_fields import _address_of_key
+
+    reply, asked = state_send()
+    forged = {**reply, "block_account": _address_of_key(_STRANGER_KEY)}
+    nodes(monkeypatch, {A: reply, B: forged, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [A, B, C], agree=2)
+    assert out.receipt.settled is True
+    assert out.agreed == (A, C)
+    assert out.failed == (B,)
+    assert [o.state for o in out.observations] == ["confirmed", "unreadable", "confirmed"]
+    assert out.observations[1].error_kind == "UnboundAnswer"
+
+
+# --- replay: a record replays only in a schema this module knows -------------------------
+
+
+@pytest.mark.parametrize("shape", ["settled", "legacy_three", "unconfirmed"])
+@pytest.mark.parametrize("edit", ["delete-schema", "delete-schema-and-permanent", "/7", "/2", "", None, 6])
+def test_replay_requires_a_known_schema(monkeypatch, shape, edit):
+    """With "schema" deleted or changed, the /6 rules for "permanent" and
+    "ask_again_not_before" were skipped and a permanent record with both edited
+    still replayed as a match. A record in no schema this module knows does not replay."""
+    if shape == "settled":
+        record = _settled_record(monkeypatch)
+    else:
+        record = _unsettled_records(monkeypatch)[shape]
+    assert nano_quorum.replay_receipt(record)["verdict"] == "match"
+    if edit == "delete-schema":
+        del record["schema"]
+    elif edit == "delete-schema-and-permanent":
+        del record["schema"], record["permanent"]
+    elif edit in ("/7", "/2"):
+        record["schema"] = "nano_quorum.corroboration" + edit
+    else:
+        record["schema"] = edit
+    out = nano_quorum.replay_receipt(record)
+    assert out["verdict"] == "mismatch", (shape, edit)
+    assert any(problem.startswith("schema is") for problem in out["problems"]), out["problems"]
 
 
 # --- replay: the keys a reader decides on are required, in every schema ------------------

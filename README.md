@@ -100,8 +100,10 @@ Do not keep that copy beside an installed 2.0.0: a local `nano_settlement_verify
 
 2.1.0 changes outcomes of `nano_settlement_verify.quorum.verify_corroborated` for existing
 callers, which is why it is a minor release and not a patch. Almost every change refuses or
-holds what 2.0.0 settled. There is one exception, where 2.1.0 settles what 2.0.0 refused: a
-sparse answer no longer contradicts the full answers around it (first item below). In short (the details are under
+holds what 2.0.0 settled. There are two exceptions, where 2.1.0 settles what 2.0.0 refused:
+an answer that is no witness - a sparse one (first item below) or one whose `block_account`
+names another chain than its hashed contents (second item) - no longer contradicts the full,
+bound answers around it. In short (the details are under
 *Changes from the previous release* below):
 
 - A `confirmed` answer whose contents are too sparse to recompute the block hash
@@ -114,11 +116,16 @@ sparse answer no longer contradicts the full answers around it (first item below
   with `agree=2` and endpoints A, B, C, where A and C give full answers bound to the block
   at height 7 and B gives a sparse answer at height 8: 2.0.0 raised `Disagreement`
   (B's height differs from A's); 2.1.0 records B as `unreadable` (`UnhashableContents`)
-  and settles on A and C. That is the one case where 2.1.0 settles what 2.0.0 refused, and
+  and settles on A and C. That is the first case where 2.1.0 settles what 2.0.0 refused, and
   it settles only on the k full answers that hash to the block and are bound to it; the
   sparse answer, which nothing ties to the block, is what 2.0.0 refused on.
 - A `confirmed` answer whose hashed contents pay someone else, are not a send, or are on
-  another chain than its `block_account` names is no witness (`UnboundAnswer`).
+  another chain than its `block_account` names is no witness (`UnboundAnswer`). This is the
+  second case where 2.1.0 settles what 2.0.0 refused: with `agree=2` and A, B, C, where A
+  and C answer in full and bound, and B gives the same hashed contents but names another
+  chain as `block_account`, 2.0.0 saw two payers and raised `Disagreement`; 2.1.0 records B
+  as `unreadable` (`UnboundAnswer`) and settles on A and C - again only on the k answers
+  bound to the block, the payer being the `account` the block's own hash fixes.
 - The amount is bound to hashed balances, not taken on the node's word: each answering
   endpoint is now asked for **two** `block_info` requests per check - the block, then
   its `contents.previous` - and a `post_json` stub must answer both. **This breaks the
@@ -142,6 +149,16 @@ sparse answer no longer contradicts the full answers around it (first item below
   null`. `"ask_again"` keeps its meaning, true exactly when unsettled, so a reader written
   for `/5` (`refusal` ? refuse : `ask_again` ? retry : serve) never serves such a record;
   `"permanent"` alone says "do not retry". Never serve an unsettled record.
+- **Rolling upgrades.** A 2.0.0 `verify_receipt_vocabulary` returns False for every `/6`
+  record (it knows `/3` to `/5` only), so while some readers still run 2.0.0 they refuse the
+  receipts 2.1.0 writes. That fails closed - nothing unpaid is served - but nothing 2.1.0
+  wrote is served by them either. Upgrade the readers before (or with) the writers.
+- **Stored receipts are not re-judged.** A `/5` receipt that 2.0.0 settled on sparse or
+  unbound answers still replays as a match under 2.1.0: `replay_receipt` checks order and
+  stopping within the record, not whether each answer was a witness, and the observations
+  of such a record say `confirmed`. 2.1.0 would refuse or hold the same answers live. To
+  know whether an old settled receipt holds under the 2.1.0 rule, run the check again
+  against the nodes (`verify_corroborated`), not `replay_receipt`.
 - `NotCorroborated`'s message no longer says "0 of 2 endpoints answered" when both
   answered `confirmed` but are no witness: it counts them apart (`witnessless`).
 - A reply cut short (`http.client.HTTPException`) is an unreadable endpoint in
@@ -480,6 +497,9 @@ slack, or pass `not_after=None` to have no deadline.
   is never a refusal, settled or not), or whose `"ask_again"` is not `not settled`, is a
   mismatch. 2.0.0 replayed a `/5` record with `"refusal"` and `"ask_again"` deleted as a
   match, which a reader that defaults a missing key to false would then serve.
+  It also requires a `"schema"` it knows (`/3` to `/6`): a record with `"schema"` deleted or
+  changed (to `/2`, `/7`, an empty string, a number) is a mismatch, because without it the
+  `/6` rules for `"permanent"` and `"ask_again_not_before"` would not be applied.
 - `to_json()` writes every endpoint URL with any `user:pass@` replaced by `***@`, and does
   the same to a URL quoted in an observation's `detail` or `error.message`. The `agreed`,
   `answered` and `failed` tuples and the observations in memory still hold the text as given.
@@ -973,7 +993,7 @@ pip install pytest
 python -m pytest -v
 ```
 
-1315 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
+1337 tests: for `verify`, the four acceptance cases, the amount compared exactly (one raw over or under is a `Mismatch`, never "at least"), the two ways it fails closed kept apart (a readable reply that names another amount, payee or operation is a `Mismatch` and refuses the sale; a reply that names no operation or no payee at all is a `NotANodeReply` and holds, so one endpoint that ignored `json_block` cannot accuse a buyer who paid or override the endpoints after it), the order's expiry (on time, late, exactly at the deadline, a missing or 0 `local_timestamp` as unknown time, unix and ISO deadlines, a deadline that is not a number at all, or is NaN or infinite, refused before the node is called, in the family a seller's own handler catches, and a Decimal or numpy deadline accepted and decided by its value, floored exactly, and a numpy float narrower than float64 or a deadline beyond 2**63 seconds refused), the error paths around them, the
 a reply that is not a JSON object at all - a proxy's `"error"`, `["error"]`, a bare
 number - refused as `NotANodeReply` rather than read as a verdict by the `in` test, with an
 object reply and a real `error` answer as controls, and the same reply as exit 4 through the
@@ -1018,7 +1038,7 @@ acceptance checks, the payee checksum (including a one-character-off address, a
 character outside Nano's alphabet, and both spellings of one account) and settlement
 against the pinned payee and amount; for
 `nano_settlement_verify.independence`, the funding chain and the independent-payer grouping; for
-`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, a confirmed answer too sparse to hash (and the one case where that settles what 2.0.0 refused: two bound answers around a sparse one at another height), a confirmed answer whose hashed contents contradict the payee, operation or payer chain it names (a forged `link_as_account`, an extra one on a legacy send, a receive called a send, a forged `block_account`), a confirmed answer whose amount the hashed balances do not move (two colluding nodes forging it, a previous block that does not hash to `previous`, is not given or is on another account, a previous legacy open, receive or change block refused as unbindable, and the genuine state and legacy sends, the live genesis send among them, that still settle for the balances' difference), a reply cut short (`IncompleteRead`), a body nested too deeply to parse (`RecursionError`, in the quorum and in `five_fields.read_nodes`), a reader written for schema `/5` that never serves an unsettled `/6` record (a permanent one included), `replay_receipt` re-deriving `permanent`, `ask_again` and `ask_again_not_before` from the observations (a settled receipt never permanent, an `OSError` relabelled `UnbindableAmount` not counted) and requiring `settled`, `refusal` (false) and `ask_again` in `/5` and `/6` records, the e2e script failing on a permanent live refusal, a `/4` or `/5` record carrying `permanent` refused, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
+`nano_settlement_verify.quorum`, agreement, contradiction, a confirmed answer whose contents hash to another block than the one asked for, a confirmed answer too sparse to hash (and the first case where that settles what 2.0.0 refused: two bound answers around a sparse one at another height), a confirmed answer whose hashed contents contradict the payee, operation or payer chain it names (a forged `link_as_account`, an extra one on a legacy send, a receive called a send, a forged `block_account`, and the second case where 2.1.0 settles what 2.0.0 refused: two bound answers around one with a forged `block_account`), a confirmed answer whose amount the hashed balances do not move (two colluding nodes forging it, a previous block that does not hash to `previous`, is not given or is on another account, a previous legacy open, receive or change block refused as unbindable, and the genuine state and legacy sends, the live genesis send among them, that still settle for the balances' difference), a reply cut short (`IncompleteRead`), a body nested too deeply to parse (`RecursionError`, in the quorum and in `five_fields.read_nodes`), a reader written for schema `/5` that never serves an unsettled `/6` record (a permanent one included), `replay_receipt` re-deriving `permanent`, `ask_again` and `ask_again_not_before` from the observations (a settled receipt never permanent, an `OSError` relabelled `UnbindableAmount` not counted) and requiring `settled`, `refusal` (false) and `ask_again` in `/5` and `/6` records and a `schema` it knows, the e2e script failing on a permanent live refusal, a `/4` or `/5` record carrying `permanent` refused, the node-state table (only the table) pinned by hash in the record, the duplicate endpoint and every way an
 endpoint can say nothing - including, for `balance_corroborated`, which reads a reply
 directly rather than through `verify`, a reply that is not a JSON object counted as
 failed rather than as an answer of nothing (the `in` test on a string is a substring
