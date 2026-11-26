@@ -2502,7 +2502,10 @@ def replay_receipt(record) -> dict:
             f"{sorted(_VOCABULARY_TABLES_OF_SCHEMA)}"
         )
     if schema == RECEIPT_SCHEMA or "permanent" in record:
-        if schema in _VOCABULARY_TABLES_OF_SCHEMA and schema != RECEIPT_SCHEMA:
+        # isinstance first: a list or dict "schema" is unhashable, and the `in`
+        # would raise instead of leaving the mismatch recorded above.
+        if (isinstance(schema, str) and schema in _VOCABULARY_TABLES_OF_SCHEMA
+                and schema != RECEIPT_SCHEMA):
             problems.append(f"permanent is a {RECEIPT_SCHEMA} key, but the record is {schema!r}")
         elif record.get("permanent", None) is not permanent:
             problems.append(
