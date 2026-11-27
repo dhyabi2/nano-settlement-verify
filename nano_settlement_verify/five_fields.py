@@ -66,6 +66,7 @@ Stdlib only. No key, no signing, no sending. Raw amounts are integers.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import re
 
 import sys as _sys
@@ -110,8 +111,11 @@ _HEX32 = re.compile(r"[0-9A-Fa-f]{32}")
 _DIGITS = re.compile(r"[0-9]+")
 _STATE_PREAMBLE = (6).to_bytes(32, "big")
 
-# "This node told us nothing usable" - the family nano_quorum and nano_claim use.
-_UNREADABLE = (OSError, ValueError, KeyError, TypeError)
+# "This node told us nothing usable" - the family nano_quorum uses. A body cut
+# short (http.client.IncompleteRead) or a status line that is not HTTP is an
+# http.client.HTTPException, not an OSError, and is still no answer. So is a
+# body nested too deeply for json.loads, which raises RecursionError.
+_UNREADABLE = (OSError, ValueError, KeyError, TypeError, http.client.HTTPException, RecursionError)
 
 
 def block_hash_of(contents: object) -> str | None:
