@@ -223,7 +223,7 @@ try:
     # leave the nine loopback cases above standing - never as a failure of the
     # library. NotCorroborated is caught for the same reason: it is what a
     # throttled endpoint looks like from the inside - unless it is permanent
-    # (an endpoint answered and showed the send can never be bound), which is
+    # (an endpoint answered and showed this version cannot bind the send), which is
     # reported as permanent/unbindable, never as "not reachable".
     out = verify_corroborated(LIVE_HASH, LIVE_RAW, LIVE_PAYEE, [LIVE_RPC, RELAY])
     print(f"    -> {out.to_json()}")

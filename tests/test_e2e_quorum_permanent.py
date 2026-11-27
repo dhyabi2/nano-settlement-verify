@@ -2,7 +2,7 @@
 
 The script's live section reads a NotCorroborated as "the node is not reachable
 from here" and skips - unless it is `permanent`: then an endpoint answered and
-showed the block can never be bound, which is no reachability problem, and the
+showed this version cannot bind the block, which is no reachability problem, and the
 script must fail. These tests run the script's loopback sections for real (on
 127.0.0.1 only) and replace only the live call, so they never leave the machine.
 """

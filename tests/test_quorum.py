@@ -2616,7 +2616,8 @@ def test_not_corroborated_says_when_to_ask_again(monkeypatch):
 
 @pytest.mark.parametrize("delay, error", [
     (-1, ValueError), (float("nan"), ValueError), (float("inf"), ValueError),
-    (10**9 + 1, ValueError), (True, TypeError), ("30", TypeError),
+    (10**9 + 1, ValueError), pytest.param(10**400, ValueError, id="10**400"),
+    pytest.param(-(10**400), ValueError, id="-10**400"), (True, TypeError), ("30", TypeError),
 ])
 def test_a_retry_delay_that_is_not_a_time_is_refused_before_any_call(monkeypatch, delay, error):
     nodes(monkeypatch, {})
@@ -2890,8 +2891,8 @@ def _send_after_legacy_receive(monkeypatch, not_seen_on=()):
 
 
 def test_a_send_after_a_legacy_block_is_permanent_and_says_do_not_retry(monkeypatch):
-    """Block 18563C81... settled on its node's word before 2.1.0 and can never
-    settle now: its previous block is fixed by its hash, so asking again cannot
+    """Block 18563C81... settled on its node's word before 2.1.0 and this version
+    cannot settle it: its previous block is fixed by its hash, so asking again cannot
     help. The refusal says so - `permanent`, no `not_before` - and its message
     does not claim that nobody answered, since both endpoints answered confirmed."""
     asked = _send_after_legacy_receive(monkeypatch)
@@ -2906,7 +2907,7 @@ def test_a_send_after_a_legacy_block_is_permanent_and_says_do_not_retry(monkeypa
     assert "PERMANENT" in text and "do not retry" in text
     assert "0 of 2 endpoints answered," not in text
     assert "2 more answered confirmed" in text
-    assert "(permanent: no node can ever bind it, do not retry)" in out.failures[A]
+    assert "(permanent: this version cannot bind it from any node, do not retry)" in out.failures[A]
 
 
 def test_one_endpoint_showing_the_legacy_previous_makes_the_unsettled_receipt_permanent(monkeypatch):
@@ -3308,6 +3309,33 @@ def test_a_sparse_answer_between_two_bound_answers_settles_where_2_0_0_disagreed
     assert out.observations[1].error_kind == "UnhashableContents"
 
 
+def test_two_sparse_answers_that_differ_from_each_other_are_no_disagreement(monkeypatch):
+    """The README's case of two answers that are no witness, pinned. B answers sparse at
+    height 8 and D sparse at height 9: 2.0.0 compared the two and raised
+    `Disagreement`. 2.1.0 holds both as no witness, so with two bound answers
+    beside them it settles on those two, and with only the two sparse answers the
+    refusal becomes a hold: `NotCorroborated`, ask again, never a `Disagreement`."""
+    D = "http://127.0.0.1:7074"
+    reply, asked = state_send(height=7)
+    sparse_at_8 = sparse_send({**reply, "height": "8"})
+    sparse_at_9 = sparse_send({**reply, "height": "9"})
+    nodes(monkeypatch, {B: sparse_at_8, D: sparse_at_9, A: reply, C: reply})
+    out = verify_corroborated(asked, ONE_XNO, HOLDER, [B, D, A, C], agree=2)
+    assert out.receipt.settled is True
+    assert out.receipt.height == 7
+    assert out.agreed == (A, C)
+    assert out.failed == (B, D)
+    assert [o.error_kind for o in out.observations[:2]] == ["UnhashableContents"] * 2
+
+    nodes(monkeypatch, {B: sparse_at_8, D: sparse_at_9})
+    with pytest.raises(NotCorroborated) as caught:
+        verify_corroborated(asked, ONE_XNO, HOLDER, [B, D], agree=2)
+    assert not isinstance(caught.value, Disagreement)
+    assert caught.value.permanent is False
+    assert caught.value.answered == 0
+    assert [o.error_kind for o in caught.value.observations] == ["UnhashableContents"] * 2
+
+
 def test_a_forged_block_account_between_two_bound_answers_settles_where_2_0_0_disagreed(monkeypatch):
     """The README's forged `block_account` case, pinned. A and C answer in full, bound to the block;
     B gives the same hashed contents but names another chain as `block_account`.
@@ -3350,6 +3378,40 @@ def test_an_answer_with_a_forged_previous_between_two_bound_answers_settles_wher
     assert [o.state for o in out.observations] == ["confirmed", "unreadable", "confirmed"]
     assert out.observations[1].error_kind == "UnboundAnswer"
     assert "does not hash to" in out.observations[1].detail
+
+
+# --- replay: a retry delay that gives no moment is a mismatch, never a crash -------------
+
+
+@pytest.mark.parametrize("delay", [
+    pytest.param(10**400, id="10**400"), pytest.param(-(10**400), id="-10**400"),
+    10**9 + 1, -1, "30", None, True, [30],
+])
+def test_replay_of_a_retry_delay_that_is_not_a_time_is_a_mismatch_not_a_crash(monkeypatch, delay):
+    """An int too large for a float made `math.isfinite` raise OverflowError, which
+    the replay did not catch: a stored record could crash `replay_receipt`."""
+    record = _unsettled_records(monkeypatch)["unconfirmed"]
+    assert nano_quorum.replay_receipt(record)["verdict"] == "match"
+    record["retry_after_s"] = delay
+    out = nano_quorum.replay_receipt(json.dumps(record))
+    assert out["verdict"] == "mismatch"
+    assert any("ask_again_not_before" in problem for problem in out["problems"]), out["problems"]
+
+
+@pytest.mark.parametrize("literal", [
+    pytest.param("1" + "0" * 400, id="1e400-as-int"), "1e400", "-1e400", "NaN", "Infinity",
+])
+def test_the_replay_cli_reports_a_huge_retry_delay_as_a_mismatch(monkeypatch, tmp_path, capsys, literal):
+    """`--replay` on a record whose "retry_after_s" is a huge or non-finite JSON number
+    exits 1 with a mismatch, and prints no traceback."""
+    record = _unsettled_records(monkeypatch)["unconfirmed"]
+    text = json.dumps(record).replace('"retry_after_s": 30', '"retry_after_s": ' + literal)
+    assert ('"retry_after_s": ' + literal) in text
+    stored = tmp_path / "receipt.json"
+    stored.write_text(text, encoding="utf-8")
+    assert nano_quorum._main(["--replay", str(stored)]) == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["verdict"] == "mismatch"
 
 
 # --- replay: a record replays only in a schema this module knows -------------------------

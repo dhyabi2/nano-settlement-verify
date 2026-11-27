@@ -81,7 +81,7 @@ _PERMANENT_KIND = "UnbindableAmount"
 
 
 def _is_permanent(observations) -> bool:
-    """Whether any endpoint showed the block can never be bound (`UnbindableAmount`)."""
+    """Whether any endpoint showed this version cannot bind the block's amount (`UnbindableAmount`)."""
     return any(getattr(seen, "error_kind", "") == _PERMANENT_KIND for seen in observations)
 
 
@@ -102,8 +102,11 @@ class NotCorroborated(Exception):
     `permanent` is True when an endpoint showed, from contents that hash to the
     block, that the block's previous block is a legacy open, receive or change
     block that hashes no balance (`UnbindableAmount`). A block's previous is
-    fixed by its hash, so no endpoint, now or later, can bind that send's
-    amount: asking again can never settle it. Do not retry a permanent
+    fixed by its hash, so this version, which reads the one block before the
+    send, cannot bind that send's amount from any endpoint, now or later:
+    asking again cannot settle it. (The amount is not unknowable - a check
+    that walked further back down the chain could bind it - but this one does
+    not.) Do not retry a permanent
     `NotCorroborated`; `not_before` is then None. Check such a payment some
     other way, or not at all.
     """
@@ -129,7 +132,7 @@ class NotCorroborated(Exception):
         if permanent:
             head += (
                 "; PERMANENT: the block's previous block is a legacy block that hashes no "
-                "balance, so its amount can never be bound - do not retry"
+                "balance, so this version cannot bind its amount - do not retry"
             )
         super().__init__(f"{head} ({detail})")
         self.answered = answered
@@ -139,7 +142,7 @@ class NotCorroborated(Exception):
         # the caller is not `verify_corroborated` (failover, balances).
         self.observations = observations
         # Endpoints that answered "confirmed" but are no witness, and whether
-        # asking again can ever settle the block (see the class docstring).
+        # asking again can settle the block in this version (see the class docstring).
         self.witnessless = witnessless
         self.permanent = permanent
         # The `Stop` ("exhausted") when raised by `verify_corroborated`, else None,
@@ -649,8 +652,8 @@ def _repr(value) -> str:
 # "configured_order", "ask_order", "order_rule" and "order_seed". Neither
 # vocabulary changed, so both pinned hashes are the ones /4 pinned.
 #
-# /6 adds the receipt-level "permanent" (true when asking again can never settle
-# the block, see `Corroboration.permanent`). "ask_again" keeps its /3 meaning,
+# /6 adds the receipt-level "permanent" (true when asking again cannot settle
+# the block in this version, see `Corroboration.permanent`). "ask_again" keeps its /3 meaning,
 # true exactly when the receipt is unsettled, so a /5 reader that serves only
 # when neither "refusal" nor "ask_again" is true never serves an unsettled /6
 # record; "permanent" alone says "do not retry", and "ask_again_not_before" is
@@ -673,7 +676,10 @@ RECEIPT_SCHEMA = "nano_quorum.corroboration/6"
 # "UnbindableAmount", which makes the receipt `permanent`). Such a node told us
 # nothing we could tie to the block; `error_kind` and `error` say which. This
 # widens "unreadable" from "gave no answer" to "gave no answer, or answered but
-# unbindable"; a reader that needs the difference reads the error kind. No new
+# unbindable"; a reader that needs the difference reads the error kind. The
+# receipt's lists follow the state, not the reply: such a node is in "failed",
+# and "answered" names only the nodes that answered as a witness (any state
+# but "unreadable" and "not-asked"). No new
 # state was added, so the table text and its pin (NODE_STATES_SHA256), shared by
 # /3 to /6 records, are unchanged and existing readers keep working; that is why
 # this is said here, not in the table.
@@ -1254,7 +1260,7 @@ class Corroboration:
     unsettled - permanent or not - so a cached unsettled receipt can be read
     neither as "rejected" nor, by a reader that serves when neither flag is
     set, as "settled". `"permanent"` (see `permanent`) is written beside it:
-    true means asking again can never settle the block, so do not retry -
+    true means asking again cannot settle the block in this version, so do not retry -
     and still do not serve, and it is still no refusal. `"ask_again_not_before"`
     (see `not_before`) says from when to ask again, null when the receipt is
     settled or permanent or no stop was recorded, and `"retry_after_s"` the
@@ -1331,7 +1337,7 @@ class Corroboration:
 
     @property
     def permanent(self) -> bool:
-        """Whether asking again can never settle this block, as for `NotCorroborated.permanent`.
+        """Whether asking again cannot settle this block in this version, as for `NotCorroborated.permanent`.
 
         True only for an unsettled receipt with an observation of error kind
         `UnbindableAmount`: an endpoint showed, from contents that hash to the
@@ -1376,7 +1382,7 @@ class Corroboration:
                 # serves when neither "refusal" nor "ask_again" is set must
                 # never serve an unsettled receipt (fail closed).
                 "ask_again": not self.receipt.settled,
-                # True when asking again can never settle the block: do not
+                # True when asking again cannot settle the block in this version: do not
                 # retry (and still do not serve).
                 "permanent": self.permanent,
                 # When to ask again: the moment the check stopped plus the
@@ -1419,7 +1425,9 @@ def _retry_after(value) -> int | float:
     """`value` as a delay in seconds, or TypeError / ValueError before any call is made."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"retry_after must be a number of seconds, got {type(value).__name__}")
-    if not math.isfinite(value) or value < 0 or value > _MAX_RETRY_AFTER:
+    # The range test comes first: `math.isfinite` on an int too large for a
+    # float raises OverflowError, which is neither of the two errors promised.
+    if value < 0 or value > _MAX_RETRY_AFTER or not math.isfinite(value):
         raise ValueError(
             f"retry_after must be a finite number of seconds from 0 to {_MAX_RETRY_AFTER}, got {value!r}"
         )
@@ -1595,14 +1603,15 @@ class UnboundAnswer(ValueError):
 
 
 class UnbindableAmount(UnboundAnswer):
-    """A confirmed answer that can NEVER be bound: its previous block hashes no balance.
+    """A confirmed answer this version cannot bind: its previous block hashes no balance.
 
     The contents hash to the block asked for, and the block before it hashes
     to the contents' `previous`, so both are genuine - but that block is a
     legacy open, receive or change block (not the genesis open), which hashes
     no balance. A block's `previous` is fixed by its hash, so this is true of
-    the block itself, not of one node: no endpoint, now or later, can give an
-    amount bound to hashes. It is an `UnboundAnswer` (and so a `ValueError`,
+    the block itself, not of one node: from no endpoint, now or later, can this
+    version, which reads only the one block before the send, bind the amount
+    to hashes (a check that walked further back could). It is an `UnboundAnswer` (and so a `ValueError`,
     recorded "unreadable"), and it makes `NotCorroborated.permanent` and
     `Corroboration.permanent` True: do not retry such a block.
     """
@@ -1748,8 +1757,9 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
     open (whose balance is the protocol's whole supply, and which is matched by
     its recomputed hash, never by its account) the amount cannot be bound from
     the hash, and the answer says exactly that, as `UnbindableAmount` - a limit
-    of what a hash can prove, not a forgery, and a permanent one: the previous
-    block is fixed by the send's hash. A previous block the endpoint cannot give,
+    of what this check can prove from the one block before the send, not a
+    forgery, and permanent for this version: the previous block is fixed by the
+    send's hash. A previous block the endpoint cannot give,
     whose contents do not hash to `previous`, on another chain, or that hashes
     no balance binds nothing, and the answer is not a witness: it raises
     `UnboundAnswer` (or its subclass `UnbindableAmount`) and never falls back
@@ -1777,11 +1787,11 @@ def _bound_amount(post, rpc_url: str, contents: dict) -> int:
     before = _hashed_balance(before_contents, hashed_as)
     if before is None:
         # Checked before the account: the previous block's kind is fixed by
-        # the hash, so this is permanent for the block, whoever is asked.
+        # the hash, so this version cannot bind it whoever is asked.
         raise UnbindableAmount(
             f"the previous block {previous} is a legacy {before_contents.get('type')} block, "
             f"which hashes no balance, so the amount cannot be bound from the hash "
-            f"(permanent: no node can ever bind it, do not retry)"
+            f"(permanent: this version cannot bind it from any node, do not retry)"
         )
     before_account, account = _hashed_account(before_contents), _hashed_account(contents)
     if account is not None and before_account is None:
@@ -1953,7 +1963,7 @@ def verify_corroborated(
         Usually nothing could be checked; hold the call and ask again rather
         than refuse it. When its `permanent` is True (an endpoint showed the
         send's previous block is a legacy block that hashes no balance,
-        `UnbindableAmount`), asking again can never settle it: do not retry.
+        `UnbindableAmount`), asking again cannot settle it in this version: do not retry.
       `TypeError` - `expect_raw` is not an int, the same refusal `verify` makes,
         made here before any endpoint is called.
     """
@@ -2524,7 +2534,9 @@ def replay_receipt(record) -> dict:
         else:
             try:
                 expected_not_before = _not_before(stop.get("at"), _retry_after(record.get("retry_after_s")))
-            except (TypeError, ValueError, AttributeError) as error:
+            except (TypeError, ValueError, AttributeError, OverflowError) as error:
+                # Any "retry_after_s" or "stop.at" that gives no moment is a
+                # mismatch below, never a crash of the replay.
                 expected_not_before = "<not computable: %s>" % error
         if record.get("ask_again_not_before", "<missing>") != expected_not_before:
             problems.append(

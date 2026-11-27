@@ -152,9 +152,11 @@ hashes `source`, `representative`, `account`; a receive `previous`, `source`; a 
 `previous`, `representative`). When the previous block is one of those, its hash can still
 be recomputed - so a genuine one is told from a forgery - but the amount the send moved
 cannot be bound from hashes, and it stays unbound. That is a limit of the check, not a
-sign of forgery, and it is permanent: the previous block is fixed by the send's hash, so
-asking again, or asking other nodes, never binds it (`verify_corroborated` records error
-kind `UnbindableAmount` and sets `permanent`; do not retry). The one exception is the live
+sign of forgery, and it is permanent for this check: the previous block is fixed by the
+send's hash, so asking again, or asking other nodes, does not let this version bind it (a
+check that walked further back down the chain could; this one reads only the one block
+before the send). `verify_corroborated` records error
+kind `UnbindableAmount` and sets `permanent`; do not retry. The one exception is the live
 network's genesis open (`991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948`,
 matched by its recomputed hash, not by its account), whose balance is the whole supply,
 2^128 - 1 raw.
